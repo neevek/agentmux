@@ -161,10 +161,12 @@ fn match_process_tree(
     }
     let children = tree.children_of.get(&pid)?;
     for &child_pid in children {
-        if let Some(comm) = tree.comm_of.get(&child_pid) {
-            if patterns.iter().any(|pat| comm_matches(comm, pat)) {
-                return Some(child_pid);
-            }
+        if tree
+            .comm_of
+            .get(&child_pid)
+            .is_some_and(|comm| patterns.iter().any(|pat| comm_matches(comm, pat)))
+        {
+            return Some(child_pid);
         }
         if let Some(found) = match_process_tree(child_pid, patterns, tree, depth + 1) {
             return Some(found);

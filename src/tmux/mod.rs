@@ -1,7 +1,7 @@
 use std::process::Command;
 
 const SIDEBAR_TITLE: &str = "tmux-agents-sidebar";
-const DEFAULT_WIDTH: u32 = 30;
+const DEFAULT_WIDTH: u32 = 50;
 const WIDTH_OPTION: &str = "@tmux-agents-width";
 const SELECTED_OPTION: &str = "@tmux-agents-selected";
 
@@ -95,14 +95,8 @@ pub fn is_pane_in_active_window() -> bool {
     let Some(pane_id) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) else {
         return true;
     };
-    tmux_output(&[
-        "display-message",
-        "-t",
-        &pane_id,
-        "-p",
-        "#{window_active}",
-    ])
-    .is_some_and(|s| s == "1")
+    tmux_output(&["display-message", "-t", &pane_id, "-p", "#{window_active}"])
+        .is_some_and(|s| s == "1")
 }
 
 pub fn list_window_names(session: &str) -> std::collections::HashMap<String, String> {
@@ -151,15 +145,10 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
 fn find_split_target(window_id: &str) -> Option<(String, bool)> {
     let fmt = "#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_height}";
     let out = tmux_output(&["list-panes", "-t", window_id, "-F", fmt])?;
-    let win_height: u32 = tmux_output(&[
-        "display-message",
-        "-t",
-        window_id,
-        "-p",
-        "#{window_height}",
-    ])
-    .and_then(|s| s.parse().ok())
-    .unwrap_or(0);
+    let win_height: u32 =
+        tmux_output(&["display-message", "-t", window_id, "-p", "#{window_height}"])
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
     let panes: Vec<(String, u32, u32, u32)> = out
         .lines()
