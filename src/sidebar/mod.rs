@@ -36,6 +36,7 @@ pub fn run() {
     let mut cached_agents: Vec<AgentInfo> = Vec::new();
     let mut last_selected_pane = String::new();
     let mut scroll_offset: usize = 0;
+    let mut last_width: u32 = 0;
 
     loop {
         if SHOULD_EXIT.load(Ordering::Relaxed) {
@@ -81,7 +82,7 @@ pub fn run() {
 
         // Auto-scroll to keep selection visible
         let (_, height) = terminal_size();
-        let visible = render::visible_item_count(height);
+        let visible = render::visible_item_count(height, &cached_agents, scroll_offset);
         if visible > 0 {
             if selected_idx < scroll_offset {
                 scroll_offset = selected_idx;
@@ -92,6 +93,11 @@ pub fn run() {
 
         if is_active || selection_changed {
             let (width, height) = terminal_size();
+            // Detect manual resize and sync to all sidebars
+            if last_width != 0 && width != last_width {
+                tmux::save_sidebar_width(&session, width);
+            }
+            last_width = width;
             print!(
                 "{}",
                 render::render_sidebar(
@@ -122,7 +128,9 @@ pub fn run() {
                     scroll_offset = scroll_offset.saturating_sub(1);
                 }
                 input::InputEvent::MouseScrollDown => {
-                    let max_offset = cached_agents.len().saturating_sub(visible.max(1));
+                    let max_offset = cached_agents.len().saturating_sub(
+                        render::visible_item_count(height, &cached_agents, scroll_offset).max(1),
+                    );
                     scroll_offset = (scroll_offset + 1).min(max_offset);
                 }
                 input::InputEvent::KeyEnter => {
@@ -134,7 +142,7 @@ pub fn run() {
                 }
                 input::InputEvent::MouseClick { y } => {
                     if let Some(agent) =
-                        input::click_to_agent_index(y, cached_agents.len(), scroll_offset)
+                        input::click_to_agent_index(y, &cached_agents, scroll_offset)
                             .and_then(|idx| cached_agents.get(idx))
                     {
                         tmux::set_selected_pane(&agent.pane_id);

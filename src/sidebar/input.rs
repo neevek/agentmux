@@ -115,17 +115,24 @@ fn parse_sgr_mouse(buf: &[u8]) -> InputEvent {
     }
 }
 
-/// Convert a click y-coordinate to an agent index, accounting for scroll offset.
+/// Convert a click y-coordinate to an agent index, accounting for scroll offset
+/// and adaptive item heights.
 pub fn click_to_agent_index(
     y: u32,
-    agent_count: usize,
+    agents: &[crate::detect::AgentInfo],
     scroll_offset: usize,
 ) -> Option<usize> {
-    use crate::sidebar::render::{HEADER_ROWS, ITEM_ROWS};
-    if y <= HEADER_ROWS || agent_count == 0 {
+    use crate::sidebar::render::{HEADER_ROWS, item_row_count};
+    if y <= HEADER_ROWS || agents.is_empty() {
         return None;
     }
-    let visible_idx = ((y - HEADER_ROWS - 1) / ITEM_ROWS) as usize;
-    let idx = visible_idx + scroll_offset;
-    if idx < agent_count { Some(idx) } else { None }
+    let click_row = y - HEADER_ROWS;
+    let mut cumulative = 0u32;
+    for (vi, agent) in agents.iter().skip(scroll_offset).enumerate() {
+        cumulative += item_row_count(agent);
+        if click_row <= cumulative {
+            return Some(scroll_offset + vi);
+        }
+    }
+    None
 }
