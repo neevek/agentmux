@@ -90,7 +90,7 @@ Let's be honest. In the age of AI-assisted development, the lifecycle of any int
 
 I decided to skip that step.
 
-agentpane is written in Rust from day one — not because I wanted to be trendy, but because I wanted to be *last*. No one's going to rewrite-it-in-Rust if it's already in Rust. The PR writes itself: "closes #1: rewrite in Rust" — filed and merged before the repo Int public.
+agentpane is written in Rust from day one — not because I wanted to be trendy, but because I wanted to be *last*. No one's going to rewrite-it-in-Rust if it's already in Rust. The PR writes itself: "closes #1: rewrite in Rust" — filed and merged before the repo is in public.
 
 And it turns out Rust is genuinely the right tool here:
 

@@ -16,8 +16,15 @@ pub struct SessionDetails {
     pub state: AgentState,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache read tokens (subset of input_tokens, for cost calc)
+    pub cache_read_tokens: u64,
+    /// Cache creation tokens (subset of input_tokens, for cost calc)
+    pub cache_creation_tokens: u64,
     pub last_activity: Option<String>,
     pub context_pct: Option<u8>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub turn_count: u32,
 }
 
 impl Default for SessionDetails {
@@ -26,8 +33,13 @@ impl Default for SessionDetails {
             state: AgentState::Idle,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             last_activity: None,
             context_pct: None,
+            model: None,
+            effort: None,
+            turn_count: 0,
         }
     }
 }
@@ -46,8 +58,13 @@ struct CachedData {
 struct ParsedTokens {
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
     last_activity: Option<String>,
     context_pct: Option<u8>,
+    model: Option<String>,
+    effort: Option<String>,
+    turn_count: u32,
 }
 
 impl SessionCache {
@@ -134,8 +151,13 @@ fn agent_details(
         state,
         input_tokens: cached.input_tokens,
         output_tokens: cached.output_tokens,
+        cache_read_tokens: cached.cache_read_tokens,
+        cache_creation_tokens: cached.cache_creation_tokens,
         last_activity: cached.last_activity.clone(),
         context_pct: cached.context_pct,
+        model: cached.model.clone(),
+        effort: cached.effort.clone(),
+        turn_count: cached.turn_count,
     }
 }
 
@@ -369,14 +391,38 @@ fn parse_claude_tokens(path: &Path) -> ParsedTokens {
     let entries = read_jsonl(path, None);
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
+    let mut cache_read_tokens: u64 = 0;
+    let mut cache_creation_tokens: u64 = 0;
     let mut last_activity: Option<String> = None;
     let mut last_turn_input: u64 = 0;
     let mut model_name: Option<String> = None;
     let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut turn_count: u32 = 0;
 
     for entry in &entries {
         let Some(msg) = entry.get("message") else { continue };
-        if json_str(msg, &["role"]) != Some("assistant") { continue; }
+        let role = json_str(msg, &["role"]);
+
+        if role == Some("user") {
+            // Count user turns: skip pure tool_result arrays and system-like messages
+            let is_tool_result_only = matches!(msg.get("content"), Some(Value::Array(items))
+                if !items.is_empty() && items.iter().all(|c| json_str(c, &["type"]) == Some("tool_result")));
+            if !is_tool_result_only {
+                let text = match msg.get("content") {
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    Some(Value::Array(items)) => items.iter().find_map(|c| {
+                        if json_str(c, &["type"]) == Some("text") { c.get("text")?.as_str() } else { None }
+                    }),
+                    _ => None,
+                };
+                if !text.is_some_and(|t| t.starts_with('<') || t.starts_with('{')) {
+                    turn_count += 1;
+                }
+            }
+            continue;
+        }
+
+        if role != Some("assistant") { continue; }
 
         // Deduplicate: Claude Code writes streaming + final entries with the same id
         if msg.get("id").and_then(|v| v.as_str()).is_some_and(|id| !seen_ids.insert(id.to_string())) {
@@ -388,9 +434,14 @@ fn parse_claude_tokens(path: &Path) -> ParsedTokens {
         }
         if let Some(usage) = msg.get("usage") {
             let get = |k| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-            let turn_input = get("input_tokens") + get("cache_read_input_tokens") + get("cache_creation_input_tokens");
+            let base = get("input_tokens");
+            let cache_read = get("cache_read_input_tokens");
+            let cache_create = get("cache_creation_input_tokens");
+            let turn_input = base + cache_read + cache_create;
             input_tokens += turn_input;
             output_tokens += get("output_tokens");
+            cache_read_tokens += cache_read;
+            cache_creation_tokens += cache_create;
             last_turn_input = turn_input;
         }
         if let Some(Value::Array(items)) = msg.get("content") {
@@ -409,7 +460,22 @@ fn parse_claude_tokens(path: &Path) -> ParsedTokens {
         (last_turn_input > 0).then(|| ((last_turn_input as f64 / max_ctx as f64) * 100.0).min(100.0) as u8)
     });
 
-    ParsedTokens { input_tokens, output_tokens, last_activity, context_pct }
+    let effort = claude_effort_level();
+    ParsedTokens { input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, last_activity, context_pct, model: model_name, effort, turn_count }
+}
+
+fn claude_effort_level() -> Option<String> {
+    use std::sync::OnceLock;
+    static EFFORT: OnceLock<Option<String>> = OnceLock::new();
+    EFFORT
+        .get_or_init(|| {
+            let home = dirs::home_dir()?;
+            let path = home.join(".claude").join("settings.json");
+            let content = fs::read_to_string(path).ok()?;
+            let val: Value = serde_json::from_str(&content).ok()?;
+            json_str(&val, &["effortLevel"]).map(|s| s.to_string())
+        })
+        .clone()
 }
 
 fn parse_codex_tokens(path: &Path) -> ParsedTokens {
@@ -419,18 +485,38 @@ fn parse_codex_tokens(path: &Path) -> ParsedTokens {
     let mut last_activity: Option<String> = None;
     let mut context_window: u64 = 0;
     let mut last_turn_input: u64 = 0;
+    let mut model: Option<String> = None;
+    let mut effort: Option<String> = None;
+    let mut turn_count: u32 = 0;
 
     for entry in &entries {
         match json_str(entry, &["type"]) {
-            Some("event_msg") if json_str(entry, &["payload", "type"]) == Some("token_count") => {
-                if let Some(info) = entry.get("payload").and_then(|p| p.get("info")) {
-                    let get_from = |section: &str, field: &str| {
-                        info.get(section).and_then(|s| s.get(field)).and_then(|v| v.as_u64()).unwrap_or(0)
-                    };
-                    input_tokens = get_from("total_token_usage", "input_tokens");
-                    output_tokens = get_from("total_token_usage", "output_tokens");
-                    last_turn_input = get_from("last_token_usage", "input_tokens");
-                    context_window = info.get("model_context_window").and_then(|v| v.as_u64()).unwrap_or(context_window);
+            Some("turn_context") => {
+                // Primary source for model name and effort level
+                if let Some(m) = json_str(entry, &["payload", "model"]) {
+                    model = Some(m.to_string());
+                }
+                if let Some(e) = json_str(entry, &["payload", "effort"]) {
+                    effort = Some(e.to_string());
+                }
+            }
+            Some("event_msg") => {
+                match json_str(entry, &["payload", "type"]) {
+                    Some("token_count") => {
+                        if let Some(info) = entry.get("payload").and_then(|p| p.get("info")) {
+                            let get_from = |section: &str, field: &str| {
+                                info.get(section).and_then(|s| s.get(field)).and_then(|v| v.as_u64()).unwrap_or(0)
+                            };
+                            input_tokens = get_from("total_token_usage", "input_tokens");
+                            output_tokens = get_from("total_token_usage", "output_tokens");
+                            last_turn_input = get_from("last_token_usage", "input_tokens");
+                            context_window = info.get("model_context_window").and_then(|v| v.as_u64()).unwrap_or(context_window);
+                        }
+                    }
+                    Some("user_message") => {
+                        turn_count += 1;
+                    }
+                    _ => {}
                 }
             }
             Some("response_item") if json_str(entry, &["payload", "type"]) == Some("function_call") => {
@@ -445,7 +531,7 @@ fn parse_codex_tokens(path: &Path) -> ParsedTokens {
     let context_pct = (context_window > 0 && last_turn_input > 0)
         .then(|| ((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8);
 
-    ParsedTokens { input_tokens, output_tokens, last_activity, context_pct }
+    ParsedTokens { input_tokens, output_tokens, cache_read_tokens: 0, cache_creation_tokens: 0, last_activity, context_pct, model, effort, turn_count }
 }
 
 fn model_context_window(model: &str) -> Option<u64> {

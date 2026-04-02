@@ -22,15 +22,39 @@ const PEACH: &str = "\x1b[38;2;250;179;135m"; // peach #fab387 (Claude)
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
 const HEADER_BG: &str = "\x1b[48;2;30;30;46m";
 
-/// Number of rows per item
-pub const ITEM_ROWS: u32 = 5;
 /// Number of header rows
 pub const HEADER_ROWS: u32 = 3;
 
-/// Calculate how many items fit in the visible area.
-pub fn visible_item_count(height: u32) -> usize {
-    let available = height.saturating_sub(HEADER_ROWS);
-    (available / ITEM_ROWS) as usize
+/// Calculate the row count for a single agent item.
+pub fn item_row_count(agent: &AgentInfo) -> u32 {
+    // Always: top margin (1) + info (1) + path (1) + bottom margin (1) = 4
+    let mut rows = 4u32;
+    if has_meta_line(agent) {
+        rows += 1;
+    }
+    if agent.last_activity.is_some() {
+        rows += 1;
+    }
+    rows
+}
+
+/// Calculate how many items fit in the visible area (adaptive heights).
+pub fn visible_item_count(height: u32, agents: &[AgentInfo], scroll_offset: usize) -> usize {
+    let mut available = height.saturating_sub(HEADER_ROWS);
+    let mut count = 0;
+    for agent in agents.iter().skip(scroll_offset) {
+        let h = item_row_count(agent);
+        if h > available {
+            break;
+        }
+        available -= h;
+        count += 1;
+    }
+    count
+}
+
+fn has_meta_line(agent: &AgentInfo) -> bool {
+    agent.model.is_some() || agent.cost_usd >= 0.01 || agent.turn_count > 0
 }
 
 pub fn render_sidebar(
@@ -73,7 +97,7 @@ pub fn render_sidebar(
         );
         row += 1;
     } else {
-        let visible = visible_item_count(height);
+        let visible = visible_item_count(height, agents, scroll_offset);
         let end = (scroll_offset + visible).min(agents.len());
 
         for (vi, agent) in agents[scroll_offset..end].iter().enumerate() {
@@ -144,7 +168,28 @@ pub fn render_sidebar(
                 ),
             );
             row += 1;
-            // Line 2: [window] cwd
+            // Line 2 (optional): model [- effort] | est. $cost | N turn(s)
+            if has_meta_line(agent) {
+                let model_short = agent.model.as_deref().map(short_model_name).unwrap_or_default();
+                let mut meta_parts: Vec<String> = Vec::new();
+                if !model_short.is_empty() {
+                    let model_display = match &agent.effort {
+                        Some(effort) => format!("{model_short} - {effort}"),
+                        None => model_short,
+                    };
+                    meta_parts.push(model_display);
+                }
+                if agent.cost_usd >= 0.01 {
+                    meta_parts.push(format!("est. {}", format_cost(agent.cost_usd)));
+                }
+                if agent.turn_count > 0 {
+                    let turn_label = if agent.turn_count == 1 { "turn" } else { "turns" };
+                    meta_parts.push(format!("{} {turn_label}", agent.turn_count));
+                }
+                emit(&mut buf, row, bg, &format!("  {DIM}{}{RESET}", meta_parts.join(" | ")));
+                row += 1;
+            }
+            // Line 3: [window] cwd
             emit(
                 &mut buf,
                 row,
@@ -152,14 +197,12 @@ pub fn render_sidebar(
                 &format!("  {GRAY}[{win_name}]{RESET}{bg} {SUBTEXT}{short_cwd}{RESET}"),
             );
             row += 1;
-            // Line 3: last activity
+            // Line 4 (optional): last activity — at the end
             if let Some(ref activity) = agent.last_activity {
                 let short: String = activity.chars().take(w.saturating_sub(5)).collect();
-                emit(&mut buf, row, bg, &format!("  {DIM}> {short}{RESET}"));
-            } else {
-                emit(&mut buf, row, bg, "");
+                emit(&mut buf, row, bg, &format!("  {GREEN}{BOLD}>{RESET}{bg} {DIM}{short}{RESET}"));
+                row += 1;
             }
-            row += 1;
             // Bottom margin
             emit(&mut buf, row, bg, "");
             row += 1;
@@ -184,6 +227,41 @@ fn emit_line_no_bg(buf: &mut String, row: u32, _bg: &str, content: &str) {
 
 fn emit_line_clear(buf: &mut String, row: u32) {
     buf.push_str(&format!("\x1b[{row};1H\x1b[K"));
+}
+
+fn short_model_name(model: &str) -> String {
+    // Claude: "claude-opus-4-6-20260401" → "opus 4.6"
+    for family in &["opus", "sonnet", "haiku"] {
+        if let Some(pos) = model.find(family) {
+            let after = &model[pos + family.len()..];
+            let version_parts: Vec<&str> = after
+                .split('-')
+                .filter(|s| !s.is_empty() && s.len() < 8 && s.chars().all(|c| c.is_ascii_digit()))
+                .collect();
+            return if version_parts.is_empty() {
+                family.to_string()
+            } else {
+                format!("{}-{}", family, version_parts.join("."))
+            };
+        }
+    }
+    // OpenAI models — check specific variants before broad patterns
+    for prefix in &["o4-mini", "o3-mini", "o3", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4", "gpt-5.3-codex", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1", "gpt-4o-mini", "gpt-4o"] {
+        if model.contains(prefix) {
+            return prefix.to_string();
+        }
+    }
+    model.to_string()
+}
+
+fn format_cost(cost: f64) -> String {
+    if cost >= 100.0 {
+        format!("${:.0}", cost)
+    } else if cost >= 10.0 {
+        format!("${:.1}", cost)
+    } else {
+        format!("${:.2}", cost)
+    }
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {

@@ -9,8 +9,19 @@
 #   @agentpane-key   "a"  — prefix + key to toggle sidebar
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="$CURRENT_DIR/bin/agentpane"
 REPO="neevek/agentpane"
+
+# Determine install directory: prefer ~/.local/bin, fallback to ~/bin
+get_bin_dir() {
+  if [ -d "$HOME/.local/bin" ]; then
+    echo "$HOME/.local/bin"
+  else
+    echo "$HOME/bin"
+  fi
+}
+
+BIN_DIR="$(get_bin_dir)"
+BINARY="$BIN_DIR/agentpane"
 
 get_target() {
   local os arch
@@ -26,6 +37,41 @@ get_target() {
     MINGW*|MSYS*|CYGWIN*) echo "x86_64-pc-windows-msvc" ;;
     *)      echo "" ;;
   esac
+}
+
+# Ensure bin dir is in PATH via shell profile
+ensure_path() {
+  local bin_dir="$1"
+  # Already in PATH — nothing to do
+  case ":$PATH:" in
+    *":$bin_dir:"*) return 0 ;;
+  esac
+
+  local export_line="export PATH=\"$bin_dir:\$PATH\""
+  local profile=""
+
+  # Pick the right shell profile
+  if [ -n "$ZSH_VERSION" ] || [ "$(basename "$SHELL")" = "zsh" ]; then
+    profile="$HOME/.zshrc"
+  elif [ -f "$HOME/.bashrc" ]; then
+    profile="$HOME/.bashrc"
+  elif [ -f "$HOME/.bash_profile" ]; then
+    profile="$HOME/.bash_profile"
+  else
+    profile="$HOME/.profile"
+  fi
+
+  # Don't add if already present in profile
+  if [ -f "$profile" ] && grep -qF "$bin_dir" "$profile" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "" >> "$profile"
+  echo "# Added by agentpane" >> "$profile"
+  echo "$export_line" >> "$profile"
+
+  # Also export for current session
+  export PATH="$bin_dir:$PATH"
 }
 
 download_binary() {
@@ -45,10 +91,10 @@ download_binary() {
   tmp="$(mktemp -d)"
 
   if curl -fsSL "$url" -o "$tmp/archive.$ext" 2>/dev/null; then
-    mkdir -p "$CURRENT_DIR/bin"
+    mkdir -p "$BIN_DIR"
     case "$ext" in
-      tar.gz) tar xzf "$tmp/archive.$ext" -C "$CURRENT_DIR/bin" ;;
-      zip)    unzip -o "$tmp/archive.$ext" -d "$CURRENT_DIR/bin" >/dev/null ;;
+      tar.gz) tar xzf "$tmp/archive.$ext" -C "$BIN_DIR" ;;
+      zip)    unzip -o "$tmp/archive.$ext" -d "$BIN_DIR" >/dev/null ;;
     esac
     rm -rf "$tmp"
     chmod +x "$BINARY" 2>/dev/null
@@ -68,9 +114,12 @@ if [ ! -x "$BINARY" ]; then
   # Fallback: build from source if download failed and cargo is available
   if [ ! -x "$BINARY" ] && command -v cargo >/dev/null 2>&1; then
     (cd "$CURRENT_DIR" && cargo build --release 2>/tmp/agentpane-build.log \
-      && mkdir -p bin && cp target/release/agentpane bin/) &
+      && mkdir -p "$BIN_DIR" && cp target/release/agentpane "$BIN_DIR/") &
   fi
 fi
+
+# Ensure the bin directory is in PATH
+ensure_path "$BIN_DIR"
 
 # Read user options
 TOGGLE_KEY=$(tmux show-option -gqv "@agentpane-key" 2>/dev/null)
