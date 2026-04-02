@@ -131,11 +131,11 @@ pub fn codex_details(cwd: &str, cache: &mut SessionCache) -> SessionDetails {
         return SessionDetails::default();
     };
 
-    let Some(jsonl_path) = find_most_recent_jsonl_recursive(&sessions_dir) else {
+    // Find the JSONL file whose session_meta.payload.cwd matches this agent's cwd
+    let Some(jsonl_path) = find_codex_jsonl_for_cwd(&sessions_dir, cwd) else {
         return SessionDetails::default();
     };
 
-    let _ = cwd;
     let recently_active = file_recently_modified(&jsonl_path, ACTIVE_WRITE_THRESHOLD);
 
     let state = if recently_active {
@@ -235,6 +235,72 @@ fn find_most_recent_jsonl_recursive(dir: &PathBuf) -> Option<PathBuf> {
 
     walk(dir, &mut best);
     best.map(|(p, _)| p)
+}
+
+/// Find the Codex JSONL file whose session_meta.payload.cwd matches the given cwd.
+/// Scans all JSONL files, reads only the first line of each to check the cwd.
+/// Falls back to the most recent file if no match is found.
+fn find_codex_jsonl_for_cwd(sessions_dir: &PathBuf, cwd: &str) -> Option<PathBuf> {
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+
+    let mut all_files: Vec<(PathBuf, SystemTime)> = Vec::new();
+
+    fn walk(dir: &PathBuf, files: &mut Vec<(PathBuf, SystemTime)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        files.push((path, mtime));
+                    }
+                }
+            }
+        }
+    }
+
+    walk(sessions_dir, &mut all_files);
+    if all_files.is_empty() {
+        return None;
+    }
+
+    // Sort by modification time descending (most recent first)
+    all_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Check each file's first line for session_meta with matching cwd
+    for (path, _) in &all_files {
+        if let Some(session_cwd) = read_codex_session_cwd(path) {
+            if session_cwd == cwd {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    // Fallback: most recent file
+    Some(all_files.into_iter().next()?.0)
+}
+
+/// Read the first line of a Codex JSONL file to extract session_meta.payload.cwd.
+fn read_codex_session_cwd(path: &PathBuf) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first_line).ok()?;
+    let entry: Value = serde_json::from_str(&first_line).ok()?;
+    if entry.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    entry
+        .get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Fast tail read — only last 32KB, used for state detection every poll cycle.
