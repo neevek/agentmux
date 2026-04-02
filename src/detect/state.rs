@@ -1,6 +1,7 @@
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -10,14 +11,12 @@ pub enum AgentState {
     Idle,
 }
 
-/// Rich session details from JSONL parsing.
 #[derive(Debug, Clone)]
 pub struct SessionDetails {
     pub state: AgentState,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub last_activity: Option<String>,
-    /// Context window used percentage (0-100), if available
     pub context_pct: Option<u8>,
 }
 
@@ -33,9 +32,69 @@ impl Default for SessionDetails {
     }
 }
 
-const ACTIVE_WRITE_THRESHOLD: Duration = Duration::from_secs(3);
+/// Cache for JSONL parsing — avoids re-reading entire files every poll cycle.
+/// Only re-parses when file size changes.
+pub struct SessionCache {
+    entries: HashMap<PathBuf, CachedData>,
+}
 
-pub fn claude_code_details(cwd: &str) -> SessionDetails {
+#[derive(Clone)]
+struct CachedData {
+    file_size: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    last_activity: Option<String>,
+    context_pct: Option<u8>,
+}
+
+impl SessionCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get_or_update(
+        &mut self,
+        path: &PathBuf,
+        parser: fn(&PathBuf) -> ParsedTokens,
+    ) -> CachedData {
+        let current_size = fs::metadata(path)
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        if let Some(cached) = self.entries.get(path) {
+            if cached.file_size == current_size {
+                return cached.clone();
+            }
+        }
+
+        // File grew or first read — do full parse
+        let parsed = parser(path);
+        let data = CachedData {
+            file_size: current_size,
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            last_activity: parsed.last_activity,
+            context_pct: parsed.context_pct,
+        };
+        self.entries.insert(path.clone(), data.clone());
+        data
+    }
+}
+
+struct ParsedTokens {
+    input_tokens: u64,
+    output_tokens: u64,
+    last_activity: Option<String>,
+    context_pct: Option<u8>,
+}
+
+const ACTIVE_WRITE_THRESHOLD: Duration = Duration::from_secs(3);
+const TAIL_BYTES: u64 = 32768;
+
+pub fn claude_code_details(cwd: &str, cache: &mut SessionCache) -> SessionDetails {
     let Some(home) = dirs::home_dir() else {
         return SessionDetails::default();
     };
@@ -47,16 +106,27 @@ pub fn claude_code_details(cwd: &str) -> SessionDetails {
     };
 
     let recently_active = file_recently_modified(&jsonl_path, ACTIVE_WRITE_THRESHOLD);
-    let mut details = parse_claude_code_jsonl(&jsonl_path);
 
-    if recently_active {
-        details.state = AgentState::Working;
+    // State detection: always do a fast tail read
+    let state = if recently_active {
+        AgentState::Working
+    } else {
+        detect_claude_state(&jsonl_path)
+    };
+
+    // Token counting: cached, only re-reads when file grows
+    let cached = cache.get_or_update(&jsonl_path, parse_claude_tokens);
+
+    SessionDetails {
+        state,
+        input_tokens: cached.input_tokens,
+        output_tokens: cached.output_tokens,
+        last_activity: cached.last_activity,
+        context_pct: cached.context_pct,
     }
-
-    details
 }
 
-pub fn codex_details(cwd: &str) -> SessionDetails {
+pub fn codex_details(cwd: &str, cache: &mut SessionCache) -> SessionDetails {
     let Some(sessions_dir) = codex_sessions_dir() else {
         return SessionDetails::default();
     };
@@ -67,13 +137,22 @@ pub fn codex_details(cwd: &str) -> SessionDetails {
 
     let _ = cwd;
     let recently_active = file_recently_modified(&jsonl_path, ACTIVE_WRITE_THRESHOLD);
-    let mut details = parse_codex_jsonl(&jsonl_path);
 
-    if recently_active {
-        details.state = AgentState::Working;
+    let state = if recently_active {
+        AgentState::Working
+    } else {
+        detect_codex_state(&jsonl_path)
+    };
+
+    let cached = cache.get_or_update(&jsonl_path, parse_codex_tokens);
+
+    SessionDetails {
+        state,
+        input_tokens: cached.input_tokens,
+        output_tokens: cached.output_tokens,
+        last_activity: cached.last_activity,
+        context_pct: cached.context_pct,
     }
-
-    details
 }
 
 fn file_recently_modified(path: &PathBuf, threshold: Duration) -> bool {
@@ -113,9 +192,6 @@ fn find_most_recent_jsonl(dir: &PathBuf) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
-    // Pick the most recently modified .jsonl file — no age cutoff.
-    // The agent process is already confirmed running by the process tree scan,
-    // so whatever file is newest belongs to the current session.
     fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
@@ -161,21 +237,37 @@ fn find_most_recent_jsonl_recursive(dir: &PathBuf) -> Option<PathBuf> {
     best.map(|(p, _)| p)
 }
 
-/// Read the entire JSONL file. Token counting needs all entries for accurate totals.
-fn full_read_jsonl(path: &PathBuf) -> Vec<Value> {
+/// Fast tail read — only last 32KB, used for state detection every poll cycle.
+fn tail_read_jsonl(path: &PathBuf) -> Vec<Value> {
     let Ok(mut file) = fs::File::open(path) else {
         return Vec::new();
     };
-
+    let Ok(meta) = file.metadata() else {
+        return Vec::new();
+    };
+    let size = meta.len();
+    if size > TAIL_BYTES {
+        let _ = file.seek(SeekFrom::Start(size - TAIL_BYTES));
+    }
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf);
-
     buf.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()
 }
 
-/// Format a token count concisely: 1234 → "1.2k", 1234567 → "1.2M"
+/// Full file read — used for token counting, only called when file size changes.
+fn full_read_jsonl(path: &PathBuf) -> Vec<Value> {
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf);
+    buf.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
 pub fn format_tokens(tokens: u64) -> String {
     if tokens == 0 {
         return String::new();
@@ -189,20 +281,162 @@ pub fn format_tokens(tokens: u64) -> String {
     }
 }
 
-fn parse_claude_code_jsonl(path: &PathBuf) -> SessionDetails {
-    let entries = full_read_jsonl(path);
-    if entries.is_empty() {
-        return SessionDetails::default();
-    }
+// ---- State detection (fast, tail read) ----
 
-    let mut state: Option<AgentState> = None;
+fn detect_claude_state(path: &PathBuf) -> AgentState {
+    let entries = tail_read_jsonl(path);
+    for entry in entries.iter().rev() {
+        let Some(msg) = entry.get("message") else {
+            continue;
+        };
+        let Some(role) = msg.get("role").and_then(|r| r.as_str()) else {
+            continue;
+        };
+        match role {
+            "assistant" => {
+                let content = msg.get("content");
+                if let Some(Value::Array(items)) = content {
+                    if items
+                        .iter()
+                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    {
+                        return AgentState::Working;
+                    }
+                    if items
+                        .iter()
+                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+                    {
+                        return AgentState::Working;
+                    }
+                }
+                match msg.get("stop_reason") {
+                    Some(Value::String(reason)) => {
+                        return if reason == "end_turn" {
+                            AgentState::Idle
+                        } else if reason == "tool_use" {
+                            AgentState::Working
+                        } else {
+                            AgentState::Idle
+                        };
+                    }
+                    Some(Value::Null) | None => return AgentState::Working,
+                    _ => {}
+                }
+            }
+            "user" => {
+                let content = msg.get("content");
+                let text = match content {
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    Some(Value::Array(items)) => items.iter().find_map(|c| {
+                        if c.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            c.get("text").and_then(|t| t.as_str())
+                        } else {
+                            None
+                        }
+                    }),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    if text.starts_with("[Request interrupted") {
+                        return AgentState::Idle;
+                    }
+                    if text.contains("<command-name>/exit</command-name>") {
+                        return AgentState::Idle;
+                    }
+                    if text.starts_with('<') || text.starts_with('{') {
+                        continue;
+                    }
+                }
+                if let Some(Value::Array(items)) = content {
+                    if items
+                        .iter()
+                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                    {
+                        return AgentState::Working;
+                    }
+                }
+                return AgentState::Working;
+            }
+            _ => continue,
+        }
+    }
+    AgentState::Idle
+}
+
+fn detect_codex_state(path: &PathBuf) -> AgentState {
+    let entries = tail_read_jsonl(path);
+    for entry in entries.iter().rev() {
+        let entry_type = entry.get("type").and_then(|t| t.as_str());
+        match entry_type {
+            Some("event_msg") => {
+                if let Some(pt) = entry
+                    .get("payload")
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                {
+                    match pt {
+                        "task_started" | "user_message" => return AgentState::Working,
+                        "task_complete" | "turn_aborted" => return AgentState::Idle,
+                        "agent_message" => {
+                            let phase = entry
+                                .get("payload")
+                                .and_then(|p| p.get("phase"))
+                                .and_then(|p| p.as_str());
+                            return if phase == Some("final_answer") {
+                                AgentState::Idle
+                            } else {
+                                AgentState::Working
+                            };
+                        }
+                        "token_count" => continue,
+                        _ => continue,
+                    }
+                }
+            }
+            Some("response_item") => {
+                if let Some(it) = entry
+                    .get("payload")
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                {
+                    if it == "function_call" {
+                        return AgentState::Working;
+                    }
+                    if it == "message" {
+                        let phase = entry
+                            .get("payload")
+                            .and_then(|p| p.get("phase"))
+                            .and_then(|p| p.as_str());
+                        if phase == Some("final_answer") {
+                            return AgentState::Idle;
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(role) = entry.get("role").and_then(|r| r.as_str()) {
+                    return if role == "user" {
+                        AgentState::Working
+                    } else {
+                        AgentState::Idle
+                    };
+                }
+            }
+        }
+    }
+    AgentState::Idle
+}
+
+// ---- Token counting (cached, full read) ----
+
+fn parse_claude_tokens(path: &PathBuf) -> ParsedTokens {
+    let entries = full_read_jsonl(path);
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
     let mut last_activity: Option<String> = None;
-    let mut last_turn_input: u64 = 0; // input tokens of the most recent turn (≈ context used)
+    let mut last_turn_input: u64 = 0;
     let mut model_name: Option<String> = None;
 
-    // Forward pass: accumulate tokens, track last activity
     for entry in &entries {
         let Some(msg) = entry.get("message") else {
             continue;
@@ -210,13 +444,10 @@ fn parse_claude_code_jsonl(path: &PathBuf) -> SessionDetails {
         let Some(role) = msg.get("role").and_then(|r| r.as_str()) else {
             continue;
         };
-
         if role == "assistant" {
-            // Track model name
             if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
                 model_name = Some(m.to_string());
             }
-
             if let Some(usage) = msg.get("usage") {
                 let inp = usage
                     .get("input_tokens")
@@ -239,14 +470,11 @@ fn parse_claude_code_jsonl(path: &PathBuf) -> SessionDetails {
                 output_tokens += out;
                 last_turn_input = turn_input;
             }
-
-            // Track last tool_use as activity
             if let Some(Value::Array(items)) = msg.get("content") {
                 for item in items {
                     if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                            let detail = extract_tool_detail(name, item);
-                            last_activity = Some(detail);
+                            last_activity = Some(extract_tool_detail(name, item));
                         }
                     }
                 }
@@ -254,96 +482,6 @@ fn parse_claude_code_jsonl(path: &PathBuf) -> SessionDetails {
         }
     }
 
-    // Reverse pass: find the most recent state
-    for entry in entries.iter().rev() {
-        let Some(msg) = entry.get("message") else {
-            continue;
-        };
-        let Some(role) = msg.get("role").and_then(|r| r.as_str()) else {
-            continue;
-        };
-
-        match role {
-            "assistant" => {
-                let content = msg.get("content");
-                if let Some(Value::Array(items)) = content {
-                    if items
-                        .iter()
-                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-                    {
-                        state = Some(AgentState::Working);
-                        break;
-                    }
-                    if items
-                        .iter()
-                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("thinking"))
-                    {
-                        state = Some(AgentState::Working);
-                        break;
-                    }
-                }
-                match msg.get("stop_reason") {
-                    Some(Value::String(reason)) => {
-                        if reason == "end_turn" {
-                            state = Some(AgentState::Idle);
-                        } else if reason == "tool_use" {
-                            state = Some(AgentState::Working);
-                        } else {
-                            state = Some(AgentState::Idle);
-                        }
-                        break;
-                    }
-                    Some(Value::Null) | None => {
-                        state = Some(AgentState::Working);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            "user" => {
-                let content = msg.get("content");
-                let text = match content {
-                    Some(Value::String(s)) => Some(s.as_str()),
-                    Some(Value::Array(items)) => items.iter().find_map(|c| {
-                        if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            c.get("text").and_then(|t| t.as_str())
-                        } else {
-                            None
-                        }
-                    }),
-                    _ => None,
-                };
-
-                if let Some(text) = text {
-                    if text.starts_with("[Request interrupted") {
-                        state = Some(AgentState::Idle);
-                        break;
-                    }
-                    if text.contains("<command-name>/exit</command-name>") {
-                        state = Some(AgentState::Idle);
-                        break;
-                    }
-                    if text.starts_with('<') || text.starts_with('{') {
-                        continue;
-                    }
-                }
-                if let Some(Value::Array(items)) = content {
-                    if items
-                        .iter()
-                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
-                    {
-                        state = Some(AgentState::Working);
-                        break;
-                    }
-                }
-                state = Some(AgentState::Working);
-                break;
-            }
-            _ => continue,
-        }
-    }
-
-    // Estimate context window usage: last turn's input ≈ conversation context size
     let context_pct = model_name.as_deref().and_then(|m| {
         let max_ctx = model_context_window(m)?;
         if last_turn_input > 0 && max_ctx > 0 {
@@ -353,8 +491,7 @@ fn parse_claude_code_jsonl(path: &PathBuf) -> SessionDetails {
         }
     });
 
-    SessionDetails {
-        state: state.unwrap_or(AgentState::Idle),
+    ParsedTokens {
         input_tokens,
         output_tokens,
         last_activity,
@@ -362,20 +499,84 @@ fn parse_claude_code_jsonl(path: &PathBuf) -> SessionDetails {
     }
 }
 
-/// Map Claude model name to context window size in tokens.
+fn parse_codex_tokens(path: &PathBuf) -> ParsedTokens {
+    let entries = full_read_jsonl(path);
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut last_activity: Option<String> = None;
+    let mut context_window: u64 = 0;
+    let mut last_turn_input: u64 = 0;
+
+    for entry in &entries {
+        let entry_type = entry.get("type").and_then(|t| t.as_str());
+
+        if entry_type == Some("event_msg") {
+            let pt = entry
+                .get("payload")
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str());
+            if pt == Some("token_count") {
+                let info = entry.get("payload").and_then(|p| p.get("info"));
+                if let Some(info) = info {
+                    if let Some(u) = info.get("total_token_usage") {
+                        input_tokens =
+                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        output_tokens =
+                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    }
+                    if let Some(u) = info.get("last_token_usage") {
+                        last_turn_input =
+                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    }
+                    if let Some(cw) = info.get("model_context_window").and_then(|v| v.as_u64()) {
+                        context_window = cw;
+                    }
+                }
+            }
+        }
+
+        if entry_type == Some("response_item") {
+            let it = entry
+                .get("payload")
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str());
+            if it == Some("function_call") {
+                let name = entry
+                    .get("payload")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("tool");
+                last_activity = Some(name.to_string());
+            }
+        }
+    }
+
+    let context_pct = if context_window > 0 && last_turn_input > 0 {
+        Some(((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8)
+    } else {
+        None
+    };
+
+    ParsedTokens {
+        input_tokens,
+        output_tokens,
+        last_activity,
+        context_pct,
+    }
+}
+
 fn model_context_window(model: &str) -> Option<u64> {
     if model.contains("opus") {
-        Some(1_000_000) // Opus: 1M context (with extended)
+        Some(1_000_000)
     } else if model.contains("sonnet") {
-        Some(200_000) // Sonnet: 200k
+        Some(200_000)
     } else if model.contains("haiku") {
-        Some(200_000) // Haiku: 200k
+        Some(200_000)
     } else {
         None
     }
 }
 
-/// Extract a short description from a tool_use entry.
 fn extract_tool_detail(name: &str, item: &Value) -> String {
     let input = item.get("input");
     match name {
@@ -403,154 +604,6 @@ fn extract_tool_detail(name: &str, item: &Value) -> String {
             format!("{name} {pat}")
         }
         _ => name.to_string(),
-    }
-}
-
-fn parse_codex_jsonl(path: &PathBuf) -> SessionDetails {
-    let entries = full_read_jsonl(path);
-    if entries.is_empty() {
-        return SessionDetails::default();
-    }
-
-    let mut state: Option<AgentState> = None;
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut last_activity: Option<String> = None;
-    let mut context_window: u64 = 0;
-    let mut last_turn_input: u64 = 0;
-
-    // Forward pass: find token_count entries and last activity
-    for entry in &entries {
-        let entry_type = entry.get("type").and_then(|t| t.as_str());
-
-        if entry_type == Some("event_msg") {
-            let payload_type = entry
-                .get("payload")
-                .and_then(|p| p.get("type"))
-                .and_then(|t| t.as_str());
-
-            if payload_type == Some("token_count") {
-                let info = entry
-                    .get("payload")
-                    .and_then(|p| p.get("info"));
-                if let Some(info) = info {
-                    if let Some(u) = info.get("total_token_usage") {
-                        input_tokens =
-                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        output_tokens =
-                            u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    }
-                    if let Some(u) = info.get("last_token_usage") {
-                        last_turn_input =
-                            u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    }
-                    if let Some(cw) = info.get("model_context_window").and_then(|v| v.as_u64()) {
-                        context_window = cw;
-                    }
-                }
-            }
-        }
-
-        // Track function_call as last activity
-        if entry_type == Some("response_item") {
-            let item_type = entry
-                .get("payload")
-                .and_then(|p| p.get("type"))
-                .and_then(|t| t.as_str());
-            if item_type == Some("function_call") {
-                let name = entry
-                    .get("payload")
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("tool");
-                last_activity = Some(name.to_string());
-            }
-        }
-    }
-
-    // Reverse pass: find state
-    for entry in entries.iter().rev() {
-        let entry_type = entry.get("type").and_then(|t| t.as_str());
-        match entry_type {
-            Some("event_msg") => {
-                if let Some(payload_type) = entry
-                    .get("payload")
-                    .and_then(|p| p.get("type"))
-                    .and_then(|t| t.as_str())
-                {
-                    match payload_type {
-                        "task_started" | "user_message" => {
-                            state = Some(AgentState::Working);
-                            break;
-                        }
-                        "task_complete" | "turn_aborted" => {
-                            state = Some(AgentState::Idle);
-                            break;
-                        }
-                        "agent_message" => {
-                            let phase = entry
-                                .get("payload")
-                                .and_then(|p| p.get("phase"))
-                                .and_then(|p| p.as_str());
-                            state = Some(if phase == Some("final_answer") {
-                                AgentState::Idle
-                            } else {
-                                AgentState::Working
-                            });
-                            break;
-                        }
-                        "token_count" => continue,
-                        _ => continue,
-                    }
-                }
-            }
-            Some("response_item") => {
-                if let Some(item_type) = entry
-                    .get("payload")
-                    .and_then(|p| p.get("type"))
-                    .and_then(|t| t.as_str())
-                {
-                    if item_type == "function_call" {
-                        state = Some(AgentState::Working);
-                        break;
-                    }
-                    if item_type == "message" {
-                        let phase = entry
-                            .get("payload")
-                            .and_then(|p| p.get("phase"))
-                            .and_then(|p| p.as_str());
-                        if phase == Some("final_answer") {
-                            state = Some(AgentState::Idle);
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Some(role) = entry.get("role").and_then(|r| r.as_str()) {
-                    state = Some(if role == "user" {
-                        AgentState::Working
-                    } else {
-                        AgentState::Idle
-                    });
-                    break;
-                }
-            }
-        }
-    }
-
-    let context_pct = if context_window > 0 && last_turn_input > 0 {
-        Some(((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8)
-    } else {
-        None
-    };
-
-    SessionDetails {
-        state: state.unwrap_or(AgentState::Idle),
-        input_tokens,
-        output_tokens,
-        last_activity,
-        context_pct,
     }
 }
 

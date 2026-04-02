@@ -73,26 +73,21 @@ fn build_process_tree() -> ProcessTree {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        // Format: "  PID  PPID      ELAPSED COMMAND..."
+        // split_whitespace() correctly handles variable-width column spacing
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 4 {
             continue;
         }
-        // Format: "  PID  PPID      ELAPSED COMMAND"
-        // etime can be: MM:SS, HH:MM:SS, or D-HH:MM:SS
-        let parts: Vec<&str> = trimmed.splitn(4, char::is_whitespace).collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        let Some(pid) = parts[0].trim().parse::<u32>().ok() else {
+        let Some(pid) = tokens[0].parse::<u32>().ok() else {
             continue;
         };
-        let Some(ppid) = parts[1].trim().parse::<u32>().ok() else {
+        let Some(ppid) = tokens[1].parse::<u32>().ok() else {
             continue;
         };
-        let etime = parse_etime(parts[2].trim());
-        // comm is everything after etime, but splitn(4) gives us the rest as parts[3]
-        // However, parts[3] may start with whitespace because of splitting
-        let comm = parts[3].trim().to_lowercase();
+        let etime = parse_etime(tokens[2]);
+        // comm may contain spaces (e.g., "Google Chrome Helper"), rejoin remaining tokens
+        let comm = tokens[3..].join(" ").to_lowercase();
         children_of.entry(ppid).or_default().push(pid);
         comm_of.insert(pid, comm);
         etime_of.insert(pid, etime);
@@ -161,7 +156,7 @@ fn match_process_tree(
     tree: &ProcessTree,
     depth: u32,
 ) -> Option<u32> {
-    if depth > 2 {
+    if depth > 4 {
         return None;
     }
     let children = tree.children_of.get(&pid)?;

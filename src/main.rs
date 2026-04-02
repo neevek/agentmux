@@ -40,11 +40,11 @@ fn cmd_toggle() {
     let session = tmux::current_session().expect("not running inside tmux");
     let sidebars = tmux::find_all_sidebar_panes(&session);
     if sidebars.is_empty() {
-        // Open: create sidebar in every window
-        open_all_sidebars(&session);
+        // Create sidebar only in current window, hooks handle the rest lazily
+        let current_window = tmux::current_window_id().expect("no current window");
+        create_sidebar_in_window(&current_window);
         install_hooks();
     } else {
-        // Close: kill all sidebars
         close_all_sidebars(&sidebars);
         uninstall_hooks();
     }
@@ -55,7 +55,8 @@ fn cmd_open() {
     if !tmux::find_all_sidebar_panes(&session).is_empty() {
         return;
     }
-    open_all_sidebars(&session);
+    let current_window = tmux::current_window_id().expect("no current window");
+    create_sidebar_in_window(&current_window);
     install_hooks();
 }
 
@@ -68,43 +69,32 @@ fn cmd_close() {
     }
 }
 
-/// Called by tmux hook on after-select-window and after-new-window.
-/// Only creates a sidebar if the current window doesn't have one yet.
+/// Called by tmux hook on window switch or new window.
+/// Creates a sidebar lazily if the current window doesn't have one
+/// and the sidebar feature is "on" (at least one sidebar exists elsewhere).
 fn cmd_ensure() {
     let current_window = tmux::current_window_id().expect("no current window");
     if tmux::sidebar_in_window(&current_window) {
-        return; // already has one, no-op
+        return;
     }
-    // This window is new or was created before sidebar was opened — add one
+    // Only create if sidebar is "on" (at least one exists in another window)
+    let session = tmux::current_session().expect("not running inside tmux");
+    if tmux::find_all_sidebar_panes(&session).is_empty() {
+        return;
+    }
     create_sidebar_in_window(&current_window);
 }
 
-/// Create a sidebar pane in every window of the session.
-fn open_all_sidebars(session: &str) {
-    let windows = tmux::list_window_ids(session);
-    for win_id in &windows {
-        if !tmux::sidebar_in_window(win_id) {
-            create_sidebar_in_window(win_id);
-        }
-    }
-}
-
-/// Kill all sidebar panes.
 fn close_all_sidebars(sidebars: &[(String, String)]) {
     for (pane_id, _) in sidebars {
         tmux::kill_pane(pane_id);
     }
 }
 
-/// Create a sidebar split in a specific window.
 fn create_sidebar_in_window(window_id: &str) {
-    let Some(target_pane) = tmux::first_pane_in_window(window_id) else {
-        return;
-    };
     let binary = tmux::self_binary();
     let cmd = format!("{} sidebar", binary);
-
-    if let Some(new_pane_id) = tmux::create_sidebar_split(&target_pane, &cmd) {
+    if let Some(new_pane_id) = tmux::create_sidebar_in(window_id, &cmd) {
         tmux::set_pane_title(&new_pane_id, "tmux-agents-sidebar");
     }
 }

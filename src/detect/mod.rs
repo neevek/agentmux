@@ -3,6 +3,7 @@ pub mod state;
 
 use crate::tmux;
 use process::AgentKind;
+pub use state::SessionCache;
 
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -20,19 +21,18 @@ pub struct AgentInfo {
 }
 
 /// Full scan: find all agent panes in the session and determine their state.
-pub fn scan_agents(session: &str) -> Vec<AgentInfo> {
+pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     let panes = tmux::list_session_panes(session);
     let detected = process::scan_panes_for_agents(&panes, "tmux-agents-sidebar");
 
-    // Build a window_id → window_name map
     let window_names = tmux::list_window_names(session);
 
     detected
         .into_iter()
         .map(|d| {
             let details = match d.kind {
-                AgentKind::ClaudeCode => state::claude_code_details(&d.cwd),
-                AgentKind::Codex => state::codex_details(&d.cwd),
+                AgentKind::ClaudeCode => state::claude_code_details(&d.cwd, cache),
+                AgentKind::Codex => state::codex_details(&d.cwd, cache),
             };
             let window_name = window_names
                 .get(&d.window_id)
