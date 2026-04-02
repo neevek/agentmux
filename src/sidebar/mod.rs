@@ -35,6 +35,7 @@ pub fn run() {
     let mut session_cache = detect::SessionCache::new();
     let mut cached_agents: Vec<AgentInfo> = Vec::new();
     let mut last_selected_pane = String::new();
+    let mut scroll_offset: usize = 0;
 
     loop {
         if SHOULD_EXIT.load(Ordering::Relaxed) {
@@ -73,17 +74,34 @@ pub fn run() {
             cached_agents = agents;
         }
 
-        // Resolve selected index once — reused for render and input handling
         let selected_idx = cached_agents
             .iter()
             .position(|a| a.pane_id == selected_pane)
             .unwrap_or(0);
 
+        // Auto-scroll to keep selection visible
+        let (_, height) = terminal_size();
+        let visible = render::visible_item_count(height);
+        if visible > 0 {
+            if selected_idx < scroll_offset {
+                scroll_offset = selected_idx;
+            } else if selected_idx >= scroll_offset + visible {
+                scroll_offset = selected_idx + 1 - visible;
+            }
+        }
+
         if is_active || selection_changed {
             let (width, height) = terminal_size();
             print!(
                 "{}",
-                render::render_sidebar(&cached_agents, width, height, selected_idx, &unseen_done)
+                render::render_sidebar(
+                    &cached_agents,
+                    width,
+                    height,
+                    selected_idx,
+                    scroll_offset,
+                    &unseen_done,
+                )
             );
             flush();
         }
@@ -97,7 +115,15 @@ pub fn run() {
                 }
                 input::InputEvent::KeyDown => {
                     let max = cached_agents.len().saturating_sub(1);
-                    set_selection(&cached_agents, selected_idx.min(max - 1) + 1);
+                    let new_sel = if selected_idx < max { selected_idx + 1 } else { max };
+                    set_selection(&cached_agents, new_sel);
+                }
+                input::InputEvent::MouseScrollUp => {
+                    scroll_offset = scroll_offset.saturating_sub(1);
+                }
+                input::InputEvent::MouseScrollDown => {
+                    let max_offset = cached_agents.len().saturating_sub(visible.max(1));
+                    scroll_offset = (scroll_offset + 1).min(max_offset);
                 }
                 input::InputEvent::KeyEnter => {
                     if let Some(agent) = cached_agents.get(selected_idx) {
@@ -108,7 +134,7 @@ pub fn run() {
                 }
                 input::InputEvent::MouseClick { y } => {
                     if let Some(agent) =
-                        input::click_to_agent_index(y, cached_agents.len(), selected_idx)
+                        input::click_to_agent_index(y, cached_agents.len(), scroll_offset)
                             .and_then(|idx| cached_agents.get(idx))
                     {
                         tmux::set_selected_pane(&agent.pane_id);

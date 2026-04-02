@@ -27,11 +27,18 @@ pub const ITEM_ROWS: u32 = 5;
 /// Number of header rows
 pub const HEADER_ROWS: u32 = 3;
 
+/// Calculate how many items fit in the visible area.
+pub fn visible_item_count(height: u32) -> usize {
+    let available = height.saturating_sub(HEADER_ROWS);
+    (available / ITEM_ROWS) as usize
+}
+
 pub fn render_sidebar(
     agents: &[AgentInfo],
     width: u32,
     height: u32,
     selected: usize,
+    scroll_offset: usize,
     unseen_done: &HashSet<String>,
 ) -> String {
     let w = width as usize;
@@ -66,7 +73,11 @@ pub fn render_sidebar(
         );
         row += 1;
     } else {
-        for (i, agent) in agents.iter().enumerate() {
+        let visible = visible_item_count(height);
+        let end = (scroll_offset + visible).min(agents.len());
+
+        for (vi, agent) in agents[scroll_offset..end].iter().enumerate() {
+            let i = scroll_offset + vi;
             let is_selected = i == selected;
             let color = match agent.kind {
                 AgentKind::ClaudeCode => PEACH,
@@ -75,9 +86,9 @@ pub fn render_sidebar(
             let name = agent.kind.display_name();
             let has_badge = unseen_done.contains(&agent.pane_id);
 
-            let (state_color, state_label) = match agent.state {
-                AgentState::Working => (GREEN, "WORKING"),
-                AgentState::Idle => (GRAY, "IDLE"),
+            let state_color = match agent.state {
+                AgentState::Working => GREEN,
+                AgentState::Idle => GRAY,
             };
 
             let elapsed = format_elapsed(agent.elapsed_secs);
@@ -123,13 +134,13 @@ pub fn render_sidebar(
             // Top margin
             emit(&mut buf, row, bg, "");
             row += 1;
-            // Line 1: name ● STATE elapsed | ↑in ↓out | N% left
+            // Line 1: ● name elapsed | ↑in ↓out | N% left
             emit(
                 &mut buf,
                 row,
                 bg,
                 &format!(
-                    "  {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {state_color}● {state_label}{RESET}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
+                    "  {state_color}● {RESET}{bg} {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
                 ),
             );
             row += 1;

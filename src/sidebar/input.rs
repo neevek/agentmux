@@ -8,21 +8,21 @@ pub enum InputEvent {
     KeyEnter,
     KeyQuit,
     MouseClick { y: u32 },
+    MouseScrollUp,
+    MouseScrollDown,
     Resize,
     None,
 }
 
-/// Enable SGR mouse mode.
 pub fn enable_mouse() {
-    print!("\x1b[?1000h\x1b[?1006h");
+    // 1000 = button events, 1002 = button + motion, 1006 = SGR extended mode
+    print!("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
 }
 
-/// Disable SGR mouse mode.
 pub fn disable_mouse() {
-    print!("\x1b[?1000l\x1b[?1006l");
+    print!("\x1b[?1000l\x1b[?1002l\x1b[?1006l");
 }
 
-/// Poll stdin for input with a timeout. Returns the parsed event.
 pub fn poll_input(timeout: Duration) -> InputEvent {
     let fd = libc::STDIN_FILENO;
 
@@ -36,7 +36,6 @@ pub fn poll_input(timeout: Duration) -> InputEvent {
     };
 
     if ready < 0 {
-        // poll was interrupted by a signal (EINTR) — likely SIGWINCH
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if errno == libc::EINTR {
             return InputEvent::Resize;
@@ -62,20 +61,17 @@ fn parse_input(buf: &[u8]) -> InputEvent {
         return InputEvent::None;
     }
 
-    // Single byte keys
     if buf.len() == 1 {
         return match buf[0] {
             b'q' | b'Q' => InputEvent::KeyQuit,
             b'k' => InputEvent::KeyUp,
             b'j' => InputEvent::KeyDown,
-            13 => InputEvent::KeyEnter, // Enter
+            13 => InputEvent::KeyEnter,
             _ => InputEvent::None,
         };
     }
 
-    // Escape sequences
     if buf[0] == 0x1b && buf.len() >= 3 && buf[1] == b'[' {
-        // Arrow keys: ESC [ A/B
         if buf.len() == 3 {
             return match buf[2] {
                 b'A' => InputEvent::KeyUp,
@@ -93,7 +89,6 @@ fn parse_input(buf: &[u8]) -> InputEvent {
     InputEvent::None
 }
 
-/// Parse SGR mouse event: "button;x;yM" or "button;x;ym"
 fn parse_sgr_mouse(buf: &[u8]) -> InputEvent {
     let s = std::str::from_utf8(buf).unwrap_or("");
 
@@ -102,7 +97,7 @@ fn parse_sgr_mouse(buf: &[u8]) -> InputEvent {
         return InputEvent::None;
     }
 
-    let s = &s[..s.len() - 1]; // strip trailing M
+    let s = &s[..s.len() - 1];
     let parts: Vec<&str> = s.split(';').collect();
     if parts.len() != 3 {
         return InputEvent::None;
@@ -112,21 +107,25 @@ fn parse_sgr_mouse(buf: &[u8]) -> InputEvent {
     let _x: u32 = parts[1].parse().unwrap_or(0);
     let y: u32 = parts[2].parse().unwrap_or(0);
 
-    // Button 0 = left click
-    if button == 0 {
-        InputEvent::MouseClick { y }
-    } else {
-        InputEvent::None
+    match button {
+        0 => InputEvent::MouseClick { y },
+        64 => InputEvent::MouseScrollUp,
+        65 => InputEvent::MouseScrollDown,
+        _ => InputEvent::None,
     }
 }
 
-/// Convert a click y-coordinate to an agent index.
-/// Header = 3 rows. All items = 5 rows each (margin+name+cwd+activity+margin).
-pub fn click_to_agent_index(y: u32, agent_count: usize, _selected: usize) -> Option<usize> {
+/// Convert a click y-coordinate to an agent index, accounting for scroll offset.
+pub fn click_to_agent_index(
+    y: u32,
+    agent_count: usize,
+    scroll_offset: usize,
+) -> Option<usize> {
     use crate::sidebar::render::{HEADER_ROWS, ITEM_ROWS};
     if y <= HEADER_ROWS || agent_count == 0 {
         return None;
     }
-    let idx = ((y - HEADER_ROWS - 1) / ITEM_ROWS) as usize;
+    let visible_idx = ((y - HEADER_ROWS - 1) / ITEM_ROWS) as usize;
+    let idx = visible_idx + scroll_offset;
     if idx < agent_count { Some(idx) } else { None }
 }
