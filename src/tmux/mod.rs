@@ -1,7 +1,7 @@
 use std::process::Command;
 
 const SIDEBAR_TITLE: &str = "agentpane-sidebar";
-const DEFAULT_WIDTH: u32 = 50;
+const DEFAULT_WIDTH: u32 = 60;
 const WIDTH_OPTION: &str = "@agentpane-width";
 const SELECTED_OPTION: &str = "@agentpane-selected";
 
