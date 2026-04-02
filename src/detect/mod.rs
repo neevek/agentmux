@@ -1,3 +1,4 @@
+pub mod history;
 pub mod process;
 pub mod state;
 
@@ -84,7 +85,7 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
 /// Estimate cost using per-type pricing.
 /// Claude: cache_read = 10% of base input, cache_creation = 125% of base input.
 /// Codex/OpenAI: no cache breakdown (cache_read/cache_creation = 0).
-fn estimate_cost(
+pub(crate) fn estimate_cost(
     model: &str,
     total_input: u64,
     output_tokens: u64,

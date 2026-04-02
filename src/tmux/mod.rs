@@ -171,7 +171,7 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
     let sidebar_width = get_sidebar_width();
     let width_str = sidebar_width.to_string();
 
-    let (target, use_full) = find_split_target(window_id)?;
+    let target = find_split_target(window_id)?;
 
     let mut args = vec![
         "split-window",
@@ -185,14 +185,11 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
         "-F",
         "#{pane_id}",
     ];
-    if use_full {
-        args.insert(2, "-f");
-    }
     args.push(cmd);
     tmux_output(&args)
 }
 
-fn find_split_target(window_id: &str) -> Option<(String, bool)> {
+fn find_split_target(window_id: &str) -> Option<String> {
     let fmt = "#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_height}";
     let out = tmux_output(&["list-panes", "-t", window_id, "-F", fmt])?;
     let win_height: u32 =
@@ -216,16 +213,27 @@ fn find_split_target(window_id: &str) -> Option<(String, bool)> {
         })
         .collect();
 
+    // Prefer a full-height pane at left=0 (ideal: no -f needed)
     let full_height_left = panes.iter().find(|(_, left, top, height)| {
         *left == 0 && *top == 0 && (*height + 1 >= win_height || win_height == 0)
     });
 
     if let Some((id, _, _, _)) = full_height_left {
-        Some((id.clone(), false))
-    } else {
-        let first = panes.first()?;
-        Some((first.0.clone(), true))
+        return Some(id.clone());
     }
+
+    // Otherwise pick the tallest pane at left=0; never use -f to avoid squashing
+    // all other panes. The sidebar only takes space from the pane it splits from.
+    if let Some((id, _, _, _)) = panes
+        .iter()
+        .filter(|(_, left, _, _)| *left == 0)
+        .max_by_key(|(_, _, _, height)| *height)
+    {
+        return Some(id.clone());
+    }
+
+    // No pane at left=0 — just use the first pane
+    Some(panes.first()?.0.clone())
 }
 
 pub fn kill_pane(pane_id: &str) {

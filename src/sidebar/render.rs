@@ -1,4 +1,5 @@
 use crate::detect::AgentInfo;
+use crate::detect::history::{AgentTotals, AggregatedStats};
 use crate::detect::process::{AgentKind, format_elapsed};
 use crate::detect::state::{AgentState, format_tokens};
 use std::collections::HashSet;
@@ -25,8 +26,8 @@ const FLAMINGO: &str = "\x1b[38;2;242;205;205m"; // flamingo #f2cdcd (msg count)
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
 const HEADER_BG: &str = "\x1b[48;2;30;30;46m";
 
-/// Number of header rows
-pub const HEADER_ROWS: u32 = 3;
+/// Number of header rows (title 3 + table 5 = 8)
+pub const HEADER_ROWS: u32 = 8;
 
 /// Calculate the row count for a single agent item.
 pub fn item_row_count(agent: &AgentInfo) -> u32 {
@@ -64,6 +65,7 @@ pub fn render_sidebar(
     selected: usize,
     scroll_offset: usize,
     unseen_done: &HashSet<String>,
+    stats: &AggregatedStats,
 ) -> String {
     let w = width as usize;
     let mut buf = String::new();
@@ -83,7 +85,54 @@ pub fn render_sidebar(
         &format!("{}{BOLD}{WHITE}{title}{RESET}", " ".repeat(padding)),
     );
     row += 1;
+    // Row 3: padding below title
     emit_line_bg(&mut buf, row, HEADER_BG, "");
+    row += 1;
+
+    // === Stats table (box-drawing chars: ─ │ ┬ ┼ ┴) ===
+    let cell_w = w.saturating_sub(1) / 2; // │ takes 1 column
+    let right_cell_w = w.saturating_sub(1).saturating_sub(cell_w);
+    let h_left: String = std::iter::repeat_n('─', cell_w).collect();
+    let h_right: String = std::iter::repeat_n('─', right_cell_w).collect();
+
+    // Row 4: top border  ─────┬─────
+    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{h_left}┬{h_right}{RESET}"));
+    row += 1;
+
+    // Row 5: header — centered "Claude" │ "Codex"
+    let (lp, lr) = center_pad("Claude", cell_w);
+    let (rp, rr) = center_pad("Codex", right_cell_w);
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!(
+            "{}{PEACH}{BOLD}Claude{RESET}{}{DIM}│{RESET}{}{BLUE}{BOLD}Codex{RESET}{}",
+            " ".repeat(lp),
+            " ".repeat(lr),
+            " ".repeat(rp),
+            " ".repeat(rr),
+        ),
+    );
+    row += 1;
+
+    // Row 6: middle border  ─────┼─────
+    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{h_left}┼{h_right}{RESET}"));
+    row += 1;
+
+    // Row 7: body — centered stats
+    let left_body = format_agent_stats_centered(&stats.claude, cell_w);
+    let right_body = format_agent_stats_centered(&stats.codex, right_cell_w);
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!("{left_body}{DIM}│{RESET}{right_body}"),
+    );
+    row += 1;
+
+    // Row 8: bottom border  ─────┴─────
+    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{h_left}┴{h_right}{RESET}"));
     row += 1;
 
     if agents.is_empty() {
@@ -157,10 +206,7 @@ pub fn render_sidebar(
             info_parts.push(format!("{ctx_color}{left}% left{RESET}"));
             if agent.turn_count > 0 {
                 let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
-                info_parts.push(format!(
-                    "{FLAMINGO}{} {msg_label}{RESET}",
-                    agent.turn_count
-                ));
+                info_parts.push(format!("{FLAMINGO}{} {msg_label}{RESET}", agent.turn_count));
             }
 
             let info_str = format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep));
@@ -180,7 +226,11 @@ pub fn render_sidebar(
             row += 1;
             // Line 2 (optional): model (effort) | > last activity
             if has_detail_line(agent) {
-                let model_short = agent.model.as_deref().map(short_model_name).unwrap_or_default();
+                let model_short = agent
+                    .model
+                    .as_deref()
+                    .map(short_model_name)
+                    .unwrap_or_default();
                 let mut detail_parts: Vec<String> = Vec::new();
                 if !model_short.is_empty() {
                     let model_display = match &agent.effort {
@@ -193,7 +243,15 @@ pub fn render_sidebar(
                     let prefix = format!("{GREEN}{BOLD}>{RESET}{bg} ");
                     detail_parts.push(format!("{prefix}{DIM}{activity}{RESET}"));
                 }
-                emit(&mut buf, row, bg, &format!("  {}", detail_parts.join(&format!("{bg} {DIM}|{RESET}{bg} "))));
+                emit(
+                    &mut buf,
+                    row,
+                    bg,
+                    &format!(
+                        "  {}",
+                        detail_parts.join(&format!("{bg} {DIM}|{RESET}{bg} "))
+                    ),
+                );
                 row += 1;
             }
             // Line 3: [window] cwd
@@ -247,12 +305,63 @@ fn short_model_name(model: &str) -> String {
         }
     }
     // OpenAI models — check specific variants before broad patterns
-    for prefix in &["o4-mini", "o3-mini", "o3", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4", "gpt-5.3-codex", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.1", "gpt-4o-mini", "gpt-4o"] {
+    for prefix in &[
+        "o4-mini",
+        "o3-mini",
+        "o3",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4.1",
+        "gpt-4o-mini",
+        "gpt-4o",
+    ] {
         if model.contains(prefix) {
             return prefix.to_string();
         }
     }
     model.to_string()
+}
+
+/// Compute (left_pad, right_pad) to center `text` in `width` columns.
+fn center_pad(text: &str, width: usize) -> (usize, usize) {
+    let len = text.chars().count();
+    let left = width.saturating_sub(len) / 2;
+    let right = width.saturating_sub(len).saturating_sub(left);
+    (left, right)
+}
+
+fn format_agent_stats_centered(totals: &AgentTotals, cell_w: usize) -> String {
+    let input = format_tokens(totals.input_tokens);
+    let output = format_tokens(totals.output_tokens);
+    let cost = format_cost(totals.cost_usd);
+    let msgs = format_compact_count(totals.turns);
+
+    // Plain text for measuring visible width
+    let plain = format!("↑ {input} ↓ {output} | {cost} | {msgs} msgs");
+    let visible_len = plain.chars().count();
+
+    let pad_left = cell_w.saturating_sub(visible_len) / 2;
+    let pad_right = cell_w.saturating_sub(visible_len).saturating_sub(pad_left);
+
+    format!(
+        "{}{BLUE}↑ {input}{RESET} {MAUVE}↓ {output}{RESET} {DIM}|{RESET} {ROSEWATER}{cost}{RESET} {DIM}|{RESET} {FLAMINGO}{msgs} msgs{RESET}{}",
+        " ".repeat(pad_left),
+        " ".repeat(pad_right),
+    )
+}
+
+fn format_compact_count(n: u32) -> String {
+    if n < 1000 {
+        format!("{n}")
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
 
 fn format_cost(cost: f64) -> String {

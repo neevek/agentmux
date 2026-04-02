@@ -55,16 +55,16 @@ struct CachedData {
 }
 
 #[derive(Clone)]
-struct ParsedTokens {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-    last_activity: Option<String>,
-    context_pct: Option<u8>,
-    model: Option<String>,
-    effort: Option<String>,
-    turn_count: u32,
+pub(crate) struct ParsedTokens {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) cache_creation_tokens: u64,
+    pub(crate) last_activity: Option<String>,
+    pub(crate) context_pct: Option<u8>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) turn_count: u32,
 }
 
 impl SessionCache {
@@ -211,7 +211,7 @@ fn encode_project_dir(path: &str) -> String {
         .collect()
 }
 
-fn codex_sessions_dir() -> Option<PathBuf> {
+pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         let p = PathBuf::from(codex_home).join("sessions");
         if p.is_dir() {
@@ -387,7 +387,7 @@ fn detect_codex_state(path: &Path) -> AgentState {
 
 // --- Token counting (cached, full read) ---
 
-fn parse_claude_tokens(path: &Path) -> ParsedTokens {
+pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
     let entries = read_jsonl(path, None);
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
@@ -478,7 +478,7 @@ fn claude_effort_level() -> Option<String> {
         .clone()
 }
 
-fn parse_codex_tokens(path: &Path) -> ParsedTokens {
+pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
     let entries = read_jsonl(path, None);
     let mut input_tokens: u64 = 0;
     let mut output_tokens: u64 = 0;
