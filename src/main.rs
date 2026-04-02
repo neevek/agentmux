@@ -74,8 +74,8 @@ fn cmd_close() {
 /// and the sidebar feature is "on" (at least one sidebar exists elsewhere).
 fn cmd_ensure() {
     let current_window = tmux::current_window_id().expect("no current window");
-    if tmux::sidebar_in_window(&current_window) {
-        return;
+    if tmux::sidebar_pid_in_window(&current_window).is_some() {
+        return; // sidebar already exists in this window
     }
     // Only create if sidebar is "on" (at least one exists in another window)
     let session = tmux::current_session().expect("not running inside tmux");

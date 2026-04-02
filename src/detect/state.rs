@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -94,7 +94,13 @@ struct ParsedTokens {
 const ACTIVE_WRITE_THRESHOLD: Duration = Duration::from_secs(3);
 const TAIL_BYTES: u64 = 32768;
 
-pub fn claude_code_details(cwd: &str, cache: &mut SessionCache) -> SessionDetails {
+/// `agent_age_secs`: how long the agent process has been running.
+/// If the JSONL file is older than the process, it's from a previous session → return empty.
+pub fn claude_code_details(
+    cwd: &str,
+    agent_age_secs: u64,
+    cache: &mut SessionCache,
+) -> SessionDetails {
     let Some(home) = dirs::home_dir() else {
         return SessionDetails::default();
     };
@@ -105,16 +111,19 @@ pub fn claude_code_details(cwd: &str, cache: &mut SessionCache) -> SessionDetail
         return SessionDetails::default();
     };
 
+    // If file was last modified before this process started, it's from an old session
+    if file_older_than_process(&jsonl_path, agent_age_secs) {
+        return SessionDetails::default();
+    }
+
     let recently_active = file_recently_modified(&jsonl_path, ACTIVE_WRITE_THRESHOLD);
 
-    // State detection: always do a fast tail read
     let state = if recently_active {
         AgentState::Working
     } else {
         detect_claude_state(&jsonl_path)
     };
 
-    // Token counting: cached, only re-reads when file grows
     let cached = cache.get_or_update(&jsonl_path, parse_claude_tokens);
 
     SessionDetails {
@@ -126,15 +135,22 @@ pub fn claude_code_details(cwd: &str, cache: &mut SessionCache) -> SessionDetail
     }
 }
 
-pub fn codex_details(cwd: &str, cache: &mut SessionCache) -> SessionDetails {
+pub fn codex_details(
+    cwd: &str,
+    agent_age_secs: u64,
+    cache: &mut SessionCache,
+) -> SessionDetails {
     let Some(sessions_dir) = codex_sessions_dir() else {
         return SessionDetails::default();
     };
 
-    // Find the JSONL file whose session_meta.payload.cwd matches this agent's cwd
     let Some(jsonl_path) = find_codex_jsonl_for_cwd(&sessions_dir, cwd) else {
         return SessionDetails::default();
     };
+
+    if file_older_than_process(&jsonl_path, agent_age_secs) {
+        return SessionDetails::default();
+    }
 
     let recently_active = file_recently_modified(&jsonl_path, ACTIVE_WRITE_THRESHOLD);
 
@@ -153,6 +169,19 @@ pub fn codex_details(cwd: &str, cache: &mut SessionCache) -> SessionDetails {
         last_activity: cached.last_activity,
         context_pct: cached.context_pct,
     }
+}
+
+/// Check if a file was last modified before the agent process started.
+fn file_older_than_process(path: &PathBuf, agent_age_secs: u64) -> bool {
+    let file_age = fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    // File's age is greater than the process age → file predates the process
+    // Add a small buffer (5s) for startup timing
+    file_age > agent_age_secs + 5
 }
 
 fn file_recently_modified(path: &PathBuf, threshold: Duration) -> bool {
@@ -202,39 +231,6 @@ fn find_most_recent_jsonl(dir: &PathBuf) -> Option<PathBuf> {
         })
         .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
         .map(|e| e.path())
-}
-
-fn find_most_recent_jsonl_recursive(dir: &PathBuf) -> Option<PathBuf> {
-    if !dir.is_dir() {
-        return None;
-    }
-    let mut best: Option<(PathBuf, SystemTime)> = None;
-
-    fn walk(dir: &PathBuf, best: &mut Option<(PathBuf, SystemTime)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, best);
-            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        let dominated = best
-                            .as_ref()
-                            .is_none_or(|(_, prev_mtime)| mtime > *prev_mtime);
-                        if dominated {
-                            *best = Some((path, mtime));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    walk(dir, &mut best);
-    best.map(|(p, _)| p)
 }
 
 /// Find the Codex JSONL file whose session_meta.payload.cwd matches the given cwd.
@@ -336,7 +332,7 @@ fn full_read_jsonl(path: &PathBuf) -> Vec<Value> {
 
 pub fn format_tokens(tokens: u64) -> String {
     if tokens == 0 {
-        return String::new();
+        return "0".to_string();
     }
     if tokens < 1000 {
         format!("{tokens}")
@@ -502,6 +498,9 @@ fn parse_claude_tokens(path: &PathBuf) -> ParsedTokens {
     let mut last_activity: Option<String> = None;
     let mut last_turn_input: u64 = 0;
     let mut model_name: Option<String> = None;
+    // Claude Code writes duplicate JSONL entries per message (streaming + final).
+    // Deduplicate by message.id to avoid double-counting tokens.
+    let mut seen_ids: HashSet<String> = HashSet::new();
 
     for entry in &entries {
         let Some(msg) = entry.get("message") else {
@@ -511,6 +510,13 @@ fn parse_claude_tokens(path: &PathBuf) -> ParsedTokens {
             continue;
         };
         if role == "assistant" {
+            // Skip duplicate message entries
+            if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                if !seen_ids.insert(id.to_string()) {
+                    continue; // already counted this message
+                }
+            }
+
             if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
                 model_name = Some(m.to_string());
             }
@@ -687,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_format_tokens() {
-        assert_eq!(format_tokens(0), "");
+        assert_eq!(format_tokens(0), "0");
         assert_eq!(format_tokens(500), "500");
         assert_eq!(format_tokens(1500), "1.5k");
         assert_eq!(format_tokens(1_500_000), "1.5M");
