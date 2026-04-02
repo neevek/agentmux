@@ -22,7 +22,7 @@ pub struct AgentInfo {
 /// Full scan: find all agent panes in the session and determine their state.
 pub fn scan_agents(session: &str) -> Vec<AgentInfo> {
     let panes = tmux::list_session_panes(session);
-    let detected = process::scan_panes_for_agents(&panes, "coding-agent-mux-sidebar");
+    let detected = process::scan_panes_for_agents(&panes, "tmux-agents-sidebar");
 
     // Build a window_id → window_name map
     let window_names = tmux::list_window_names(session);

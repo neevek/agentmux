@@ -1,8 +1,8 @@
 use std::process::Command;
 
-const SIDEBAR_TITLE: &str = "coding-agent-mux-sidebar";
+const SIDEBAR_TITLE: &str = "tmux-agents-sidebar";
 const DEFAULT_WIDTH: u32 = 30;
-const WIDTH_OPTION: &str = "@coding-agent-mux-width";
+const WIDTH_OPTION: &str = "@tmux-agents-width";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -191,7 +191,7 @@ pub fn remove_hook(hook_name: &str) {
 /// Get the path to our own binary.
 pub fn self_binary() -> String {
     std::env::current_exe()
-        .unwrap_or_else(|_| "coding-agent-mux".into())
+        .unwrap_or_else(|_| "tmux-agents".into())
         .display()
         .to_string()
 }
