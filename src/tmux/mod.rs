@@ -114,18 +114,21 @@ pub fn list_window_names(session: &str) -> std::collections::HashMap<String, Str
 }
 
 /// Create a sidebar split on the left side of a window.
-/// Uses the saved width. Returns the new pane ID.
-pub fn create_sidebar_split(target_pane: &str, cmd: &str) -> Option<String> {
-    let width = get_sidebar_width().to_string();
+/// Splits the leftmost pane with `-hb` (no `-f`): only that pane shrinks,
+/// no proportional redistribution, no flicker. The sidebar inherits the
+/// target pane's height — full height in standard horizontal layouts.
+pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
+    let sidebar_width = get_sidebar_width();
+    let target = first_pane_in_window(window_id)?;
+    let width_str = sidebar_width.to_string();
     tmux_output(&[
         "split-window",
         "-hb",
-        "-f",
         "-l",
-        &width,
+        &width_str,
         "-t",
-        target_pane,
-        "-d", // don't switch focus to the new pane
+        &target,
+        "-d",
         "-P",
         "-F",
         "#{pane_id}",
