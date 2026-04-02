@@ -27,12 +27,14 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
 
     let window_names = tmux::list_window_names(session);
 
-    detected
+    let mut agents: Vec<AgentInfo> = detected
         .into_iter()
         .map(|d| {
             let details = match d.kind {
-                AgentKind::ClaudeCode => state::claude_code_details(&d.cwd, cache),
-                AgentKind::Codex => state::codex_details(&d.cwd, cache),
+                AgentKind::ClaudeCode => {
+                    state::claude_code_details(&d.cwd, d.elapsed_secs, cache)
+                }
+                AgentKind::Codex => state::codex_details(&d.cwd, d.elapsed_secs, cache),
             };
             let window_name = window_names
                 .get(&d.window_id)
@@ -52,5 +54,10 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
                 context_pct: details.context_pct,
             }
         })
-        .collect()
+        .collect();
+
+    // Newest agents first (lowest elapsed_secs = most recently started)
+    agents.sort_by_key(|a| a.elapsed_secs);
+
+    agents
 }

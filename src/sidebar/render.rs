@@ -12,8 +12,10 @@ const GREEN: &str = "\x1b[38;2;166;227;161m";
 const GRAY: &str = "\x1b[38;2;127;132;156m";
 const WHITE: &str = "\x1b[38;2;205;214;244m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
-const BLUE: &str = "\x1b[38;2;137;180;250m"; // blue #89b4fa (input tokens)
+const BLUE: &str = "\x1b[38;2;137;180;250m";  // blue #89b4fa (input tokens)
 const MAUVE: &str = "\x1b[38;2;203;166;247m"; // mauve #cba6f7 (output tokens)
+const TEAL: &str = "\x1b[38;2;148;226;213m";  // teal #94e2d5 (context left)
+const SUBTEXT: &str = "\x1b[38;2;186;194;222m"; // subtext0 #bac2de (cwd)
 
 // Backgrounds
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
@@ -100,21 +102,19 @@ pub fn render_sidebar(
             // Build info trail: ↑19.1M ↓93.4k | 51% left
             let sep = format!("{bg} {DIM}|{RESET}{bg} ");
             let mut info_parts: Vec<String> = Vec::new();
-            if !in_tok.is_empty() || !out_tok.is_empty() {
-                info_parts.push(format!(
-                    "{BLUE}↑ {in_tok}{RESET}{bg} {MAUVE}↓ {out_tok}{RESET}"
-                ));
-            }
-            if let Some(pct) = agent.context_pct {
-                let left = 100u8.saturating_sub(pct);
-                let ctx_color = if left <= 20 { YELLOW } else { GREEN };
-                info_parts.push(format!("{ctx_color}{left}% left{RESET}"));
-            }
-            let info_str = if info_parts.is_empty() {
-                String::new()
-            } else {
-                format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep))
+            // Always show tokens
+            info_parts.push(format!(
+                "{BLUE}↑ {in_tok}{RESET}{bg} {MAUVE}↓ {out_tok}{RESET}"
+            ));
+            // Show context left: use value if available, 100% for new sessions
+            let left = match agent.context_pct {
+                Some(pct) => 100u8.saturating_sub(pct),
+                None => 100,
             };
+            let ctx_color = if left <= 20 { YELLOW } else { TEAL };
+            info_parts.push(format!("{ctx_color}{left}% left{RESET}"));
+
+            let info_str = format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep));
 
             // Top margin
             emit(&mut buf, row, bg, "");
@@ -134,7 +134,7 @@ pub fn render_sidebar(
                 &mut buf,
                 row,
                 bg,
-                &format!("  {DIM}[{win_name}]{RESET}{bg} {DIM}{short_cwd}{RESET}"),
+                &format!("  {GRAY}[{win_name}]{RESET}{bg} {SUBTEXT}{short_cwd}{RESET}"),
             );
             row += 1;
             // Line 3: last activity
