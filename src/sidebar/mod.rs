@@ -15,8 +15,8 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
     SHOULD_EXIT.store(true, Ordering::Relaxed);
 }
 
-const ACTIVE_POLL_MS: u64 = 3000;
-const INACTIVE_POLL_MS: u64 = 1000;
+const SCAN_INTERVAL_MS: u64 = 3000;
+const IDLE_CHECK_MS: u64 = 1000;
 
 pub fn run() {
     let session = tmux::current_session().expect("not running inside tmux");
@@ -34,7 +34,6 @@ pub fn run() {
     let mut unseen_done: HashSet<String> = HashSet::new();
     let mut session_cache = detect::SessionCache::new();
     let mut cached_agents: Vec<AgentInfo> = Vec::new();
-    let mut current_window;
     let mut last_selected_pane = String::new();
 
     loop {
@@ -43,14 +42,11 @@ pub fn run() {
         }
 
         let is_active = tmux::is_pane_in_active_window();
-
-        // All sidebars: check if selection changed (cheap: 1 tmux query)
         let selected_pane = tmux::get_selected_pane();
         let selection_changed = selected_pane != last_selected_pane;
-        last_selected_pane = selected_pane.clone();
+        last_selected_pane.clone_from(&selected_pane);
 
         if is_active {
-            // Active: full scan
             let agents = detect::scan_agents(&session, &mut session_cache);
 
             for agent in &agents {
@@ -62,84 +58,57 @@ pub fn run() {
                 }
                 prev_states.insert(agent.pane_id.clone(), agent.state);
             }
-            let current_ids: HashSet<&str> =
-                agents.iter().map(|a| a.pane_id.as_str()).collect();
+            let current_ids: HashSet<&str> = agents.iter().map(|a| a.pane_id.as_str()).collect();
             prev_states.retain(|k, _| current_ids.contains(k.as_str()));
             unseen_done.retain(|k| current_ids.contains(k.as_str()));
 
-            current_window = tmux::current_window_id().unwrap_or_default();
-            for agent in &agents {
-                if agent.window_id == current_window {
-                    unseen_done.remove(&agent.pane_id);
+            if let Some(current_window) = tmux::current_window_id() {
+                for agent in &agents {
+                    if agent.window_id == current_window {
+                        unseen_done.remove(&agent.pane_id);
+                    }
                 }
             }
 
             cached_agents = agents;
         }
 
-        // All sidebars: render (active renders fresh data, inactive renders cached)
-        // Only re-render inactive sidebars when selection actually changed.
-        if is_active || selection_changed {
-            let selected = cached_agents
-                .iter()
-                .position(|a| a.pane_id == selected_pane)
-                .unwrap_or(0);
+        // Resolve selected index once — reused for render and input handling
+        let selected_idx = cached_agents
+            .iter()
+            .position(|a| a.pane_id == selected_pane)
+            .unwrap_or(0);
 
+        if is_active || selection_changed {
             let (width, height) = terminal_size();
             print!(
                 "{}",
-                render::render_sidebar(&cached_agents, width, height, selected, &unseen_done)
+                render::render_sidebar(&cached_agents, width, height, selected_idx, &unseen_done)
             );
             flush();
         }
 
-        // Active: handle input, poll at active rate
-        // Inactive: no input, poll at inactive rate
         if is_active {
-            let timeout = std::time::Duration::from_millis(ACTIVE_POLL_MS);
+            let timeout = std::time::Duration::from_millis(SCAN_INTERVAL_MS);
             match input::poll_input(timeout) {
                 input::InputEvent::KeyUp => {
-                    let selected = cached_agents
-                        .iter()
-                        .position(|a| a.pane_id == last_selected_pane)
-                        .unwrap_or(0);
-                    let new_sel = if selected > 0 { selected - 1 } else { 0 };
-                    if let Some(agent) = cached_agents.get(new_sel) {
-                        tmux::set_selected_pane(&agent.pane_id);
-                    }
+                    let new_sel = selected_idx.saturating_sub(1);
+                    set_selection(&cached_agents, new_sel);
                 }
                 input::InputEvent::KeyDown => {
-                    let selected = cached_agents
-                        .iter()
-                        .position(|a| a.pane_id == last_selected_pane)
-                        .unwrap_or(0);
-                    let new_sel =
-                        if !cached_agents.is_empty() && selected < cached_agents.len() - 1 {
-                            selected + 1
-                        } else {
-                            selected
-                        };
-                    if let Some(agent) = cached_agents.get(new_sel) {
-                        tmux::set_selected_pane(&agent.pane_id);
-                    }
+                    let max = cached_agents.len().saturating_sub(1);
+                    set_selection(&cached_agents, selected_idx.min(max - 1) + 1);
                 }
                 input::InputEvent::KeyEnter => {
-                    if let Some(agent) = cached_agents
-                        .iter()
-                        .find(|a| a.pane_id == last_selected_pane)
-                    {
+                    if let Some(agent) = cached_agents.get(selected_idx) {
                         unseen_done.remove(&agent.pane_id);
                         tmux::select_window(&agent.window_id);
                         tmux::select_pane(&agent.pane_id);
                     }
                 }
                 input::InputEvent::MouseClick { y } => {
-                    let selected = cached_agents
-                        .iter()
-                        .position(|a| a.pane_id == last_selected_pane)
-                        .unwrap_or(0);
                     if let Some(agent) =
-                        input::click_to_agent_index(y, cached_agents.len(), selected)
+                        input::click_to_agent_index(y, cached_agents.len(), selected_idx)
                             .and_then(|idx| cached_agents.get(idx))
                     {
                         tmux::set_selected_pane(&agent.pane_id);
@@ -152,9 +121,15 @@ pub fn run() {
                 input::InputEvent::Resize | input::InputEvent::None => {}
             }
         } else {
-            let timeout = std::time::Duration::from_millis(INACTIVE_POLL_MS);
+            let timeout = std::time::Duration::from_millis(IDLE_CHECK_MS);
             let _ = input::poll_input(timeout);
         }
+    }
+}
+
+fn set_selection(agents: &[AgentInfo], idx: usize) {
+    if let Some(agent) = agents.get(idx) {
+        tmux::set_selected_pane(&agent.pane_id);
     }
 }
 

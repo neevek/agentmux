@@ -1,5 +1,5 @@
 use crate::detect::AgentInfo;
-use crate::detect::process::format_elapsed;
+use crate::detect::process::{AgentKind, format_elapsed};
 use crate::detect::state::{AgentState, format_tokens};
 use std::collections::HashSet;
 
@@ -12,10 +12,11 @@ const GREEN: &str = "\x1b[38;2;166;227;161m";
 const GRAY: &str = "\x1b[38;2;127;132;156m";
 const WHITE: &str = "\x1b[38;2;205;214;244m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
-const BLUE: &str = "\x1b[38;2;137;180;250m";  // blue #89b4fa (input tokens)
+const BLUE: &str = "\x1b[38;2;137;180;250m"; // blue #89b4fa (input tokens)
 const MAUVE: &str = "\x1b[38;2;203;166;247m"; // mauve #cba6f7 (output tokens)
-const TEAL: &str = "\x1b[38;2;148;226;213m";  // teal #94e2d5 (context left)
+const TEAL: &str = "\x1b[38;2;148;226;213m"; // teal #94e2d5 (context left)
 const SUBTEXT: &str = "\x1b[38;2;186;194;222m"; // subtext0 #bac2de (cwd)
+const PEACH: &str = "\x1b[38;2;250;179;135m"; // peach #fab387 (Claude)
 
 // Backgrounds
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
@@ -67,7 +68,10 @@ pub fn render_sidebar(
     } else {
         for (i, agent) in agents.iter().enumerate() {
             let is_selected = i == selected;
-            let color = agent.kind.color_code();
+            let color = match agent.kind {
+                AgentKind::ClaudeCode => PEACH,
+                AgentKind::Codex => BLUE,
+            };
             let name = agent.kind.display_name();
             let has_badge = unseen_done.contains(&agent.pane_id);
 
@@ -140,12 +144,7 @@ pub fn render_sidebar(
             // Line 3: last activity
             if let Some(ref activity) = agent.last_activity {
                 let short: String = activity.chars().take(w.saturating_sub(5)).collect();
-                emit(
-                    &mut buf,
-                    row,
-                    bg,
-                    &format!("  {DIM}> {short}{RESET}"),
-                );
+                emit(&mut buf, row, bg, &format!("  {DIM}> {short}{RESET}"));
             } else {
                 emit(&mut buf, row, bg, "");
             }
@@ -177,10 +176,14 @@ fn emit_line_clear(buf: &mut String, row: u32) {
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {
-    let home = dirs::home_dir()
-        .map(|h| h.display().to_string())
-        .unwrap_or_default();
-    let display = if !home.is_empty() && path.starts_with(&home) {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<String> = OnceLock::new();
+    let home = HOME.get_or_init(|| {
+        dirs::home_dir()
+            .map(|h| h.display().to_string())
+            .unwrap_or_default()
+    });
+    let display = if !home.is_empty() && path.starts_with(home.as_str()) {
         format!("~{}", &path[home.len()..])
     } else {
         path.to_string()

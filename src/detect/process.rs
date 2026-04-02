@@ -23,14 +23,6 @@ impl AgentKind {
             AgentKind::Codex => "Codex",
         }
     }
-
-    /// 24-bit ANSI foreground color code
-    pub fn color_code(&self) -> &str {
-        match self {
-            AgentKind::ClaudeCode => "\x1b[38;2;250;179;135m", // peach #fab387
-            AgentKind::Codex => "\x1b[38;2;137;180;250m",     // blue #89b4fa
-        }
-    }
 }
 
 const ALL_AGENTS: &[AgentKind] = &[AgentKind::ClaudeCode, AgentKind::Codex];
