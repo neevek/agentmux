@@ -90,6 +90,22 @@ pub fn sidebar_in_window(window_id: &str) -> bool {
     out.lines().any(|line| line == SIDEBAR_TITLE)
 }
 
+/// Check if this sidebar's window is the active window.
+/// Uses $TMUX_PANE to identify our pane, then checks if its window is active.
+pub fn is_pane_in_active_window() -> bool {
+    let Some(pane_id) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) else {
+        return true; // assume active if we can't determine
+    };
+    tmux_output(&[
+        "display-message",
+        "-t",
+        &pane_id,
+        "-p",
+        "#{window_active}",
+    ])
+    .is_some_and(|s| s == "1")
+}
+
 /// List all window IDs in a session.
 pub fn list_window_ids(session: &str) -> Vec<String> {
     let Some(out) = tmux_output(&["list-windows", "-t", session, "-F", "#{window_id}"]) else {
@@ -114,14 +130,15 @@ pub fn list_window_names(session: &str) -> std::collections::HashMap<String, Str
 }
 
 /// Create a sidebar split on the left side of a window.
-/// Splits the leftmost pane with `-hb` (no `-f`): only that pane shrinks,
-/// no proportional redistribution, no flicker. The sidebar inherits the
-/// target pane's height — full height in standard horizontal layouts.
+/// For simple horizontal layouts: no `-f`, no squash, no flicker.
+/// For complex layouts (no leftmost pane spans full height): uses `-f` for correct height.
 pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
     let sidebar_width = get_sidebar_width();
-    let target = first_pane_in_window(window_id)?;
     let width_str = sidebar_width.to_string();
-    tmux_output(&[
+
+    let (target, use_full) = find_split_target(window_id)?;
+
+    let mut args = vec![
         "split-window",
         "-hb",
         "-l",
@@ -132,8 +149,59 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
         "-P",
         "-F",
         "#{pane_id}",
-        cmd,
+    ];
+    if use_full {
+        args.insert(2, "-f");
+    }
+    args.push(cmd);
+    tmux_output(&args)
+}
+
+/// Find the best pane to split for the sidebar.
+/// Returns (pane_id, needs_full_split).
+/// If any leftmost pane spans full window height, split it without -f.
+/// Otherwise, use -f for full height (accepts proportional redistribution).
+fn find_split_target(window_id: &str) -> Option<(String, bool)> {
+    let fmt = "#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_height}";
+    let out = tmux_output(&["list-panes", "-t", window_id, "-F", fmt])?;
+    let win_height: u32 = tmux_output(&[
+        "display-message",
+        "-t",
+        window_id,
+        "-p",
+        "#{window_height}",
     ])
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(0);
+
+    let panes: Vec<(String, u32, u32, u32)> = out
+        .lines()
+        .filter_map(|line| {
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() < 4 {
+                return None;
+            }
+            Some((
+                p[0].to_string(),
+                p[1].parse().ok()?,
+                p[2].parse().ok()?,
+                p[3].parse().ok()?,
+            ))
+        })
+        .collect();
+
+    // Look for a leftmost pane (left == 0) that spans full height
+    let full_height_left = panes.iter().find(|(_, left, top, height)| {
+        *left == 0 && *top == 0 && (*height + 1 >= win_height || win_height == 0)
+    });
+
+    if let Some((id, _, _, _)) = full_height_left {
+        Some((id.clone(), false)) // no -f needed
+    } else {
+        // No single pane spans full height — use -f, target first pane
+        let first = panes.first()?;
+        Some((first.0.clone(), true))
+    }
 }
 
 /// Resize a pane to a specific width.
