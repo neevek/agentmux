@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::detect;
 use crate::detect::state::AgentState;
+use crate::detect::AgentInfo;
 use crate::tmux;
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -18,6 +19,8 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
 extern "C" fn winch_handler(_sig: libc::c_int) {
     NEED_RESIZE.store(true, Ordering::Relaxed);
 }
+
+const POLL_SECS: u64 = 3;
 
 pub fn run() {
     let session = tmux::current_session().expect("not running inside tmux");
@@ -37,6 +40,8 @@ pub fn run() {
     let mut prev_states: HashMap<String, AgentState> = HashMap::new();
     let mut unseen_done: HashSet<String> = HashSet::new();
     let mut session_cache = detect::SessionCache::new();
+    let mut cached_agents: Vec<AgentInfo> = Vec::new();
+    let mut current_window = tmux::current_window_id().unwrap_or_default();
 
     loop {
         if SHOULD_EXIT.load(Ordering::Relaxed) {
@@ -46,31 +51,54 @@ pub fn run() {
         // Consume any pending resize
         NEED_RESIZE.store(false, Ordering::Relaxed);
 
-        let (width, height) = terminal_size();
-        let agents = detect::scan_agents(&session, &mut session_cache);
+        let is_active = tmux::is_pane_in_active_window();
 
-        // Update notification badges
-        for agent in &agents {
-            if let Some(&prev) = prev_states.get(&agent.pane_id) {
-                if prev == AgentState::Working && agent.state == AgentState::Idle {
-                    unseen_done.insert(agent.pane_id.clone());
+        let agents = if is_active {
+            // Active window: full scan
+            let agents = detect::scan_agents(&session, &mut session_cache);
+
+            // Update notification badges
+            for agent in &agents {
+                if let Some(&prev) = prev_states.get(&agent.pane_id) {
+                    if prev == AgentState::Working && agent.state == AgentState::Idle {
+                        unseen_done.insert(agent.pane_id.clone());
+                    }
+                }
+                prev_states.insert(agent.pane_id.clone(), agent.state);
+            }
+            let current_ids: HashSet<&str> =
+                agents.iter().map(|a| a.pane_id.as_str()).collect();
+            prev_states.retain(|k, _| current_ids.contains(k.as_str()));
+            unseen_done.retain(|k| current_ids.contains(k.as_str()));
+
+            // Clear badges for agents in the current window (user can see them)
+            for agent in &agents {
+                if agent.window_id == current_window {
+                    unseen_done.remove(&agent.pane_id);
                 }
             }
-            prev_states.insert(agent.pane_id.clone(), agent.state);
-        }
-        let current_ids: HashSet<&str> = agents.iter().map(|a| a.pane_id.as_str()).collect();
-        prev_states.retain(|k, _| current_ids.contains(k.as_str()));
-        unseen_done.retain(|k| current_ids.contains(k.as_str()));
+
+            cached_agents = agents;
+            &cached_agents
+        } else {
+            // Inactive window: reuse cached state, no scanning
+            &cached_agents
+        };
 
         if !agents.is_empty() && selected >= agents.len() {
             selected = agents.len() - 1;
         }
 
-        let output = render::render_sidebar(&agents, width, height, selected, &unseen_done);
+        let (width, height) = terminal_size();
+        let output = render::render_sidebar(agents, width, height, selected, &unseen_done);
         print!("{output}");
         flush();
 
-        let timeout = std::time::Duration::from_secs(3);
+        if is_active {
+            current_window = tmux::current_window_id().unwrap_or_default();
+        }
+
+        let timeout = std::time::Duration::from_secs(POLL_SECS);
         match input::poll_input(timeout) {
             input::InputEvent::KeyUp => {
                 if selected > 0 {
@@ -100,7 +128,11 @@ pub fn run() {
                 }
             }
             input::InputEvent::KeyQuit => break,
-            input::InputEvent::Resize | input::InputEvent::None => {}
+            input::InputEvent::Resize => {
+                // SIGWINCH often fires on window switch — loop immediately to
+                // re-check active state and refresh if we just became active
+            }
+            input::InputEvent::None => {}
         }
     }
 }
