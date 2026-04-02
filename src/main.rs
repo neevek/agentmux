@@ -95,7 +95,7 @@ fn create_sidebar_in_window(window_id: &str) {
     let binary = tmux::self_binary();
     let cmd = format!("{} sidebar", binary);
     if let Some(new_pane_id) = tmux::create_sidebar_in(window_id, &cmd) {
-        tmux::set_pane_title(&new_pane_id, "agentpane-sidebar");
+        tmux::set_pane_title(&new_pane_id, tmux::SIDEBAR_TITLE);
     }
 }
 
