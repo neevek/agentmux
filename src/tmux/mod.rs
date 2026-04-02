@@ -1,9 +1,9 @@
 use std::process::Command;
 
-const SIDEBAR_TITLE: &str = "tmux-agents-sidebar";
+const SIDEBAR_TITLE: &str = "agentpane-sidebar";
 const DEFAULT_WIDTH: u32 = 50;
-const WIDTH_OPTION: &str = "@tmux-agents-width";
-const SELECTED_OPTION: &str = "@tmux-agents-selected";
+const WIDTH_OPTION: &str = "@agentpane-width";
+const SELECTED_OPTION: &str = "@agentpane-selected";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -212,7 +212,7 @@ pub fn remove_hook(hook_name: &str) {
 
 pub fn self_binary() -> String {
     std::env::current_exe()
-        .unwrap_or_else(|_| "tmux-agents".into())
+        .unwrap_or_else(|_| "agentpane".into())
         .display()
         .to_string()
 }
