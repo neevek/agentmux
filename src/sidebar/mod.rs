@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::detect;
+use crate::detect::history::HistoryStore;
 use crate::detect::state::AgentState;
 use crate::detect::AgentInfo;
 use crate::tmux;
@@ -37,6 +38,9 @@ pub fn run() {
     let mut last_selected_pane = String::new();
     let mut scroll_offset: usize = 0;
     let mut last_width: u32 = 0;
+
+    let mut history = HistoryStore::load();
+    history.full_scan();
 
     loop {
         if SHOULD_EXIT.load(Ordering::Relaxed) {
@@ -73,6 +77,11 @@ pub fn run() {
             }
 
             cached_agents = agents;
+
+            // Periodic history re-scan (every 60s)
+            if history.should_rescan() {
+                history.full_scan();
+            }
         }
 
         let selected_idx = cached_agents
@@ -98,6 +107,7 @@ pub fn run() {
                 tmux::save_sidebar_width(&session, width);
             }
             last_width = width;
+            let stats = history.aggregated_stats();
             print!(
                 "{}",
                 render::render_sidebar(
@@ -107,6 +117,7 @@ pub fn run() {
                     selected_idx,
                     scroll_offset,
                     &unseen_done,
+                    &stats,
                 )
             );
             flush();
