@@ -17,6 +17,9 @@ const MAUVE: &str = "\x1b[38;2;203;166;247m"; // mauve #cba6f7 (output tokens)
 const TEAL: &str = "\x1b[38;2;148;226;213m"; // teal #94e2d5 (context left)
 const SUBTEXT: &str = "\x1b[38;2;186;194;222m"; // subtext0 #bac2de (cwd)
 const PEACH: &str = "\x1b[38;2;250;179;135m"; // peach #fab387 (Claude)
+const ROSEWATER: &str = "\x1b[38;2;245;224;220m"; // rosewater #f5e0dc (cost)
+const SAPPHIRE: &str = "\x1b[38;2;116;199;236m"; // sapphire #74c7ec (model)
+const FLAMINGO: &str = "\x1b[38;2;242;205;205m"; // flamingo #f2cdcd (msg count)
 
 // Backgrounds
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
@@ -29,10 +32,7 @@ pub const HEADER_ROWS: u32 = 3;
 pub fn item_row_count(agent: &AgentInfo) -> u32 {
     // Always: top margin (1) + info (1) + path (1) + bottom margin (1) = 4
     let mut rows = 4u32;
-    if has_meta_line(agent) {
-        rows += 1;
-    }
-    if agent.last_activity.is_some() {
+    if has_detail_line(agent) {
         rows += 1;
     }
     rows
@@ -53,8 +53,8 @@ pub fn visible_item_count(height: u32, agents: &[AgentInfo], scroll_offset: usiz
     count
 }
 
-fn has_meta_line(agent: &AgentInfo) -> bool {
-    agent.model.is_some() || agent.cost_usd >= 0.01 || agent.turn_count > 0
+fn has_detail_line(agent: &AgentInfo) -> bool {
+    agent.model.is_some() || agent.last_activity.is_some()
 }
 
 pub fn render_sidebar(
@@ -138,13 +138,16 @@ pub fn render_sidebar(
                 emit_line_no_bg
             };
 
-            // Build info trail: ↑19.1M ↓93.4k | 51% left
+            // Build info trail: ↑19.1M ↓93.4k | $34.4 | 51% left | 22 msgs
             let sep = format!("{bg} {DIM}|{RESET}{bg} ");
             let mut info_parts: Vec<String> = Vec::new();
             // Always show tokens
             info_parts.push(format!(
                 "{BLUE}↑ {in_tok}{RESET}{bg} {MAUVE}↓ {out_tok}{RESET}"
             ));
+            if agent.cost_usd >= 0.01 {
+                info_parts.push(format!("{ROSEWATER}{}{RESET}", format_cost(agent.cost_usd)));
+            }
             // Show context left: use value if available, 100% for new sessions
             let left = match agent.context_pct {
                 Some(pct) => 100u8.saturating_sub(pct),
@@ -152,6 +155,13 @@ pub fn render_sidebar(
             };
             let ctx_color = if left <= 20 { YELLOW } else { TEAL };
             info_parts.push(format!("{ctx_color}{left}% left{RESET}"));
+            if agent.turn_count > 0 {
+                let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
+                info_parts.push(format!(
+                    "{FLAMINGO}{} {msg_label}{RESET}",
+                    agent.turn_count
+                ));
+            }
 
             let info_str = format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep));
 
@@ -168,25 +178,22 @@ pub fn render_sidebar(
                 ),
             );
             row += 1;
-            // Line 2 (optional): model [- effort] | est. $cost | N turn(s)
-            if has_meta_line(agent) {
+            // Line 2 (optional): model (effort) | > last activity
+            if has_detail_line(agent) {
                 let model_short = agent.model.as_deref().map(short_model_name).unwrap_or_default();
-                let mut meta_parts: Vec<String> = Vec::new();
+                let mut detail_parts: Vec<String> = Vec::new();
                 if !model_short.is_empty() {
                     let model_display = match &agent.effort {
-                        Some(effort) => format!("{model_short} - {effort}"),
+                        Some(effort) => format!("{model_short} ({effort})"),
                         None => model_short,
                     };
-                    meta_parts.push(model_display);
+                    detail_parts.push(format!("{SAPPHIRE}{model_display}{RESET}"));
                 }
-                if agent.cost_usd >= 0.01 {
-                    meta_parts.push(format!("est. {}", format_cost(agent.cost_usd)));
+                if let Some(ref activity) = agent.last_activity {
+                    let prefix = format!("{GREEN}{BOLD}>{RESET}{bg} ");
+                    detail_parts.push(format!("{prefix}{DIM}{activity}{RESET}"));
                 }
-                if agent.turn_count > 0 {
-                    let turn_label = if agent.turn_count == 1 { "turn" } else { "turns" };
-                    meta_parts.push(format!("{} {turn_label}", agent.turn_count));
-                }
-                emit(&mut buf, row, bg, &format!("  {DIM}{}{RESET}", meta_parts.join(" | ")));
+                emit(&mut buf, row, bg, &format!("  {}", detail_parts.join(&format!("{bg} {DIM}|{RESET}{bg} "))));
                 row += 1;
             }
             // Line 3: [window] cwd
@@ -197,12 +204,6 @@ pub fn render_sidebar(
                 &format!("  {GRAY}[{win_name}]{RESET}{bg} {SUBTEXT}{short_cwd}{RESET}"),
             );
             row += 1;
-            // Line 4 (optional): last activity — at the end
-            if let Some(ref activity) = agent.last_activity {
-                let short: String = activity.chars().take(w.saturating_sub(5)).collect();
-                emit(&mut buf, row, bg, &format!("  {GREEN}{BOLD}>{RESET}{bg} {DIM}{short}{RESET}"));
-                row += 1;
-            }
             // Bottom margin
             emit(&mut buf, row, bg, "");
             row += 1;
