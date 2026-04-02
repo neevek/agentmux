@@ -64,10 +64,8 @@ impl SessionCache {
             .map(|m| m.len())
             .unwrap_or(0);
 
-        if let Some(cached) = self.entries.get(path) {
-            if cached.file_size == current_size {
-                return cached.clone();
-            }
+        if let Some(cached) = self.entries.get(path).filter(|c| c.file_size == current_size) {
+            return cached.clone();
         }
 
         // File grew or first read — do full parse
@@ -251,12 +249,13 @@ fn find_codex_jsonl_for_cwd(sessions_dir: &PathBuf, cwd: &str) -> Option<PathBuf
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, files);
-            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        files.push((path, mtime));
-                    }
-                }
+            } else if let Some(mtime) = path
+                .extension()
+                .is_some_and(|ext| ext == "jsonl")
+                .then(|| entry.metadata().ok().and_then(|m| m.modified().ok()))
+                .flatten()
+            {
+                files.push((path, mtime));
             }
         }
     }
@@ -271,10 +270,8 @@ fn find_codex_jsonl_for_cwd(sessions_dir: &PathBuf, cwd: &str) -> Option<PathBuf
 
     // Check each file's first line for session_meta with matching cwd
     for (path, _) in &all_files {
-        if let Some(session_cwd) = read_codex_session_cwd(path) {
-            if session_cwd == cwd {
-                return Some(path.clone());
-            }
+        if read_codex_session_cwd(path).is_some_and(|s| s == cwd) {
+            return Some(path.clone());
         }
     }
 
@@ -409,13 +406,11 @@ fn detect_claude_state(path: &PathBuf) -> AgentState {
                         continue;
                     }
                 }
-                if let Some(Value::Array(items)) = content {
-                    if items
-                        .iter()
-                        .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
-                    {
-                        return AgentState::Working;
-                    }
+                if matches!(content, Some(Value::Array(items)) if items
+                    .iter()
+                    .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_result")))
+                {
+                    return AgentState::Working;
                 }
                 return AgentState::Working;
             }
@@ -511,10 +506,12 @@ fn parse_claude_tokens(path: &PathBuf) -> ParsedTokens {
         };
         if role == "assistant" {
             // Skip duplicate message entries
-            if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
-                if !seen_ids.insert(id.to_string()) {
-                    continue; // already counted this message
-                }
+            if msg
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| !seen_ids.insert(id.to_string()))
+            {
+                continue; // already counted this message
             }
 
             if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
@@ -544,10 +541,10 @@ fn parse_claude_tokens(path: &PathBuf) -> ParsedTokens {
             }
             if let Some(Value::Array(items)) = msg.get("content") {
                 for item in items {
-                    if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                            last_activity = Some(extract_tool_detail(name, item));
-                        }
+                    if item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        && let Some(name) = item.get("name").and_then(|n| n.as_str())
+                    {
+                        last_activity = Some(extract_tool_detail(name, item));
                     }
                 }
             }
@@ -640,9 +637,7 @@ fn parse_codex_tokens(path: &PathBuf) -> ParsedTokens {
 fn model_context_window(model: &str) -> Option<u64> {
     if model.contains("opus") {
         Some(1_000_000)
-    } else if model.contains("sonnet") {
-        Some(200_000)
-    } else if model.contains("haiku") {
+    } else if model.contains("sonnet") || model.contains("haiku") {
         Some(200_000)
     } else {
         None

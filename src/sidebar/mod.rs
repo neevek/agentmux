@@ -54,10 +54,11 @@ pub fn run() {
             let agents = detect::scan_agents(&session, &mut session_cache);
 
             for agent in &agents {
-                if let Some(&prev) = prev_states.get(&agent.pane_id) {
-                    if prev == AgentState::Working && agent.state == AgentState::Idle {
-                        unseen_done.insert(agent.pane_id.clone());
-                    }
+                if prev_states
+                    .get(&agent.pane_id)
+                    .is_some_and(|&prev| prev == AgentState::Working && agent.state == AgentState::Idle)
+                {
+                    unseen_done.insert(agent.pane_id.clone());
                 }
                 prev_states.insert(agent.pane_id.clone(), agent.state);
             }
@@ -137,15 +138,14 @@ pub fn run() {
                         .iter()
                         .position(|a| a.pane_id == last_selected_pane)
                         .unwrap_or(0);
-                    if let Some(idx) =
+                    if let Some(agent) =
                         input::click_to_agent_index(y, cached_agents.len(), selected)
+                            .and_then(|idx| cached_agents.get(idx))
                     {
-                        if let Some(agent) = cached_agents.get(idx) {
-                            tmux::set_selected_pane(&agent.pane_id);
-                            unseen_done.remove(&agent.pane_id);
-                            tmux::select_window(&agent.window_id);
-                            tmux::select_pane(&agent.pane_id);
-                        }
+                        tmux::set_selected_pane(&agent.pane_id);
+                        unseen_done.remove(&agent.pane_id);
+                        tmux::select_window(&agent.window_id);
+                        tmux::select_pane(&agent.pane_id);
                     }
                 }
                 input::InputEvent::KeyQuit => break,
