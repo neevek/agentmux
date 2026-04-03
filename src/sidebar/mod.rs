@@ -39,8 +39,7 @@ pub fn run() {
     let mut scroll_offset: usize = 0;
     let mut last_width: u32 = 0;
 
-    let mut history = HistoryStore::load();
-    history.full_scan();
+    let history = HistoryStore::start();
 
     loop {
         if SHOULD_EXIT.load(Ordering::Relaxed) {
@@ -77,11 +76,6 @@ pub fn run() {
             }
 
             cached_agents = agents;
-
-            // Periodic history re-scan (every 60s)
-            if history.should_rescan() {
-                history.full_scan();
-            }
         }
 
         let selected_idx = cached_agents

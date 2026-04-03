@@ -568,6 +568,34 @@ fn extract_tool_detail(name: &str, item: &Value) -> String {
     }
 }
 
+pub(crate) fn extract_claude_session_id(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in std::io::BufRead::lines(reader).take(10).flatten() {
+        if let Ok(val) = serde_json::from_str::<Value>(&line) {
+            if let Some(sid) = json_str(&val, &["sessionId"]) {
+                return Some(sid.to_string());
+            }
+        }
+    }
+    // Fallback: filename stem (typically a UUID)
+    path.file_stem()?.to_str().map(|s| s.to_string())
+}
+
+pub(crate) fn extract_codex_session_id(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut first_line).ok()?;
+    let val: Value = serde_json::from_str(&first_line).ok()?;
+    if json_str(&val, &["type"]) == Some("session_meta") {
+        if let Some(id) = json_str(&val, &["payload", "id"]) {
+            return Some(id.to_string());
+        }
+    }
+    path.file_stem()?.to_str().map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
