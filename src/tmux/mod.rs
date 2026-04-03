@@ -50,8 +50,8 @@ fn tmux_output(args: &[&str]) -> Option<String> {
 }
 
 pub fn get_sidebar_width() -> u32 {
-    // Try persistent config first, then tmux option, then default
-    load_persisted_width()
+    crate::config::read_value("core", "width")
+        .and_then(|v| v.parse().ok())
         .or_else(|| {
             tmux_output(&["show-option", "-gqv", WIDTH_OPTION])
                 .and_then(|s| s.parse().ok())
@@ -63,7 +63,7 @@ pub fn get_sidebar_width() -> u32 {
 pub fn save_sidebar_width(session: &str, width: u32) {
     let w = width.to_string();
     let _ = tmux_output(&["set-option", "-g", WIDTH_OPTION, &w]);
-    persist_width(width);
+    crate::config::write_value("core", "width", &w);
 
     // Resize all other sidebar panes in the session to match
     let my_pane = std::env::var("TMUX_PANE").unwrap_or_default();
@@ -72,37 +72,6 @@ pub fn save_sidebar_width(session: &str, width: u32) {
             let _ = tmux_output(&["resize-pane", "-t", &pane_id, "-x", &w]);
         }
     }
-}
-
-fn config_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".config").join("agentmux").join("config.toml"))
-}
-
-fn persist_width(width: u32) {
-    let Some(path) = config_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Read existing config, update width line, preserve other settings
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.starts_with("width"))
-        .map(|l| l.to_string())
-        .collect();
-    lines.push(format!("width = {width}"));
-    let _ = std::fs::write(path, lines.join("\n") + "\n");
-}
-
-fn load_persisted_width() -> Option<u32> {
-    let content = std::fs::read_to_string(config_path()?).ok()?;
-    for line in content.lines() {
-        let line = line.trim();
-        if let Some(val) = line.strip_prefix("width") {
-            return val.trim().strip_prefix('=')?.trim().parse().ok();
-        }
-    }
-    None
 }
 
 pub fn list_session_panes(session: &str) -> Vec<PaneInfo> {
