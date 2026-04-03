@@ -194,41 +194,10 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
 }
 
 fn find_split_target(window_id: &str) -> Option<(String, bool)> {
-    let fmt = "#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_height}";
-    let out = tmux_output(&["list-panes", "-t", window_id, "-F", fmt])?;
-    let win_height: u32 =
-        tmux_output(&["display-message", "-t", window_id, "-p", "#{window_height}"])
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-    let panes: Vec<(String, u32, u32, u32)> = out
-        .lines()
-        .filter_map(|line| {
-            let p: Vec<&str> = line.split('\t').collect();
-            if p.len() < 4 {
-                return None;
-            }
-            Some((
-                p[0].to_string(),
-                p[1].parse().ok()?,
-                p[2].parse().ok()?,
-                p[3].parse().ok()?,
-            ))
-        })
-        .collect();
-
-    // Prefer a full-height pane at left=0 (no -f needed)
-    let full_height_left = panes.iter().find(|(_, left, top, height)| {
-        *left == 0 && *top == 0 && (*height + 1 >= win_height || win_height == 0)
-    });
-
-    if let Some((id, _, _, _)) = full_height_left {
-        Some((id.clone(), false))
-    } else {
-        // Use -f to ensure full-height sidebar
-        let first = panes.first()?;
-        Some((first.0.clone(), true))
-    }
+    let out = tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"])?;
+    let first_pane = out.lines().next()?.to_string();
+    // Always use -f to guarantee full-height sidebar
+    Some((first_pane, true))
 }
 
 pub fn resize_pane_width(width: u32) {

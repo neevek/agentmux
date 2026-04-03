@@ -121,12 +121,13 @@ pub fn click_to_agent_index(
     y: u32,
     agents: &[crate::detect::AgentInfo],
     scroll_offset: usize,
+    header_rows: u32,
 ) -> Option<usize> {
-    use crate::sidebar::render::{HEADER_ROWS, item_row_count};
-    if y <= HEADER_ROWS || agents.is_empty() {
+    use crate::sidebar::render::item_row_count;
+    if y <= header_rows || agents.is_empty() {
         return None;
     }
-    let click_row = y - HEADER_ROWS;
+    let click_row = y - header_rows;
     let mut cumulative = 0u32;
     for (vi, agent) in agents.iter().skip(scroll_offset).enumerate() {
         cumulative += item_row_count(agent);

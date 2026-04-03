@@ -24,18 +24,21 @@ pub struct AgentTotals {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct AgentPeriodStats {
+    pub today: AgentTotals,
+    pub seven_days: AgentTotals,
+    pub total: AgentTotals,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct AggregatedStats {
-    pub claude: AgentTotals,
-    pub codex: AgentTotals,
+    pub claude: AgentPeriodStats,
+    pub codex: AgentPeriodStats,
 }
 
 // --- Internal ---
 
 struct SessionBaseline {
-    input_tokens: u64,
-    output_tokens: u64,
-    cost_usd: f64,
-    turns: u32,
     file_size: u64,
 }
 
@@ -197,36 +200,68 @@ fn upsert_session(
     let _ = stmt.next();
 }
 
-fn compute_snapshot(db: &sqlite::Connection) -> AggregatedStats {
-    let mut stats = AggregatedStats::default();
+fn midnight_local_today() -> u64 {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        tm.tm_hour = 0;
+        tm.tm_min = 0;
+        tm.tm_sec = 0;
+        libc::mktime(&mut tm) as u64
+    }
+}
+
+fn fill_period(
+    db: &sqlite::Connection,
+    stats: &mut AggregatedStats,
+    since_ts: u64,
+    accessor: fn(&mut AgentPeriodStats) -> &mut AgentTotals,
+) {
     let sql = "SELECT agent_type, SUM(input_tokens), SUM(output_tokens), \
-               SUM(cost_usd), SUM(turns) FROM sessions GROUP BY agent_type";
-    let Ok(mut stmt) = db.prepare(sql) else {
-        return stats;
-    };
+               SUM(cost_usd), SUM(turns) FROM sessions \
+               WHERE last_modified_ts >= ? GROUP BY agent_type";
+    let Ok(mut stmt) = db.prepare(sql) else { return };
+    let _ = stmt.bind((1, since_ts as i64));
     while let Ok(sqlite::State::Row) = stmt.next() {
         let agent_type: String = stmt.read(0).unwrap_or_default();
         let input: i64 = stmt.read(1).unwrap_or(0);
         let output: i64 = stmt.read(2).unwrap_or(0);
         let cost: f64 = stmt.read(3).unwrap_or(0.0);
         let turns: i64 = stmt.read(4).unwrap_or(0);
-        let totals = match agent_type.as_str() {
+        let period_stats = match agent_type.as_str() {
             "claude" => &mut stats.claude,
             "codex" => &mut stats.codex,
             _ => continue,
         };
+        let totals = accessor(period_stats);
         totals.input_tokens = input as u64;
         totals.output_tokens = output as u64;
         totals.cost_usd = cost;
         totals.turns = turns as u32;
     }
+}
+
+fn compute_snapshot(db: &sqlite::Connection) -> AggregatedStats {
+    let mut stats = AggregatedStats::default();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let seven_days_ago = now.saturating_sub(7 * 86400);
+    let midnight = midnight_local_today();
+
+    fill_period(db, &mut stats, 0, |s| &mut s.total);
+    fill_period(db, &mut stats, seven_days_ago, |s| &mut s.seven_days);
+    fill_period(db, &mut stats, midnight, |s| &mut s.today);
+
     stats
 }
 
 fn load_baselines(db: &sqlite::Connection) -> HashMap<String, SessionBaseline> {
     let mut baselines = HashMap::new();
-    let sql = "SELECT agent_type, session_id, input_tokens, output_tokens, \
-               cost_usd, turns, file_size FROM sessions";
+    let sql = "SELECT agent_type, session_id, file_size FROM sessions";
     let Ok(mut stmt) = db.prepare(sql) else {
         return baselines;
     };
@@ -237,11 +272,7 @@ fn load_baselines(db: &sqlite::Connection) -> HashMap<String, SessionBaseline> {
         baselines.insert(
             key,
             SessionBaseline {
-                input_tokens: stmt.read::<i64, _>(2).unwrap_or(0) as u64,
-                output_tokens: stmt.read::<i64, _>(3).unwrap_or(0) as u64,
-                cost_usd: stmt.read::<f64, _>(4).unwrap_or(0.0),
-                turns: stmt.read::<i64, _>(5).unwrap_or(0) as u32,
-                file_size: stmt.read::<i64, _>(6).unwrap_or(0) as u64,
+                file_size: stmt.read::<i64, _>(2).unwrap_or(0) as u64,
             },
         );
     }
@@ -257,7 +288,6 @@ fn process_file(
     path: &Path,
     parse_fn: fn(&Path) -> ParsedTokens,
     baselines: &mut HashMap<String, SessionBaseline>,
-    delta: &mut AgentTotals,
 ) {
     let fsize = file_size(path);
     let key = format!("{agent_type}:{session_id}");
@@ -281,32 +311,9 @@ fn process_file(
         })
         .unwrap_or(0.0);
 
-    // Compute delta: new usage since baseline
-    if let Some(bl) = baselines.get(&key) {
-        delta.input_tokens += tokens.input_tokens.saturating_sub(bl.input_tokens);
-        delta.output_tokens += tokens.output_tokens.saturating_sub(bl.output_tokens);
-        delta.cost_usd += (cost - bl.cost_usd).max(0.0);
-        delta.turns += tokens.turn_count.saturating_sub(bl.turns);
-    } else {
-        // New session — full stats are the delta
-        delta.input_tokens += tokens.input_tokens;
-        delta.output_tokens += tokens.output_tokens;
-        delta.cost_usd += cost;
-        delta.turns += tokens.turn_count;
-    }
-
     upsert_session(db, agent_type, session_id, path, &tokens, cost, fsize);
 
-    baselines.insert(
-        key,
-        SessionBaseline {
-            input_tokens: tokens.input_tokens,
-            output_tokens: tokens.output_tokens,
-            cost_usd: cost,
-            turns: tokens.turn_count,
-            file_size: fsize,
-        },
-    );
+    baselines.insert(key, SessionBaseline { file_size: fsize });
 }
 
 fn scan_and_update(
@@ -314,45 +321,20 @@ fn scan_and_update(
     shared: &Arc<Mutex<AggregatedStats>>,
     baselines: &mut HashMap<String, SessionBaseline>,
 ) {
-    let mut delta = AggregatedStats::default();
-
     for path in discover_claude_jsonl_files() {
         if let Some(sid) = extract_claude_session_id(&path) {
-            process_file(
-                db,
-                "claude",
-                &sid,
-                &path,
-                parse_claude_tokens,
-                baselines,
-                &mut delta.claude,
-            );
+            process_file(db, "claude", &sid, &path, parse_claude_tokens, baselines);
         }
     }
     for path in discover_codex_jsonl_files() {
         if let Some(sid) = extract_codex_session_id(&path) {
-            process_file(
-                db,
-                "codex",
-                &sid,
-                &path,
-                parse_codex_tokens,
-                baselines,
-                &mut delta.codex,
-            );
+            process_file(db, "codex", &sid, &path, parse_codex_tokens, baselines);
         }
     }
 
-    // Apply accumulated deltas to in-memory snapshot
-    let mut stats = shared.lock().unwrap();
-    stats.claude.input_tokens += delta.claude.input_tokens;
-    stats.claude.output_tokens += delta.claude.output_tokens;
-    stats.claude.cost_usd += delta.claude.cost_usd;
-    stats.claude.turns += delta.claude.turns;
-    stats.codex.input_tokens += delta.codex.input_tokens;
-    stats.codex.output_tokens += delta.codex.output_tokens;
-    stats.codex.cost_usd += delta.codex.cost_usd;
-    stats.codex.turns += delta.codex.turns;
+    // Recompute snapshot from DB (covers all time periods including shifting today boundary)
+    let snapshot = compute_snapshot(db);
+    *shared.lock().unwrap() = snapshot;
 }
 
 // --- Background worker ---
