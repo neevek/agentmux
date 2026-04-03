@@ -224,7 +224,15 @@ pub fn render_sidebar(
                 ),
             );
             row += 1;
-            // Line 2 (optional): model (effort) | > last activity
+            // Line 2: [window] cwd
+            emit(
+                &mut buf,
+                row,
+                bg,
+                &format!("  {GRAY}[{win_name}]{RESET}{bg} {SUBTEXT}{short_cwd}{RESET}"),
+            );
+            row += 1;
+            // Line 3 (optional): model (effort) | > last activity
             if has_detail_line(agent) {
                 let model_short = agent
                     .model
@@ -254,14 +262,6 @@ pub fn render_sidebar(
                 );
                 row += 1;
             }
-            // Line 3: [window] cwd
-            emit(
-                &mut buf,
-                row,
-                bg,
-                &format!("  {GRAY}[{win_name}]{RESET}{bg} {SUBTEXT}{short_cwd}{RESET}"),
-            );
-            row += 1;
             // Bottom margin
             emit(&mut buf, row, bg, "");
             row += 1;

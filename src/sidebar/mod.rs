@@ -3,6 +3,7 @@ pub mod render;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::detect;
 use crate::detect::history::HistoryStore;
@@ -18,6 +19,7 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
 
 const SCAN_INTERVAL_MS: u64 = 3000;
 const IDLE_CHECK_MS: u64 = 1000;
+const WIDTH_SAVE_THROTTLE_MS: u64 = 300;
 
 pub fn run() {
     let session = tmux::current_session().expect("not running inside tmux");
@@ -38,6 +40,10 @@ pub fn run() {
     let mut last_selected_pane = String::new();
     let mut scroll_offset: usize = 0;
     let mut last_width: u32 = 0;
+    let scan_interval = Duration::from_millis(SCAN_INTERVAL_MS);
+    let mut last_scan = Instant::now().checked_sub(scan_interval).unwrap_or_else(Instant::now);
+    let mut last_width_save = Instant::now();
+    let mut needs_render = true;
 
     let history = HistoryStore::start();
 
@@ -50,8 +56,11 @@ pub fn run() {
         let selected_pane = tmux::get_selected_pane();
         let selection_changed = selected_pane != last_selected_pane;
         last_selected_pane.clone_from(&selected_pane);
+        if selection_changed {
+            needs_render = true;
+        }
 
-        if is_active {
+        if is_active && last_scan.elapsed() >= scan_interval {
             let agents = detect::scan_agents(&session, &mut session_cache);
 
             for agent in &agents {
@@ -76,6 +85,8 @@ pub fn run() {
             }
 
             cached_agents = agents;
+            last_scan = Instant::now();
+            needs_render = true;
         }
 
         let selected_idx = cached_agents
@@ -94,11 +105,14 @@ pub fn run() {
             }
         }
 
-        if is_active || selection_changed {
+        if needs_render {
             let (width, height) = terminal_size();
-            // Detect manual resize and sync to all sidebars
-            if last_width != 0 && width != last_width {
+            // Detect manual resize and sync to all sidebars (throttled)
+            if last_width != 0 && width != last_width
+                && last_width_save.elapsed() >= Duration::from_millis(WIDTH_SAVE_THROTTLE_MS)
+            {
                 tmux::save_sidebar_width(&session, width);
+                last_width_save = Instant::now();
             }
             last_width = width;
             let stats = history.aggregated_stats();
@@ -115,28 +129,34 @@ pub fn run() {
                 )
             );
             flush();
+            needs_render = false;
         }
 
         if is_active {
-            let timeout = std::time::Duration::from_millis(SCAN_INTERVAL_MS);
-            match input::poll_input(timeout) {
+            let elapsed_ms = last_scan.elapsed().as_millis() as u64;
+            let remaining = SCAN_INTERVAL_MS.saturating_sub(elapsed_ms).max(50);
+            match input::poll_input(Duration::from_millis(remaining)) {
                 input::InputEvent::KeyUp => {
                     let new_sel = selected_idx.saturating_sub(1);
                     set_selection(&cached_agents, new_sel);
+                    needs_render = true;
                 }
                 input::InputEvent::KeyDown => {
                     let max = cached_agents.len().saturating_sub(1);
                     let new_sel = if selected_idx < max { selected_idx + 1 } else { max };
                     set_selection(&cached_agents, new_sel);
+                    needs_render = true;
                 }
                 input::InputEvent::MouseScrollUp => {
                     scroll_offset = scroll_offset.saturating_sub(1);
+                    needs_render = true;
                 }
                 input::InputEvent::MouseScrollDown => {
                     let max_offset = cached_agents.len().saturating_sub(
                         render::visible_item_count(height, &cached_agents, scroll_offset).max(1),
                     );
                     scroll_offset = (scroll_offset + 1).min(max_offset);
+                    needs_render = true;
                 }
                 input::InputEvent::KeyEnter => {
                     if let Some(agent) = cached_agents.get(selected_idx) {
@@ -157,10 +177,13 @@ pub fn run() {
                     }
                 }
                 input::InputEvent::KeyQuit => break,
-                input::InputEvent::Resize | input::InputEvent::None => {}
+                input::InputEvent::Resize => {
+                    needs_render = true;
+                }
+                input::InputEvent::None => {}
             }
         } else {
-            let timeout = std::time::Duration::from_millis(IDLE_CHECK_MS);
+            let timeout = Duration::from_millis(IDLE_CHECK_MS);
             let _ = input::poll_input(timeout);
         }
     }
