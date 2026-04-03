@@ -46,10 +46,6 @@ struct SessionBaseline {
     file_size: u64,
 }
 
-fn config_dir() -> PathBuf {
-    crate::config::config_dir()
-}
-
 fn is_initialized() -> bool {
     crate::config::read_value("core", "initialized")
         .is_some_and(|v| v == "true")
@@ -164,8 +160,9 @@ fn file_mtime_date(path: &Path) -> String {
 // --- Database ---
 
 fn open_db() -> Option<sqlite::Connection> {
-    let _ = fs::create_dir_all(config_dir());
-    let db = sqlite::open(config_dir().join("stats.db")).ok()?;
+    let dir = crate::config::config_dir();
+    let _ = fs::create_dir_all(&dir);
+    let db = sqlite::open(dir.join("stats.db")).ok()?;
     db.execute(
         "CREATE TABLE IF NOT EXISTS sessions (
             agent_type TEXT NOT NULL,

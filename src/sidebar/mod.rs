@@ -60,7 +60,7 @@ fn load_header_config() -> HeaderConfig {
         cfg.auto_collapse_timeout_ms = v.parse().unwrap_or(5000);
     }
     if let Some(v) = read_value("header", "start_mode") {
-        cfg.start_mode = if v.trim_matches('"') == "collapsed" {
+        cfg.start_mode = if v == "collapsed" {
             HeaderMode::Collapsed
         } else {
             HeaderMode::Expanded
