@@ -174,30 +174,98 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
 
     let (target, use_full) = find_split_target(window_id)?;
 
-    let mut args = vec![
-        "split-window",
-        "-hb",
-        "-l",
-        &width_str,
-        "-t",
-        &target,
-        "-d",
-        "-P",
-        "-F",
-        "#{pane_id}",
+    // When using -f, snapshot non-left pane widths and restore them in the
+    // SAME tmux command (chained with ";") to avoid visible flicker.
+    let saved_widths: Vec<(String, String)> = if use_full {
+        let fmt = "#{pane_id}\t#{pane_left}\t#{pane_width}";
+        tmux_output(&["list-panes", "-t", window_id, "-F", fmt])
+            .map(|out| {
+                out.lines()
+                    .filter_map(|line| {
+                        let p: Vec<&str> = line.split('\t').collect();
+                        if p.len() < 3 { return None; }
+                        let left: u32 = p[1].parse().ok()?;
+                        if left > 0 {
+                            Some((p[0].to_string(), p[2].to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut args: Vec<String> = vec![
+        "split-window".into(),
+        "-hb".into(),
+        "-l".into(),
+        width_str,
+        "-t".into(),
+        target,
+        "-d".into(),
+        "-P".into(),
+        "-F".into(),
+        "#{pane_id}".into(),
     ];
     if use_full {
-        args.insert(2, "-f");
+        args.insert(2, "-f".into());
     }
-    args.push(cmd);
-    tmux_output(&args)
+    args.push(cmd.to_string());
+
+    // Chain resize commands with ";" so tmux executes them atomically
+    for (pane_id, width) in &saved_widths {
+        args.extend([
+            ";".to_string(),
+            "resize-pane".to_string(),
+            "-t".to_string(),
+            pane_id.clone(),
+            "-x".to_string(),
+            width.clone(),
+        ]);
+    }
+
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    tmux_output(&refs)
 }
 
 fn find_split_target(window_id: &str) -> Option<(String, bool)> {
-    let out = tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"])?;
-    let first_pane = out.lines().next()?.to_string();
-    // Always use -f to guarantee full-height sidebar
-    Some((first_pane, true))
+    let fmt = "#{pane_id}\t#{pane_left}\t#{pane_top}";
+    let out = tmux_output(&["list-panes", "-t", window_id, "-F", fmt])?;
+
+    let panes: Vec<(String, u32, u32)> = out
+        .lines()
+        .filter_map(|line| {
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() < 3 {
+                return None;
+            }
+            Some((
+                p[0].to_string(),
+                p[1].parse().ok()?,
+                p[2].parse().ok()?,
+            ))
+        })
+        .collect();
+
+    // Find panes in the leftmost column (left=0).
+    let left_panes: Vec<_> = panes.iter().filter(|(_, left, _)| *left == 0).collect();
+
+    if left_panes.len() == 1 {
+        // Single pane spans the full height of the leftmost column.
+        // Split without -f: sidebar inherits full height, only this column shrinks.
+        Some((left_panes[0].0.clone(), false))
+    } else if !left_panes.is_empty() {
+        // Multiple panes in left column (vertical splits). Must use -f for
+        // full-height sidebar. This shrinks all columns proportionally.
+        let topmost = left_panes.iter().min_by_key(|(_, _, top)| *top).unwrap();
+        Some((topmost.0.clone(), true))
+    } else {
+        let first = panes.first()?;
+        Some((first.0.clone(), true))
+    }
 }
 
 pub fn resize_pane_width(width: u32) {

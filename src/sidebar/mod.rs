@@ -297,8 +297,12 @@ pub fn run() {
                         needs_render = true;
                     } else if let Some(agent) = cached_agents.get(selected_idx) {
                         unseen_done.remove(&agent.pane_id);
-                        tmux::select_window(&agent.window_id);
-                        tmux::select_pane(&agent.pane_id);
+                        let in_current_window = tmux::current_window_id()
+                            .is_some_and(|cw| cw == agent.window_id);
+                        if !in_current_window {
+                            tmux::select_window(&agent.window_id);
+                            tmux::select_pane(&agent.pane_id);
+                        }
                     }
                 }
                 input::InputEvent::MouseClick { y } => {
@@ -316,8 +320,13 @@ pub fn run() {
                         header_selected = false;
                         tmux::set_selected_pane(&agent.pane_id);
                         unseen_done.remove(&agent.pane_id);
-                        tmux::select_window(&agent.window_id);
-                        tmux::select_pane(&agent.pane_id);
+                        let in_current_window = tmux::current_window_id()
+                            .is_some_and(|cw| cw == agent.window_id);
+                        if !in_current_window {
+                            tmux::select_window(&agent.window_id);
+                            tmux::select_pane(&agent.pane_id);
+                        }
+                        needs_render = true;
                     }
                 }
                 input::InputEvent::KeyQuit => break,

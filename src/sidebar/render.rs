@@ -112,7 +112,7 @@ pub fn render_sidebar(
         .max().unwrap_or(4)
         .max("Cost".len()) + 2;
     // col4 (Turns) gets all remaining width
-    let col4 = w.saturating_sub(col0 + col1 + col2 + col3 + 4).max("Turns".len() + 2);
+    let col4 = w.saturating_sub(col0 + col1 + col2 + col3 + 4).max("Messages".len() + 2);
     let cw = [col0, col1, col2, col3, col4];
 
     let table_bg = if header_selected { SEL_BG } else { "" };
@@ -136,7 +136,7 @@ pub fn render_sidebar(
     let bg = table_bg;
     let hdr_tok = centered_in("In/Out tokens", cw[2]);
     let hdr_cost = centered_in("Cost", cw[3]);
-    let hdr_turns = centered_in("Turns", cw[4]);
+    let hdr_turns = centered_in("Messages", cw[4]);
     emit_table(&mut buf, row, table_bg, &format!(
         "{}{DIM}│{RESET}{bg}{WHITE}{hdr_tok}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_cost}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_turns}{RESET}{bg}",
         " ".repeat(hdr_blank),
