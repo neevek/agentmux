@@ -1,5 +1,5 @@
 use crate::detect::AgentInfo;
-use crate::detect::history::{AgentTotals, AggregatedStats};
+use crate::detect::history::AggregatedStats;
 use crate::detect::process::{AgentKind, format_elapsed};
 use crate::detect::state::{AgentState, format_tokens};
 use std::collections::HashSet;
@@ -26,8 +26,8 @@ const FLAMINGO: &str = "\x1b[38;2;242;205;205m"; // flamingo #f2cdcd (msg count)
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
 const HEADER_BG: &str = "\x1b[48;2;30;30;46m";
 
-/// Number of header rows (title 2 + stats 6 = 8)
-pub const HEADER_ROWS: u32 = 8;
+/// Number of header rows (title 2 + table 5 = 7)
+pub const HEADER_ROWS: u32 = 7;
 
 /// Calculate the row count for a single agent item.
 pub fn item_row_count(agent: &AgentInfo) -> u32 {
@@ -85,23 +85,49 @@ pub fn render_sidebar(
     );
     row += 1;
 
-    // === Stats sections ===
-    let h_line: String = std::iter::repeat_n('─', w).collect();
+    // === Stats table (bordered, 4 columns: name │ tokens │ cost │ msgs) ===
+    let c_tok = format!("↑ {} ↓ {}", format_tokens(stats.claude.input_tokens), format_tokens(stats.claude.output_tokens));
+    let x_tok = format!("↑ {} ↓ {}", format_tokens(stats.codex.input_tokens), format_tokens(stats.codex.output_tokens));
+    let c_cost = format_cost(stats.claude.cost_usd);
+    let x_cost = format_cost(stats.codex.cost_usd);
+    let c_msg_label = if stats.claude.turns == 1 { "msg" } else { "msgs" };
+    let x_msg_label = if stats.codex.turns == 1 { "msg" } else { "msgs" };
+    let c_msgs = format!("{} {c_msg_label}", format_compact_count(stats.claude.turns));
+    let x_msgs = format!("{} {x_msg_label}", format_compact_count(stats.codex.turns));
 
-    // Claude section
-    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{h_line}{RESET}"));
-    row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format!("  {PEACH}{BOLD}Claude{RESET}"));
-    row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format_agent_stats_line(&stats.claude));
-    row += 1;
+    // Column widths (content + 2 padding) — give remaining space to tokens column
+    let mut cw = [
+        "Claude".len().max("Codex".len()) + 2,
+        c_tok.chars().count().max(x_tok.chars().count()) + 2,
+        c_cost.len().max(x_cost.len()) + 2,
+        c_msgs.len().max(x_msgs.len()) + 2,
+    ];
+    let total: usize = cw.iter().sum::<usize>() + 3; // +3 for │ separators
+    if total < w {
+        cw[1] += w - total;
+    }
 
-    // Codex section
-    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{h_line}{RESET}"));
+    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{}{RESET}", table_border(&cw, '┬')));
     row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format!("  {BLUE}{BOLD}Codex{RESET}"));
+    emit_line_no_bg(&mut buf, row, "", &format!(
+        "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
+        centered_cell(&format!("{PEACH}{BOLD}Claude{RESET}"), 6, cw[0]),
+        centered_cell(&format!("{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}", format_tokens(stats.claude.input_tokens), format_tokens(stats.claude.output_tokens)), c_tok.chars().count(), cw[1]),
+        centered_cell(&format!("{ROSEWATER}{c_cost}{RESET}"), c_cost.len(), cw[2]),
+        centered_cell(&format!("{FLAMINGO}{c_msgs}{RESET}"), c_msgs.len(), cw[3]),
+    ));
     row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format_agent_stats_line(&stats.codex));
+    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+    row += 1;
+    emit_line_no_bg(&mut buf, row, "", &format!(
+        "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
+        centered_cell(&format!("{BLUE}{BOLD}Codex{RESET}"), 5, cw[0]),
+        centered_cell(&format!("{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}", format_tokens(stats.codex.input_tokens), format_tokens(stats.codex.output_tokens)), x_tok.chars().count(), cw[1]),
+        centered_cell(&format!("{ROSEWATER}{x_cost}{RESET}"), x_cost.len(), cw[2]),
+        centered_cell(&format!("{FLAMINGO}{x_msgs}{RESET}"), x_msgs.len(), cw[3]),
+    ));
+    row += 1;
+    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{}{RESET}", table_border(&cw, '┴')));
     row += 1;
 
     if agents.is_empty() {
@@ -153,14 +179,7 @@ pub fn render_sidebar(
                 emit_line_no_bg
             };
 
-            // Context left
-            let left = match agent.context_pct {
-                Some(pct) => 100u8.saturating_sub(pct),
-                None => 100,
-            };
-            let ctx_color = if left <= 20 { YELLOW } else { TEAL };
-
-            // Build info trail: ↑2.8M ↓25.6k | $2.54 | 91% left | 1 msg
+            // Build info trail: ↑2.8M ↓25.6k | $2.54
             let sep = format!("{bg} {DIM}|{RESET}{bg} ");
             let mut info_parts: Vec<String> = Vec::new();
             info_parts.push(format!(
@@ -168,11 +187,6 @@ pub fn render_sidebar(
             ));
             if agent.cost_usd >= 0.01 {
                 info_parts.push(format!("{ROSEWATER}{}{RESET}", format_cost(agent.cost_usd)));
-            }
-            info_parts.push(format!("{ctx_color}{left}% left{RESET}"));
-            if agent.turn_count > 0 {
-                let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
-                info_parts.push(format!("{FLAMINGO}{} {msg_label}{RESET}", agent.turn_count));
             }
             let info_str = format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep));
 
@@ -207,6 +221,11 @@ pub fn render_sidebar(
                     Some(effort) => format!("{model_short} ({effort})"),
                     None => model_short,
                 };
+                let left = match agent.context_pct {
+                    Some(pct) => 100u8.saturating_sub(pct),
+                    None => 100,
+                };
+                let ctx_color = if left <= 20 { YELLOW } else { TEAL };
                 let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
                 emit(
                     &mut buf,
@@ -295,15 +314,21 @@ fn short_model_name(model: &str) -> String {
     model.to_string()
 }
 
-fn format_agent_stats_line(totals: &AgentTotals) -> String {
-    let input = format_tokens(totals.input_tokens);
-    let output = format_tokens(totals.output_tokens);
-    let cost = format_cost(totals.cost_usd);
-    let msgs = format_compact_count(totals.turns);
-    let msg_label = if totals.turns == 1 { "msg" } else { "msgs" };
-    format!(
-        "  {BLUE}↑ {input}{RESET} {MAUVE}↓ {output}{RESET} {DIM}|{RESET} {ROSEWATER}{cost}{RESET} {DIM}|{RESET} {FLAMINGO}{msgs} {msg_label}{RESET}"
-    )
+fn table_border(col_widths: &[usize], junction: char) -> String {
+    col_widths
+        .iter()
+        .map(|&w| {
+            let s: String = std::iter::repeat_n('─', w).collect();
+            s
+        })
+        .collect::<Vec<_>>()
+        .join(&junction.to_string())
+}
+
+fn centered_cell(colored: &str, plain_len: usize, cell_width: usize) -> String {
+    let left = cell_width.saturating_sub(plain_len) / 2;
+    let right = cell_width.saturating_sub(plain_len).saturating_sub(left);
+    format!("{}{colored}{}", " ".repeat(left), " ".repeat(right))
 }
 
 fn format_compact_count(n: u32) -> String {
