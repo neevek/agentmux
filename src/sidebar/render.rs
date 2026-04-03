@@ -84,14 +84,32 @@ pub fn render_sidebar(
         &format!("{}{BOLD}{WHITE}{title}{RESET}", " ".repeat(padding)),
     );
     row += 1;
+    emit_line_bg(&mut buf, row, HEADER_BG, "");
+    row += 1;
 
     // === Stats table (bordered, 4 columns: name │ tokens │ cost │ msgs) ===
-    let c_tok = format!("↑ {} ↓ {}", format_tokens(stats.claude.input_tokens), format_tokens(stats.claude.output_tokens));
-    let x_tok = format!("↑ {} ↓ {}", format_tokens(stats.codex.input_tokens), format_tokens(stats.codex.output_tokens));
+    let c_tok = format!(
+        "↑ {} ↓ {}",
+        format_tokens(stats.claude.input_tokens),
+        format_tokens(stats.claude.output_tokens)
+    );
+    let x_tok = format!(
+        "↑ {} ↓ {}",
+        format_tokens(stats.codex.input_tokens),
+        format_tokens(stats.codex.output_tokens)
+    );
     let c_cost = format_cost(stats.claude.cost_usd);
     let x_cost = format_cost(stats.codex.cost_usd);
-    let c_msg_label = if stats.claude.turns == 1 { "msg" } else { "msgs" };
-    let x_msg_label = if stats.codex.turns == 1 { "msg" } else { "msgs" };
+    let c_msg_label = if stats.claude.turns == 1 {
+        "msg"
+    } else {
+        "msgs"
+    };
+    let x_msg_label = if stats.codex.turns == 1 {
+        "msg"
+    } else {
+        "msgs"
+    };
     let c_msgs = format!("{} {c_msg_label}", format_compact_count(stats.claude.turns));
     let x_msgs = format!("{} {x_msg_label}", format_compact_count(stats.codex.turns));
 
@@ -104,30 +122,76 @@ pub fn render_sidebar(
     ];
     let total: usize = cw.iter().sum::<usize>() + 3; // +3 for │ separators
     if total < w {
-        cw[1] += w - total;
+        let extra = w - total;
+        let per_col = extra / 3;
+        let remainder = extra % 3;
+        cw[1] += per_col + if remainder > 0 { 1 } else { 0 };
+        cw[2] += per_col + if remainder > 1 { 1 } else { 0 };
+        cw[3] += per_col;
     }
 
-    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{}{RESET}", table_border(&cw, '┬')));
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!("{DIM}{}{RESET}", table_border(&cw, '┬')),
+    );
     row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format!(
-        "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
-        centered_cell(&format!("{PEACH}{BOLD}Claude{RESET}"), 6, cw[0]),
-        centered_cell(&format!("{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}", format_tokens(stats.claude.input_tokens), format_tokens(stats.claude.output_tokens)), c_tok.chars().count(), cw[1]),
-        centered_cell(&format!("{ROSEWATER}{c_cost}{RESET}"), c_cost.len(), cw[2]),
-        centered_cell(&format!("{FLAMINGO}{c_msgs}{RESET}"), c_msgs.len(), cw[3]),
-    ));
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!(
+            "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
+            centered_cell(&format!("{PEACH}{BOLD}Claude{RESET}"), 6, cw[0]),
+            centered_cell(
+                &format!(
+                    "{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}",
+                    format_tokens(stats.claude.input_tokens),
+                    format_tokens(stats.claude.output_tokens)
+                ),
+                c_tok.chars().count(),
+                cw[1]
+            ),
+            centered_cell(&format!("{ROSEWATER}{c_cost}{RESET}"), c_cost.len(), cw[2]),
+            centered_cell(&format!("{FLAMINGO}{c_msgs}{RESET}"), c_msgs.len(), cw[3]),
+        ),
+    );
     row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!("{DIM}{}{RESET}", table_border(&cw, '┼')),
+    );
     row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format!(
-        "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
-        centered_cell(&format!("{BLUE}{BOLD}Codex{RESET}"), 5, cw[0]),
-        centered_cell(&format!("{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}", format_tokens(stats.codex.input_tokens), format_tokens(stats.codex.output_tokens)), x_tok.chars().count(), cw[1]),
-        centered_cell(&format!("{ROSEWATER}{x_cost}{RESET}"), x_cost.len(), cw[2]),
-        centered_cell(&format!("{FLAMINGO}{x_msgs}{RESET}"), x_msgs.len(), cw[3]),
-    ));
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!(
+            "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
+            centered_cell(&format!("{BLUE}{BOLD}Codex{RESET}"), 5, cw[0]),
+            centered_cell(
+                &format!(
+                    "{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}",
+                    format_tokens(stats.codex.input_tokens),
+                    format_tokens(stats.codex.output_tokens)
+                ),
+                x_tok.chars().count(),
+                cw[1]
+            ),
+            centered_cell(&format!("{ROSEWATER}{x_cost}{RESET}"), x_cost.len(), cw[2]),
+            centered_cell(&format!("{FLAMINGO}{x_msgs}{RESET}"), x_msgs.len(), cw[3]),
+        ),
+    );
     row += 1;
-    emit_line_no_bg(&mut buf, row, "", &format!("{DIM}{}{RESET}", table_border(&cw, '┴')));
+    emit_line_no_bg(
+        &mut buf,
+        row,
+        "",
+        &format!("{DIM}{}{RESET}", table_border(&cw, '┴')),
+    );
     row += 1;
 
     if agents.is_empty() {
@@ -200,7 +264,7 @@ pub fn render_sidebar(
                 row,
                 bg,
                 &format!(
-                    "  {state_color}●{RESET}{bg} {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
+                    "  {state_color}● {RESET}{bg} {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
                 ),
             );
             row += 1;

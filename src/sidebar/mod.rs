@@ -106,7 +106,12 @@ pub fn run() {
         }
 
         if needs_render {
-            let (width, height) = terminal_size();
+            let (mut width, height) = terminal_size();
+            // Enforce minimum width
+            if width < tmux::MIN_WIDTH {
+                tmux::resize_pane_width(tmux::MIN_WIDTH);
+                width = tmux::MIN_WIDTH;
+            }
             // Detect manual resize and sync to all sidebars (throttled)
             if last_width != 0 && width != last_width
                 && last_width_save.elapsed() >= Duration::from_millis(WIDTH_SAVE_THROTTLE_MS)
