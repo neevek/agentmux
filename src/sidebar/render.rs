@@ -81,7 +81,7 @@ pub fn render_sidebar(
         &mut buf,
         row,
         HEADER_BG,
-        &format!("{}{BOLD}{WHITE}{title}{RESET}", " ".repeat(padding)),
+        &format!("{}{BOLD}{GREEN}{title}{RESET}", " ".repeat(padding)),
     );
     row += 1;
     emit_line_bg(&mut buf, row, HEADER_BG, "");
