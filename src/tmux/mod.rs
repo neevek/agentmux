@@ -1,7 +1,8 @@
 use std::process::Command;
 
 pub const SIDEBAR_TITLE: &str = "agentmux-sidebar";
-const DEFAULT_WIDTH: u32 = 60;
+const DEFAULT_WIDTH: u32 = 50;
+pub const MIN_WIDTH: u32 = 50;
 const WIDTH_OPTION: &str = "@agentmux-width";
 const SELECTED_OPTION: &str = "@agentmux-selected";
 
@@ -224,9 +225,17 @@ fn find_split_target(window_id: &str) -> Option<(String, bool)> {
     if let Some((id, _, _, _)) = full_height_left {
         Some((id.clone(), false))
     } else {
-        // Use -f to get full-height sidebar
+        // Use -f to ensure full-height sidebar
         let first = panes.first()?;
         Some((first.0.clone(), true))
+    }
+}
+
+pub fn resize_pane_width(width: u32) {
+    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    if !pane.is_empty() {
+        let w = width.to_string();
+        let _ = tmux_output(&["resize-pane", "-t", &pane, "-x", &w]);
     }
 }
 
