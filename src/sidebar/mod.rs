@@ -50,50 +50,27 @@ impl Default for HeaderConfig {
 }
 
 fn load_header_config() -> HeaderConfig {
-    let Some(path) =
-        dirs::home_dir().map(|h| h.join(".config").join("agentmux").join("config.toml"))
-    else {
-        return HeaderConfig::default();
-    };
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    use crate::config::read_value;
     let mut cfg = HeaderConfig::default();
-    let mut in_header_section = false;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_header_section = trimmed == "[header]";
-            continue;
-        }
-        if !in_header_section {
-            continue;
-        }
-        if let Some((key, val)) = trimmed.split_once('=') {
-            let key = key.trim();
-            let val = val.trim();
-            match key {
-                "auto_collapse" => {
-                    cfg.auto_collapse = val == "true";
-                }
-                "auto_collapse_timeout_ms" => {
-                    cfg.auto_collapse_timeout_ms = val.parse().unwrap_or(5000);
-                }
-                "start_mode" => {
-                    let unquoted = val.trim_matches('"');
-                    cfg.start_mode = if unquoted == "collapsed" {
-                        HeaderMode::Collapsed
-                    } else {
-                        HeaderMode::Expanded
-                    };
-                }
-                _ => {}
-            }
-        }
+    if let Some(v) = read_value("header", "auto_collapse") {
+        cfg.auto_collapse = v == "true";
+    }
+    if let Some(v) = read_value("header", "auto_collapse_timeout_ms") {
+        cfg.auto_collapse_timeout_ms = v.parse().unwrap_or(5000);
+    }
+    if let Some(v) = read_value("header", "start_mode") {
+        cfg.start_mode = if v.trim_matches('"') == "collapsed" {
+            HeaderMode::Collapsed
+        } else {
+            HeaderMode::Expanded
+        };
     }
     cfg
 }
 
 pub fn run() {
+    crate::config::ensure_config();
     let session = tmux::current_session().expect("not running inside tmux");
 
     unsafe {

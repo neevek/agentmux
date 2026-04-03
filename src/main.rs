@@ -1,3 +1,4 @@
+mod config;
 mod detect;
 mod sidebar;
 mod tmux;

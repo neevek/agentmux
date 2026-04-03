@@ -47,35 +47,16 @@ struct SessionBaseline {
 }
 
 fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("agentmux")
-}
-
-// --- Config (initialized flag) ---
-
-fn config_toml_path() -> PathBuf {
-    config_dir().join("config.toml")
+    crate::config::config_dir()
 }
 
 fn is_initialized() -> bool {
-    fs::read_to_string(config_toml_path())
-        .unwrap_or_default()
-        .lines()
-        .any(|l| l.trim() == "initialized = true")
+    crate::config::read_value("core", "initialized")
+        .is_some_and(|v| v == "true")
 }
 
 fn set_initialized() {
-    let path = config_toml_path();
-    let _ = fs::create_dir_all(config_dir());
-    let content = fs::read_to_string(&path).unwrap_or_default();
-    let mut lines: Vec<&str> = content
-        .lines()
-        .filter(|l| !l.trim().starts_with("initialized"))
-        .collect();
-    lines.push("initialized = true");
-    let _ = fs::write(path, lines.join("\n") + "\n");
+    crate::config::write_value("core", "initialized", "true");
 }
 
 // --- Date helpers ---
