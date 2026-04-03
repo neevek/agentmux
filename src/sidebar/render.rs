@@ -46,7 +46,12 @@ pub fn item_row_count(agent: &AgentInfo) -> u32 {
 }
 
 /// Calculate how many items fit in the visible area (adaptive heights).
-pub fn visible_item_count(height: u32, agents: &[AgentInfo], scroll_offset: usize, expanded: bool) -> usize {
+pub fn visible_item_count(
+    height: u32,
+    agents: &[AgentInfo],
+    scroll_offset: usize,
+    expanded: bool,
+) -> usize {
     let mut available = height.saturating_sub(header_rows(expanded));
     let mut count = 0;
     for agent in agents.iter().skip(scroll_offset) {
@@ -94,29 +99,50 @@ pub fn render_sidebar(
 
     // === Stats table (5 columns: name │ period │ tokens │ cost │ turns) ===
     let col0 = "Claude".len().max("Codex".len()) + 2; // 8
-    let col1 = "Weekly".len() + 2;                     // 8
+    let col1 = "Weekly".len() + 2; // 8
     // Compute tokens/cost column widths from data (min fits header labels)
     let all_totals = [
-        &stats.claude.today, &stats.claude.seven_days, &stats.claude.total,
-        &stats.codex.today, &stats.codex.seven_days, &stats.codex.total,
+        &stats.claude.today,
+        &stats.claude.seven_days,
+        &stats.claude.total,
+        &stats.codex.today,
+        &stats.codex.seven_days,
+        &stats.codex.total,
     ];
-    let col2 = all_totals.iter()
+    let col2 = all_totals
+        .iter()
         .map(|t| {
-            format!("↑ {} ↓ {}", format_tokens(t.input_tokens), format_tokens(t.output_tokens))
-                .chars().count()
+            format!(
+                "↑ {} ↓ {}",
+                format_tokens(t.input_tokens),
+                format_tokens(t.output_tokens)
+            )
+            .chars()
+            .count()
         })
-        .max().unwrap_or(13)
-        .max("In/Out tokens".len()) + 2;
-    let col3 = all_totals.iter()
+        .max()
+        .unwrap_or(13)
+        .max("In/Out tokens".len())
+        + 2;
+    let col3 = all_totals
+        .iter()
         .map(|t| format_cost(t.cost_usd).len())
-        .max().unwrap_or(4)
-        .max("Cost".len()) + 2;
+        .max()
+        .unwrap_or(4)
+        .max("Cost".len())
+        + 2;
     // col4 (Turns) gets all remaining width
-    let col4 = w.saturating_sub(col0 + col1 + col2 + col3 + 4).max("Messages".len() + 2);
+    let col4 = w
+        .saturating_sub(col0 + col1 + col2 + col3 + 4)
+        .max("Messages".len() + 2);
     let cw = [col0, col1, col2, col3, col4];
 
     let table_bg = if header_selected { SEL_BG } else { "" };
-    let emit_table = if header_selected { emit_line_bg } else { emit_line_no_bg };
+    let emit_table = if header_selected {
+        emit_line_bg
+    } else {
+        emit_line_no_bg
+    };
 
     // Blank prefix width for header rows: cols 0 + │ + col1 = col0 + 1 + col1
     let hdr_blank = cw[0] + 1 + cw[1];
@@ -137,10 +163,15 @@ pub fn render_sidebar(
     let hdr_tok = centered_in("In/Out tokens", cw[2]);
     let hdr_cost = centered_in("Cost", cw[3]);
     let hdr_turns = centered_in("Messages", cw[4]);
-    emit_table(&mut buf, row, table_bg, &format!(
-        "{}{DIM}│{RESET}{bg}{WHITE}{hdr_tok}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_cost}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_turns}{RESET}{bg}",
-        " ".repeat(hdr_blank),
-    ));
+    emit_table(
+        &mut buf,
+        row,
+        table_bg,
+        &format!(
+            "{}{DIM}│{RESET}{bg}{WHITE}{hdr_tok}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_cost}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_turns}{RESET}{bg}",
+            " ".repeat(hdr_blank),
+        ),
+    );
     row += 1;
 
     // Border between header and data: cols 0-1 use ┬ (start), cols 2-4 use ┼ (continue)
@@ -156,39 +187,146 @@ pub fn render_sidebar(
     row += 1;
 
     if expanded {
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            &format!("{PEACH}{BOLD}Claude{RESET}"), 6, "Today", &stats.claude.today);
-        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            &format!("{PEACH}{BOLD}Claude{RESET}"),
+            6,
+            "Daily",
+            &stats.claude.today,
+        );
+        emit_table(
+            &mut buf,
+            row,
+            table_bg,
+            &format!("{DIM}{}{RESET}", table_border(&cw, '┼')),
+        );
         row += 1;
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            "", 0, "Weekly", &stats.claude.seven_days);
-        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border_partial(&cw)));
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            "",
+            0,
+            "Weekly",
+            &stats.claude.seven_days,
+        );
+        emit_table(
+            &mut buf,
+            row,
+            table_bg,
+            &format!("{DIM}{}{RESET}", table_border_partial(&cw)),
+        );
         row += 1;
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            "", 0, "Total", &stats.claude.total);
-        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            "",
+            0,
+            "Total",
+            &stats.claude.total,
+        );
+        emit_table(
+            &mut buf,
+            row,
+            table_bg,
+            &format!("{DIM}{}{RESET}", table_border(&cw, '┼')),
+        );
         row += 1;
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            &format!("{BLUE}{BOLD}Codex{RESET}"), 5, "Today", &stats.codex.today);
-        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            &format!("{BLUE}{BOLD}Codex{RESET}"),
+            5,
+            "Daily",
+            &stats.codex.today,
+        );
+        emit_table(
+            &mut buf,
+            row,
+            table_bg,
+            &format!("{DIM}{}{RESET}", table_border(&cw, '┼')),
+        );
         row += 1;
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            "", 0, "Weekly", &stats.codex.seven_days);
-        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border_partial(&cw)));
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            "",
+            0,
+            "Weekly",
+            &stats.codex.seven_days,
+        );
+        emit_table(
+            &mut buf,
+            row,
+            table_bg,
+            &format!("{DIM}{}{RESET}", table_border_partial(&cw)),
+        );
         row += 1;
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            "", 0, "Total", &stats.codex.total);
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            "",
+            0,
+            "Total",
+            &stats.codex.total,
+        );
     } else {
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            &format!("{PEACH}{BOLD}Claude{RESET}"), 6, "Today", &stats.claude.today);
-        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            &format!("{PEACH}{BOLD}Claude{RESET}"),
+            6,
+            "Daily",
+            &stats.claude.today,
+        );
+        emit_table(
+            &mut buf,
+            row,
+            table_bg,
+            &format!("{DIM}{}{RESET}", table_border(&cw, '┼')),
+        );
         row += 1;
-        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
-            &format!("{BLUE}{BOLD}Codex{RESET}"), 5, "Today", &stats.codex.today);
+        row = emit_stats_row(
+            &mut buf,
+            row,
+            table_bg,
+            emit_table,
+            &cw,
+            &format!("{BLUE}{BOLD}Codex{RESET}"),
+            5,
+            "Daily",
+            &stats.codex.today,
+        );
     }
 
     // Bottom border with all junctions
-    emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┴')));
+    emit_table(
+        &mut buf,
+        row,
+        table_bg,
+        &format!("{DIM}{}{RESET}", table_border(&cw, '┴')),
+    );
     row += 1;
 
     if agents.is_empty() {
@@ -377,7 +515,9 @@ fn emit_stats_row(
     let turns_cell = format!(" {FLAMINGO}{turns_str}{RESET}{bg}{}", " ".repeat(turns_pad));
 
     emit(
-        buf, row, bg,
+        buf,
+        row,
+        bg,
         &format!("{name_cell}{s}{period_cell}{s}{tok_cell}{s}{cost_cell}{s}{turns_cell}"),
     );
     row + 1
