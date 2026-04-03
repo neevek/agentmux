@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::detect;
+use crate::detect::AgentInfo;
 use crate::detect::history::HistoryStore;
 use crate::detect::state::AgentState;
-use crate::detect::AgentInfo;
 use crate::tmux;
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -17,9 +17,81 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
     SHOULD_EXIT.store(true, Ordering::Relaxed);
 }
 
+// No-op handler: installing it causes poll() to return EINTR on SIGWINCH,
+// which triggers immediate re-render on resize.
+extern "C" fn winch_handler(_sig: libc::c_int) {}
+
 const SCAN_INTERVAL_MS: u64 = 3000;
 const IDLE_CHECK_MS: u64 = 1000;
-const WIDTH_SAVE_THROTTLE_MS: u64 = 300;
+const WIDTH_SAVE_THROTTLE_MS: u64 = 50;
+
+// --- Header config ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderMode {
+    Expanded,
+    Collapsed,
+}
+
+struct HeaderConfig {
+    auto_collapse: bool,
+    auto_collapse_timeout_ms: u64,
+    start_mode: HeaderMode,
+}
+
+impl Default for HeaderConfig {
+    fn default() -> Self {
+        Self {
+            auto_collapse: true,
+            auto_collapse_timeout_ms: 5000,
+            start_mode: HeaderMode::Expanded,
+        }
+    }
+}
+
+fn load_header_config() -> HeaderConfig {
+    let Some(path) =
+        dirs::home_dir().map(|h| h.join(".config").join("agentmux").join("config.toml"))
+    else {
+        return HeaderConfig::default();
+    };
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut cfg = HeaderConfig::default();
+    let mut in_header_section = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_header_section = trimmed == "[header]";
+            continue;
+        }
+        if !in_header_section {
+            continue;
+        }
+        if let Some((key, val)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "auto_collapse" => {
+                    cfg.auto_collapse = val == "true";
+                }
+                "auto_collapse_timeout_ms" => {
+                    cfg.auto_collapse_timeout_ms = val.parse().unwrap_or(5000);
+                }
+                "start_mode" => {
+                    let unquoted = val.trim_matches('"');
+                    cfg.start_mode = if unquoted == "collapsed" {
+                        HeaderMode::Collapsed
+                    } else {
+                        HeaderMode::Expanded
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    cfg
+}
 
 pub fn run() {
     let session = tmux::current_session().expect("not running inside tmux");
@@ -29,6 +101,7 @@ pub fn run() {
         libc::signal(libc::SIGTERM, exit_h);
         libc::signal(libc::SIGINT, exit_h);
         libc::signal(libc::SIGHUP, exit_h);
+        libc::signal(libc::SIGWINCH, winch_handler as *const () as libc::sighandler_t);
     }
 
     let _guard = terminal_setup();
@@ -41,9 +114,18 @@ pub fn run() {
     let mut scroll_offset: usize = 0;
     let mut last_width: u32 = 0;
     let scan_interval = Duration::from_millis(SCAN_INTERVAL_MS);
-    let mut last_scan = Instant::now().checked_sub(scan_interval).unwrap_or_else(Instant::now);
+    let mut last_scan = Instant::now()
+        .checked_sub(scan_interval)
+        .unwrap_or_else(Instant::now);
     let mut last_width_save = Instant::now();
     let mut needs_render = true;
+
+    // Header expand/collapse state
+    let header_config = load_header_config();
+    let mut header_expanded = header_config.start_mode == HeaderMode::Expanded;
+    let mut header_user_toggled = false;
+    let mut header_selected = false;
+    let start_time = Instant::now();
 
     let history = HistoryStore::start();
 
@@ -57,6 +139,7 @@ pub fn run() {
         let selection_changed = selected_pane != last_selected_pane;
         last_selected_pane.clone_from(&selected_pane);
         if selection_changed {
+            header_selected = false;
             needs_render = true;
         }
 
@@ -64,10 +147,9 @@ pub fn run() {
             let agents = detect::scan_agents(&session, &mut session_cache);
 
             for agent in &agents {
-                if prev_states
-                    .get(&agent.pane_id)
-                    .is_some_and(|&prev| prev == AgentState::Working && agent.state == AgentState::Idle)
-                {
+                if prev_states.get(&agent.pane_id).is_some_and(|&prev| {
+                    prev == AgentState::Working && agent.state == AgentState::Idle
+                }) {
                     unseen_done.insert(agent.pane_id.clone());
                 }
                 prev_states.insert(agent.pane_id.clone(), agent.state);
@@ -89,19 +171,38 @@ pub fn run() {
             needs_render = true;
         }
 
-        let selected_idx = cached_agents
-            .iter()
-            .position(|a| a.pane_id == selected_pane)
-            .unwrap_or(0);
+        // Auto-collapse timer
+        if !header_user_toggled
+            && header_expanded
+            && header_config.start_mode == HeaderMode::Expanded
+            && header_config.auto_collapse
+            && start_time.elapsed() >= Duration::from_millis(header_config.auto_collapse_timeout_ms)
+        {
+            header_expanded = false;
+            header_user_toggled = true;
+            needs_render = true;
+        }
+
+        let selected_idx = if header_selected {
+            0 // doesn't matter for agent selection when header is focused
+        } else {
+            cached_agents
+                .iter()
+                .position(|a| a.pane_id == selected_pane)
+                .unwrap_or(0)
+        };
 
         // Auto-scroll to keep selection visible
         let (_, height) = terminal_size();
-        let visible = render::visible_item_count(height, &cached_agents, scroll_offset);
-        if visible > 0 {
-            if selected_idx < scroll_offset {
-                scroll_offset = selected_idx;
-            } else if selected_idx >= scroll_offset + visible {
-                scroll_offset = selected_idx + 1 - visible;
+        if !header_selected {
+            let visible =
+                render::visible_item_count(height, &cached_agents, scroll_offset, header_expanded);
+            if visible > 0 {
+                if selected_idx < scroll_offset {
+                    scroll_offset = selected_idx;
+                } else if selected_idx >= scroll_offset + visible {
+                    scroll_offset = selected_idx + 1 - visible;
+                }
             }
         }
 
@@ -113,7 +214,8 @@ pub fn run() {
                 width = tmux::MIN_WIDTH;
             }
             // Detect manual resize and sync to all sidebars (throttled)
-            if last_width != 0 && width != last_width
+            if last_width != 0
+                && width != last_width
                 && last_width_save.elapsed() >= Duration::from_millis(WIDTH_SAVE_THROTTLE_MS)
             {
                 tmux::save_sidebar_width(&session, width);
@@ -131,6 +233,8 @@ pub fn run() {
                     scroll_offset,
                     &unseen_done,
                     &stats,
+                    header_expanded,
+                    header_selected,
                 )
             );
             flush();
@@ -142,14 +246,31 @@ pub fn run() {
             let remaining = SCAN_INTERVAL_MS.saturating_sub(elapsed_ms).max(50);
             match input::poll_input(Duration::from_millis(remaining)) {
                 input::InputEvent::KeyUp => {
-                    let new_sel = selected_idx.saturating_sub(1);
-                    set_selection(&cached_agents, new_sel);
+                    if header_selected {
+                        // Already at top, no-op
+                    } else if selected_idx == 0 {
+                        // Move from first agent to header
+                        header_selected = true;
+                    } else {
+                        let new_sel = selected_idx.saturating_sub(1);
+                        set_selection(&cached_agents, new_sel);
+                    }
                     needs_render = true;
                 }
                 input::InputEvent::KeyDown => {
-                    let max = cached_agents.len().saturating_sub(1);
-                    let new_sel = if selected_idx < max { selected_idx + 1 } else { max };
-                    set_selection(&cached_agents, new_sel);
+                    if header_selected {
+                        // Move from header to first agent
+                        header_selected = false;
+                        set_selection(&cached_agents, 0);
+                    } else {
+                        let max = cached_agents.len().saturating_sub(1);
+                        let new_sel = if selected_idx < max {
+                            selected_idx + 1
+                        } else {
+                            max
+                        };
+                        set_selection(&cached_agents, new_sel);
+                    }
                     needs_render = true;
                 }
                 input::InputEvent::MouseScrollUp => {
@@ -158,23 +279,41 @@ pub fn run() {
                 }
                 input::InputEvent::MouseScrollDown => {
                     let max_offset = cached_agents.len().saturating_sub(
-                        render::visible_item_count(height, &cached_agents, scroll_offset).max(1),
+                        render::visible_item_count(
+                            height,
+                            &cached_agents,
+                            scroll_offset,
+                            header_expanded,
+                        )
+                        .max(1),
                     );
                     scroll_offset = (scroll_offset + 1).min(max_offset);
                     needs_render = true;
                 }
                 input::InputEvent::KeyEnter => {
-                    if let Some(agent) = cached_agents.get(selected_idx) {
+                    if header_selected {
+                        header_expanded = !header_expanded;
+                        header_user_toggled = true;
+                        needs_render = true;
+                    } else if let Some(agent) = cached_agents.get(selected_idx) {
                         unseen_done.remove(&agent.pane_id);
                         tmux::select_window(&agent.window_id);
                         tmux::select_pane(&agent.pane_id);
                     }
                 }
                 input::InputEvent::MouseClick { y } => {
-                    if let Some(agent) =
-                        input::click_to_agent_index(y, &cached_agents, scroll_offset)
+                    let hrows = render::header_rows(header_expanded);
+                    if y >= 4 && y <= hrows {
+                        // Click on header stats area (rows 4..=hrows are the table)
+                        header_expanded = !header_expanded;
+                        header_user_toggled = true;
+                        header_selected = true;
+                        needs_render = true;
+                    } else if let Some(agent) =
+                        input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows)
                             .and_then(|idx| cached_agents.get(idx))
                     {
+                        header_selected = false;
                         tmux::set_selected_pane(&agent.pane_id);
                         unseen_done.remove(&agent.pane_id);
                         tmux::select_window(&agent.window_id);

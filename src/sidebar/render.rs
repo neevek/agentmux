@@ -1,5 +1,5 @@
 use crate::detect::AgentInfo;
-use crate::detect::history::AggregatedStats;
+use crate::detect::history::{AgentTotals, AggregatedStats};
 use crate::detect::process::{AgentKind, format_elapsed};
 use crate::detect::state::{AgentState, format_tokens};
 use std::collections::HashSet;
@@ -26,8 +26,11 @@ const FLAMINGO: &str = "\x1b[38;2;242;205;205m"; // flamingo #f2cdcd (msg count)
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
 const HEADER_BG: &str = "\x1b[48;2;30;30;46m";
 
-/// Number of header rows (title 2 + table 5 = 7)
-pub const HEADER_ROWS: u32 = 7;
+/// Number of header rows, depends on expanded/collapsed mode.
+/// Title: 3 rows. Table header: 2 rows. Collapsed data: 5 rows. Expanded data: 13 rows.
+pub fn header_rows(expanded: bool) -> u32 {
+    if expanded { 18 } else { 10 }
+}
 
 /// Calculate the row count for a single agent item.
 pub fn item_row_count(agent: &AgentInfo) -> u32 {
@@ -43,8 +46,8 @@ pub fn item_row_count(agent: &AgentInfo) -> u32 {
 }
 
 /// Calculate how many items fit in the visible area (adaptive heights).
-pub fn visible_item_count(height: u32, agents: &[AgentInfo], scroll_offset: usize) -> usize {
-    let mut available = height.saturating_sub(HEADER_ROWS);
+pub fn visible_item_count(height: u32, agents: &[AgentInfo], scroll_offset: usize, expanded: bool) -> usize {
+    let mut available = height.saturating_sub(header_rows(expanded));
     let mut count = 0;
     for agent in agents.iter().skip(scroll_offset) {
         let h = item_row_count(agent);
@@ -65,6 +68,8 @@ pub fn render_sidebar(
     scroll_offset: usize,
     unseen_done: &HashSet<String>,
     stats: &AggregatedStats,
+    expanded: bool,
+    header_selected: bool,
 ) -> String {
     let w = width as usize;
     let mut buf = String::new();
@@ -87,111 +92,103 @@ pub fn render_sidebar(
     emit_line_bg(&mut buf, row, HEADER_BG, "");
     row += 1;
 
-    // === Stats table (bordered, 4 columns: name │ tokens │ cost │ msgs) ===
-    let c_tok = format!(
-        "↑ {} ↓ {}",
-        format_tokens(stats.claude.input_tokens),
-        format_tokens(stats.claude.output_tokens)
-    );
-    let x_tok = format!(
-        "↑ {} ↓ {}",
-        format_tokens(stats.codex.input_tokens),
-        format_tokens(stats.codex.output_tokens)
-    );
-    let c_cost = format_cost(stats.claude.cost_usd);
-    let x_cost = format_cost(stats.codex.cost_usd);
-    let c_msg_label = if stats.claude.turns == 1 {
-        "msg"
-    } else {
-        "msgs"
-    };
-    let x_msg_label = if stats.codex.turns == 1 {
-        "msg"
-    } else {
-        "msgs"
-    };
-    let c_msgs = format!("{} {c_msg_label}", format_compact_count(stats.claude.turns));
-    let x_msgs = format!("{} {x_msg_label}", format_compact_count(stats.codex.turns));
-
-    // Column widths (content + 2 padding) — give remaining space to tokens column
-    let mut cw = [
-        "Claude".len().max("Codex".len()) + 2,
-        c_tok.chars().count().max(x_tok.chars().count()) + 2,
-        c_cost.len().max(x_cost.len()) + 2,
-        c_msgs.len().max(x_msgs.len()) + 2,
+    // === Stats table (5 columns: name │ period │ tokens │ cost │ turns) ===
+    let col0 = "Claude".len().max("Codex".len()) + 2; // 8
+    let col1 = "Weekly".len() + 2;                     // 8
+    // Compute tokens/cost column widths from data (min fits header labels)
+    let all_totals = [
+        &stats.claude.today, &stats.claude.seven_days, &stats.claude.total,
+        &stats.codex.today, &stats.codex.seven_days, &stats.codex.total,
     ];
-    let total: usize = cw.iter().sum::<usize>() + 3; // +3 for │ separators
-    if total < w {
-        let extra = w - total;
-        let per_col = extra / 3;
-        let remainder = extra % 3;
-        cw[1] += per_col + if remainder > 0 { 1 } else { 0 };
-        cw[2] += per_col + if remainder > 1 { 1 } else { 0 };
-        cw[3] += per_col;
+    let col2 = all_totals.iter()
+        .map(|t| {
+            format!("↑ {} ↓ {}", format_tokens(t.input_tokens), format_tokens(t.output_tokens))
+                .chars().count()
+        })
+        .max().unwrap_or(13)
+        .max("In/Out tokens".len()) + 2;
+    let col3 = all_totals.iter()
+        .map(|t| format_cost(t.cost_usd).len())
+        .max().unwrap_or(4)
+        .max("Cost".len()) + 2;
+    // col4 (Turns) gets all remaining width
+    let col4 = w.saturating_sub(col0 + col1 + col2 + col3 + 4).max("Turns".len() + 2);
+    let cw = [col0, col1, col2, col3, col4];
+
+    let table_bg = if header_selected { SEL_BG } else { "" };
+    let emit_table = if header_selected { emit_line_bg } else { emit_line_no_bg };
+
+    // Blank prefix width for header rows: cols 0 + │ + col1 = col0 + 1 + col1
+    let hdr_blank = cw[0] + 1 + cw[1];
+
+    // Table header: partial top border (cols 2-4 only) + label row
+    let hdr_top = format!(
+        "{}┌{}┬{}┬{}",
+        " ".repeat(hdr_blank),
+        "─".repeat(cw[2]),
+        "─".repeat(cw[3]),
+        "─".repeat(cw[4]),
+    );
+    emit_table(&mut buf, row, table_bg, &format!("{DIM}{hdr_top}{RESET}"));
+    row += 1;
+
+    // Header labels (centered in each column)
+    let bg = table_bg;
+    let hdr_tok = centered_in("In/Out tokens", cw[2]);
+    let hdr_cost = centered_in("Cost", cw[3]);
+    let hdr_turns = centered_in("Turns", cw[4]);
+    emit_table(&mut buf, row, table_bg, &format!(
+        "{}{DIM}│{RESET}{bg}{WHITE}{hdr_tok}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_cost}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_turns}{RESET}{bg}",
+        " ".repeat(hdr_blank),
+    ));
+    row += 1;
+
+    // Border between header and data: cols 0-1 use ┬ (start), cols 2-4 use ┼ (continue)
+    let data_top = format!(
+        "{}┬{}┼{}┼{}┼{}",
+        "─".repeat(cw[0]),
+        "─".repeat(cw[1]),
+        "─".repeat(cw[2]),
+        "─".repeat(cw[3]),
+        "─".repeat(cw[4]),
+    );
+    emit_table(&mut buf, row, table_bg, &format!("{DIM}{data_top}{RESET}"));
+    row += 1;
+
+    if expanded {
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            &format!("{PEACH}{BOLD}Claude{RESET}"), 6, "Today", &stats.claude.today);
+        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row += 1;
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            "", 0, "Weekly", &stats.claude.seven_days);
+        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border_partial(&cw)));
+        row += 1;
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            "", 0, "Total", &stats.claude.total);
+        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row += 1;
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            &format!("{BLUE}{BOLD}Codex{RESET}"), 5, "Today", &stats.codex.today);
+        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row += 1;
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            "", 0, "Weekly", &stats.codex.seven_days);
+        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border_partial(&cw)));
+        row += 1;
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            "", 0, "Total", &stats.codex.total);
+    } else {
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            &format!("{PEACH}{BOLD}Claude{RESET}"), 6, "Today", &stats.claude.today);
+        emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┼')));
+        row += 1;
+        row = emit_stats_row(&mut buf, row, table_bg, emit_table, &cw,
+            &format!("{BLUE}{BOLD}Codex{RESET}"), 5, "Today", &stats.codex.today);
     }
 
-    emit_line_no_bg(
-        &mut buf,
-        row,
-        "",
-        &format!("{DIM}{}{RESET}", table_border(&cw, '┬')),
-    );
-    row += 1;
-    emit_line_no_bg(
-        &mut buf,
-        row,
-        "",
-        &format!(
-            "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
-            centered_cell(&format!("{PEACH}{BOLD}Claude{RESET}"), 6, cw[0]),
-            centered_cell(
-                &format!(
-                    "{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}",
-                    format_tokens(stats.claude.input_tokens),
-                    format_tokens(stats.claude.output_tokens)
-                ),
-                c_tok.chars().count(),
-                cw[1]
-            ),
-            centered_cell(&format!("{ROSEWATER}{c_cost}{RESET}"), c_cost.len(), cw[2]),
-            centered_cell(&format!("{FLAMINGO}{c_msgs}{RESET}"), c_msgs.len(), cw[3]),
-        ),
-    );
-    row += 1;
-    emit_line_no_bg(
-        &mut buf,
-        row,
-        "",
-        &format!("{DIM}{}{RESET}", table_border(&cw, '┼')),
-    );
-    row += 1;
-    emit_line_no_bg(
-        &mut buf,
-        row,
-        "",
-        &format!(
-            "{}{DIM}│{RESET}{}{DIM}│{RESET}{}{DIM}│{RESET}{}",
-            centered_cell(&format!("{BLUE}{BOLD}Codex{RESET}"), 5, cw[0]),
-            centered_cell(
-                &format!(
-                    "{BLUE}↑ {}{RESET} {MAUVE}↓ {}{RESET}",
-                    format_tokens(stats.codex.input_tokens),
-                    format_tokens(stats.codex.output_tokens)
-                ),
-                x_tok.chars().count(),
-                cw[1]
-            ),
-            centered_cell(&format!("{ROSEWATER}{x_cost}{RESET}"), x_cost.len(), cw[2]),
-            centered_cell(&format!("{FLAMINGO}{x_msgs}{RESET}"), x_msgs.len(), cw[3]),
-        ),
-    );
-    row += 1;
-    emit_line_no_bg(
-        &mut buf,
-        row,
-        "",
-        &format!("{DIM}{}{RESET}", table_border(&cw, '┴')),
-    );
+    // Bottom border with all junctions
+    emit_table(&mut buf, row, table_bg, &format!("{DIM}{}{RESET}", table_border(&cw, '┴')));
     row += 1;
 
     if agents.is_empty() {
@@ -205,12 +202,12 @@ pub fn render_sidebar(
         );
         row += 1;
     } else {
-        let visible = visible_item_count(height, agents, scroll_offset);
+        let visible = visible_item_count(height, agents, scroll_offset, expanded);
         let end = (scroll_offset + visible).min(agents.len());
 
         for (vi, agent) in agents[scroll_offset..end].iter().enumerate() {
             let i = scroll_offset + vi;
-            let is_selected = i == selected;
+            let is_selected = !header_selected && i == selected;
             let color = match agent.kind {
                 AgentKind::ClaudeCode => PEACH,
                 AgentKind::Codex => BLUE,
@@ -328,6 +325,75 @@ pub fn render_sidebar(
     buf
 }
 
+fn emit_stats_row(
+    buf: &mut String,
+    row: u32,
+    bg: &str,
+    emit: fn(&mut String, u32, &str, &str),
+    cw: &[usize; 5],
+    name_colored: &str,
+    name_plain_len: usize,
+    period: &str,
+    totals: &AgentTotals,
+) -> u32 {
+    let cost_str = format_cost(totals.cost_usd);
+    let turns_str = format_compact_count(totals.turns);
+    let tok_str = format!(
+        "↑ {} ↓ {}",
+        format_tokens(totals.input_tokens),
+        format_tokens(totals.output_tokens)
+    );
+
+    let s = format!("{DIM}│{RESET}{bg}"); // reusable separator
+
+    // Col 0: name (left-aligned, 1 char padding)
+    let name_cell = if name_plain_len > 0 {
+        let pad = cw[0].saturating_sub(name_plain_len + 1);
+        format!(" {name_colored}{RESET}{bg}{}", " ".repeat(pad))
+    } else {
+        format!("{bg}{}", " ".repeat(cw[0]))
+    };
+
+    // Col 1: period (left-aligned, 1 char padding)
+    let period_pad = cw[1].saturating_sub(period.len() + 1);
+    let period_cell = format!(" {DIM}{period}{RESET}{bg}{}", " ".repeat(period_pad));
+
+    // Col 2: tokens (left-aligned, 1 char padding)
+    let tok_plain_len = tok_str.chars().count();
+    let tok_pad = cw[2].saturating_sub(tok_plain_len + 1);
+    let tok_cell = format!(
+        " {BLUE}↑ {}{RESET}{bg} {MAUVE}↓ {}{RESET}{bg}{}",
+        format_tokens(totals.input_tokens),
+        format_tokens(totals.output_tokens),
+        " ".repeat(tok_pad),
+    );
+
+    // Col 3: cost (left-aligned, 1 char padding)
+    let cost_pad = cw[3].saturating_sub(cost_str.len() + 1);
+    let cost_cell = format!(" {ROSEWATER}{cost_str}{RESET}{bg}{}", " ".repeat(cost_pad));
+
+    // Col 4: turns (left-aligned, 1 char padding)
+    let turns_pad = cw[4].saturating_sub(turns_str.len() + 1);
+    let turns_cell = format!(" {FLAMINGO}{turns_str}{RESET}{bg}{}", " ".repeat(turns_pad));
+
+    emit(
+        buf, row, bg,
+        &format!("{name_cell}{s}{period_cell}{s}{tok_cell}{s}{cost_cell}{s}{turns_cell}"),
+    );
+    row + 1
+}
+
+fn table_border_partial(cw: &[usize; 5]) -> String {
+    let blank: String = " ".repeat(cw[0]);
+    format!(
+        "{blank}├{}┼{}┼{}┼{}",
+        "─".repeat(cw[1]),
+        "─".repeat(cw[2]),
+        "─".repeat(cw[3]),
+        "─".repeat(cw[4]),
+    )
+}
+
 fn emit_line_bg(buf: &mut String, row: u32, bg: &str, content: &str) {
     buf.push_str(&format!("\x1b[{row};1H{bg}\x1b[K{content}{RESET}"));
 }
@@ -389,10 +455,11 @@ fn table_border(col_widths: &[usize], junction: char) -> String {
         .join(&junction.to_string())
 }
 
-fn centered_cell(colored: &str, plain_len: usize, cell_width: usize) -> String {
-    let left = cell_width.saturating_sub(plain_len) / 2;
-    let right = cell_width.saturating_sub(plain_len).saturating_sub(left);
-    format!("{}{colored}{}", " ".repeat(left), " ".repeat(right))
+fn centered_in(text: &str, cell_width: usize) -> String {
+    let pad = cell_width.saturating_sub(text.len());
+    let left = pad / 2;
+    let right = pad - left;
+    format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
 }
 
 fn format_compact_count(n: u32) -> String {
