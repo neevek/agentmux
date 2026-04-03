@@ -1,9 +1,9 @@
 use std::process::Command;
 
-pub const SIDEBAR_TITLE: &str = "agentpane-sidebar";
+pub const SIDEBAR_TITLE: &str = "agentmux-sidebar";
 const DEFAULT_WIDTH: u32 = 60;
-const WIDTH_OPTION: &str = "@agentpane-width";
-const SELECTED_OPTION: &str = "@agentpane-selected";
+const WIDTH_OPTION: &str = "@agentmux-width";
+const SELECTED_OPTION: &str = "@agentmux-selected";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -74,7 +74,7 @@ pub fn save_sidebar_width(session: &str, width: u32) {
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".config").join("agentpane").join("config.toml"))
+    dirs::home_dir().map(|h| h.join(".config").join("agentmux").join("config.toml"))
 }
 
 fn persist_width(width: u32) {
@@ -264,7 +264,7 @@ pub fn remove_hook(hook_name: &str) {
 
 pub fn self_binary() -> String {
     std::env::current_exe()
-        .unwrap_or_else(|_| "agentpane".into())
+        .unwrap_or_else(|_| "agentmux".into())
         .display()
         .to_string()
 }

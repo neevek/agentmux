@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# agentpane.tmux — TPM entry point
+# agentmux.tmux — TPM entry point
 #
 # Install:
-#   1. Add to .tmux.conf:  set -g @plugin 'neevek/agentpane'
+#   1. Add to .tmux.conf:  set -g @plugin 'neevek/agentmux'
 #   2. Press prefix + I to install
 #
 # Options (set before TPM init):
-#   @agentpane-key   "a"  — prefix + key to toggle sidebar
+#   @agentmux-key   "a"  — prefix + key to toggle sidebar
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="neevek/agentpane"
+REPO="neevek/agentmux"
 
 # Determine install directory: prefer ~/.local/bin, fallback to ~/bin
 get_bin_dir() {
@@ -21,7 +21,7 @@ get_bin_dir() {
 }
 
 BIN_DIR="$(get_bin_dir)"
-BINARY="$BIN_DIR/agentpane"
+BINARY="$BIN_DIR/agentmux"
 
 get_target() {
   local os arch
@@ -33,7 +33,11 @@ get_target() {
         arm64) echo "aarch64-apple-darwin" ;;
         *)     echo "x86_64-apple-darwin" ;;
       esac ;;
-    Linux)  echo "x86_64-unknown-linux-musl" ;;
+    Linux)
+      case "$arch" in
+        aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
+        *)             echo "x86_64-unknown-linux-musl" ;;
+      esac ;;
     MINGW*|MSYS*|CYGWIN*) echo "x86_64-pc-windows-msvc" ;;
     *)      echo "" ;;
   esac
@@ -67,7 +71,7 @@ ensure_path() {
   fi
 
   echo "" >> "$profile"
-  echo "# Added by agentpane" >> "$profile"
+  echo "# Added by agentmux" >> "$profile"
   echo "$export_line" >> "$profile"
 
   # Also export for current session
@@ -87,7 +91,7 @@ download_binary() {
     *)         ext="tar.gz" ;;
   esac
 
-  url="https://github.com/$REPO/releases/download/$tag/agentpane-${target}.${ext}"
+  url="https://github.com/$REPO/releases/download/$tag/agentmux-${target}.${ext}"
   tmp="$(mktemp -d)"
 
   if curl -fsSL "$url" -o "$tmp/archive.$ext" 2>/dev/null; then
@@ -108,13 +112,13 @@ download_binary() {
 if [ ! -x "$BINARY" ]; then
   target=$(get_target)
   if [ -n "$target" ]; then
-    download_binary "$target" 2>/tmp/agentpane-download.log
+    download_binary "$target" 2>/tmp/agentmux-download.log
   fi
 
   # Fallback: build from source if download failed and cargo is available
   if [ ! -x "$BINARY" ] && command -v cargo >/dev/null 2>&1; then
-    (cd "$CURRENT_DIR" && cargo build --release 2>/tmp/agentpane-build.log \
-      && mkdir -p "$BIN_DIR" && cp target/release/agentpane "$BIN_DIR/") &
+    (cd "$CURRENT_DIR" && cargo build --release 2>/tmp/agentmux-build.log \
+      && mkdir -p "$BIN_DIR" && cp target/release/agentmux "$BIN_DIR/") &
   fi
 fi
 
@@ -122,7 +126,7 @@ fi
 ensure_path "$BIN_DIR"
 
 # Read user options
-TOGGLE_KEY=$(tmux show-option -gqv "@agentpane-key" 2>/dev/null)
+TOGGLE_KEY=$(tmux show-option -gqv "@agentmux-key" 2>/dev/null)
 TOGGLE_KEY="${TOGGLE_KEY:-a}"
 
 # Bind toggle key

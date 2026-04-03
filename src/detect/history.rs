@@ -43,7 +43,7 @@ fn config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("agentpane")
+        .join("agentmux")
 }
 
 // --- Config (initialized flag) ---

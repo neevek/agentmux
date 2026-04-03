@@ -74,7 +74,7 @@ pub fn render_sidebar(
     buf.push_str("\x1b[?25l");
 
     // === Header ===
-    let title = "Coding Agents";
+    let title = "AgentMux";
     let padding = w.saturating_sub(title.len()) / 2;
     emit_line_bg(&mut buf, row, HEADER_BG, "");
     row += 1;

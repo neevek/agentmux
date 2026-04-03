@@ -5,7 +5,7 @@ mod tmux;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "agentpane", about = "Tmux sidebar for coding agent sessions")]
+#[command(name = "agentmux", about = "Tmux sidebar for coding agent sessions")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
