@@ -41,7 +41,6 @@ pub fn ensure_config() {
     }
 }
 
-/// Read a value from a specific section. Returns None if not found.
 pub fn read_value(section: &str, key: &str) -> Option<String> {
     let content = fs::read_to_string(config_path()).ok()?;
     let section_header = format!("[{section}]");
@@ -58,14 +57,13 @@ pub fn read_value(section: &str, key: &str) -> Option<String> {
         }
         if let Some((k, v)) = trimmed.split_once('=') {
             if k.trim() == key {
-                return Some(v.trim().to_string());
+                return Some(v.trim().trim_matches('"').to_string());
             }
         }
     }
     None
 }
 
-/// Write a value into a specific section. Creates the section if needed.
 pub fn write_value(section: &str, key: &str, value: &str) {
     let path = config_path();
     let _ = fs::create_dir_all(config_dir());
@@ -109,7 +107,6 @@ pub fn write_value(section: &str, key: &str, value: &str) {
     // If we were in the target section at EOF and didn't write the key
     if in_target_section && !key_written {
         result.push(format!("{key} = {value}"));
-        key_written = true;
     }
 
     // Section didn't exist — append it
@@ -120,8 +117,5 @@ pub fn write_value(section: &str, key: &str, value: &str) {
         result.push(section_header);
         result.push(format!("{key} = {value}"));
     }
-    // key_written is only not set if section_found was false, handled above
-    let _ = key_written;
-
     let _ = fs::write(path, result.join("\n") + "\n");
 }

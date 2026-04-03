@@ -83,10 +83,8 @@ pub fn render_sidebar(
     buf.push_str("\x1b[?25l");
 
     // === Header ===
-    let title = "AgentMux";
+    let title = "agentmux";
     let padding = w.saturating_sub(title.len()) / 2;
-    emit_line_bg(&mut buf, row, HEADER_BG, "");
-    row += 1;
     emit_line_bg(
         &mut buf,
         row,
@@ -94,13 +92,11 @@ pub fn render_sidebar(
         &format!("{}{BOLD}{GREEN}{title}{RESET}", " ".repeat(padding)),
     );
     row += 1;
-    emit_line_bg(&mut buf, row, HEADER_BG, "");
-    row += 1;
 
-    // === Stats table (5 columns: name │ period │ tokens │ cost │ turns) ===
+    // === Stats table (6 columns: name │ period │ in │ out │ cost │ turns) ===
     let col0 = "Claude".len().max("Codex".len()) + 2; // 8
     let col1 = "Weekly".len() + 2; // 8
-    // Compute tokens/cost column widths from data (min fits header labels)
+    // Compute token/cost column widths from data (min fits header labels)
     let all_totals = [
         &stats.claude.today,
         &stats.claude.seven_days,
@@ -111,31 +107,30 @@ pub fn render_sidebar(
     ];
     let col2 = all_totals
         .iter()
-        .map(|t| {
-            format!(
-                "↑ {} ↓ {}",
-                format_tokens(t.input_tokens),
-                format_tokens(t.output_tokens)
-            )
-            .chars()
-            .count()
-        })
+        .map(|t| format_tokens(t.input_tokens).len())
         .max()
-        .unwrap_or(13)
-        .max("In/Out tokens".len())
+        .unwrap_or(1)
+        .max("↑ In".chars().count())
         + 2;
     let col3 = all_totals
+        .iter()
+        .map(|t| format_tokens(t.output_tokens).len())
+        .max()
+        .unwrap_or(1)
+        .max("↓ Out".chars().count())
+        + 2;
+    let col4 = all_totals
         .iter()
         .map(|t| format_cost(t.cost_usd).len())
         .max()
         .unwrap_or(4)
         .max("Cost".len())
         + 2;
-    // col4 (Turns) gets all remaining width
-    let col4 = w
-        .saturating_sub(col0 + col1 + col2 + col3 + 4)
-        .max("Messages".len() + 2);
-    let cw = [col0, col1, col2, col3, col4];
+    // col5 (Turns) gets all remaining width
+    let col5 = w
+        .saturating_sub(col0 + col1 + col2 + col3 + col4 + 5)
+        .max("Msgs".len() + 2);
+    let cw = [col0, col1, col2, col3, col4, col5];
 
     let table_bg = if header_selected { SEL_BG } else { "" };
     let emit_table = if header_selected {
@@ -147,41 +142,48 @@ pub fn render_sidebar(
     // Blank prefix width for header rows: cols 0 + │ + col1 = col0 + 1 + col1
     let hdr_blank = cw[0] + 1 + cw[1];
 
-    // Table header: partial top border (cols 2-4 only) + label row
+    // Table header: partial top border (cols 2-5 only) + label row
     let hdr_top = format!(
-        "{}┌{}┬{}┬{}",
+        "{}┌{}┬{}┬{}┬{}",
         " ".repeat(hdr_blank),
         "─".repeat(cw[2]),
         "─".repeat(cw[3]),
         "─".repeat(cw[4]),
+        "─".repeat(cw[5]),
     );
     emit_table(&mut buf, row, table_bg, &format!("{DIM}{hdr_top}{RESET}"));
     row += 1;
 
     // Header labels (centered in each column)
     let bg = table_bg;
-    let hdr_tok = centered_in("In/Out tokens", cw[2]);
-    let hdr_cost = centered_in("Cost", cw[3]);
-    let hdr_turns = centered_in("Messages", cw[4]);
+    let hdr_in = centered_in("↑ In", cw[2]);
+    let hdr_out = centered_in("↓ Out", cw[3]);
+    let hdr_cost = centered_in("Cost", cw[4]);
+    let hdr_turns = format!(
+        " {}{}",
+        "Msgs",
+        " ".repeat(cw[5].saturating_sub("Msgs".len() + 1))
+    );
     emit_table(
         &mut buf,
         row,
         table_bg,
         &format!(
-            "{}{DIM}│{RESET}{bg}{WHITE}{hdr_tok}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_cost}{RESET}{bg}{DIM}│{RESET}{bg}{WHITE}{hdr_turns}{RESET}{bg}",
+            "{}{DIM}│{RESET}{bg}{BLUE}{hdr_in}{RESET}{bg}{DIM}│{RESET}{bg}{MAUVE}{hdr_out}{RESET}{bg}{DIM}│{RESET}{bg}{ROSEWATER}{hdr_cost}{RESET}{bg}{DIM}│{RESET}{bg}{FLAMINGO}{hdr_turns}{RESET}{bg}",
             " ".repeat(hdr_blank),
         ),
     );
     row += 1;
 
-    // Border between header and data: cols 0-1 use ┬ (start), cols 2-4 use ┼ (continue)
+    // Border between header and data: cols 0-1 use ┬ (start), cols 2-5 use ┼ (continue)
     let data_top = format!(
-        "{}┬{}┼{}┼{}┼{}",
+        "{}┬{}┼{}┼{}┼{}┼{}",
         "─".repeat(cw[0]),
         "─".repeat(cw[1]),
         "─".repeat(cw[2]),
         "─".repeat(cw[3]),
         "─".repeat(cw[4]),
+        "─".repeat(cw[5]),
     );
     emit_table(&mut buf, row, table_bg, &format!("{DIM}{data_top}{RESET}"));
     row += 1;
@@ -468,7 +470,7 @@ fn emit_stats_row(
     row: u32,
     bg: &str,
     emit: fn(&mut String, u32, &str, &str),
-    cw: &[usize; 5],
+    cw: &[usize; 6],
     name_colored: &str,
     name_plain_len: usize,
     period: &str,
@@ -476,13 +478,11 @@ fn emit_stats_row(
 ) -> u32 {
     let cost_str = format_cost(totals.cost_usd);
     let turns_str = format_compact_count(totals.turns);
-    let tok_str = format!(
-        "↑ {} ↓ {}",
-        format_tokens(totals.input_tokens),
-        format_tokens(totals.output_tokens)
-    );
+    let in_str = format_tokens(totals.input_tokens);
+    let out_str = format_tokens(totals.output_tokens);
 
     let s = format!("{DIM}│{RESET}{bg}"); // reusable separator
+    let data_color = WHITE;
 
     // Col 0: name (left-aligned, 1 char padding)
     let name_cell = if name_plain_len > 0 {
@@ -496,41 +496,45 @@ fn emit_stats_row(
     let period_pad = cw[1].saturating_sub(period.len() + 1);
     let period_cell = format!(" {DIM}{period}{RESET}{bg}{}", " ".repeat(period_pad));
 
-    // Col 2: tokens (left-aligned, 1 char padding)
-    let tok_plain_len = tok_str.chars().count();
-    let tok_pad = cw[2].saturating_sub(tok_plain_len + 1);
-    let tok_cell = format!(
-        " {BLUE}↑ {}{RESET}{bg} {MAUVE}↓ {}{RESET}{bg}{}",
-        format_tokens(totals.input_tokens),
-        format_tokens(totals.output_tokens),
-        " ".repeat(tok_pad),
+    // Col 2: input tokens (left-aligned, 1 char padding)
+    let in_pad = cw[2].saturating_sub(in_str.len() + 1);
+    let in_cell = format!(" {data_color}{in_str}{RESET}{bg}{}", " ".repeat(in_pad));
+
+    // Col 3: output tokens (left-aligned, 1 char padding)
+    let out_pad = cw[3].saturating_sub(out_str.len() + 1);
+    let out_cell = format!(" {data_color}{out_str}{RESET}{bg}{}", " ".repeat(out_pad));
+
+    // Col 4: cost (left-aligned, 1 char padding)
+    let cost_pad = cw[4].saturating_sub(cost_str.len() + 1);
+    let cost_cell = format!(" {data_color}{cost_str}{RESET}{bg}{}", " ".repeat(cost_pad));
+
+    // Col 5: turns (left-aligned, 1 char padding)
+    let turns_pad = cw[5].saturating_sub(turns_str.len() + 1);
+    let turns_cell = format!(
+        " {data_color}{turns_str}{RESET}{bg}{}",
+        " ".repeat(turns_pad)
     );
-
-    // Col 3: cost (left-aligned, 1 char padding)
-    let cost_pad = cw[3].saturating_sub(cost_str.len() + 1);
-    let cost_cell = format!(" {ROSEWATER}{cost_str}{RESET}{bg}{}", " ".repeat(cost_pad));
-
-    // Col 4: turns (left-aligned, 1 char padding)
-    let turns_pad = cw[4].saturating_sub(turns_str.len() + 1);
-    let turns_cell = format!(" {FLAMINGO}{turns_str}{RESET}{bg}{}", " ".repeat(turns_pad));
 
     emit(
         buf,
         row,
         bg,
-        &format!("{name_cell}{s}{period_cell}{s}{tok_cell}{s}{cost_cell}{s}{turns_cell}"),
+        &format!(
+            "{name_cell}{s}{period_cell}{s}{in_cell}{s}{out_cell}{s}{cost_cell}{s}{turns_cell}"
+        ),
     );
     row + 1
 }
 
-fn table_border_partial(cw: &[usize; 5]) -> String {
+fn table_border_partial(cw: &[usize; 6]) -> String {
     let blank: String = " ".repeat(cw[0]);
     format!(
-        "{blank}├{}┼{}┼{}┼{}",
+        "{blank}├{}┼{}┼{}┼{}┼{}",
         "─".repeat(cw[1]),
         "─".repeat(cw[2]),
         "─".repeat(cw[3]),
         "─".repeat(cw[4]),
+        "─".repeat(cw[5]),
     )
 }
 
@@ -596,7 +600,7 @@ fn table_border(col_widths: &[usize], junction: char) -> String {
 }
 
 fn centered_in(text: &str, cell_width: usize) -> String {
-    let pad = cell_width.saturating_sub(text.len());
+    let pad = cell_width.saturating_sub(text.chars().count());
     let left = pad / 2;
     let right = pad - left;
     format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
