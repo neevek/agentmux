@@ -1,4 +1,4 @@
-# agentpane
+# agentmux
 
 A tmux sidebar that monitors all your coding agent sessions — Claude Code, Codex, and more — from a single, always-visible pane.
 
@@ -25,7 +25,7 @@ A tmux sidebar that monitors all your coding agent sessions — Claude Code, Cod
 Add to your `~/.tmux.conf`:
 
 ```tmux
-set -g @plugin 'neevek/agentpane'
+set -g @plugin 'neevek/agentmux'
 ```
 
 Press `prefix + I` to install. The plugin automatically downloads a prebuilt binary for your platform. If no binary is available, it falls back to building from source (requires Rust toolchain).
@@ -33,16 +33,16 @@ Press `prefix + I` to install. The plugin automatically downloads a prebuilt bin
 ### Manual
 
 ```bash
-git clone https://github.com/neevek/agentpane ~/.tmux/plugins/agentpane
-cd ~/.tmux/plugins/agentpane
+git clone https://github.com/neevek/agentmux ~/.tmux/plugins/agentmux
+cd ~/.tmux/plugins/agentmux
 cargo build --release
-mkdir -p bin && cp target/release/agentpane bin/
+mkdir -p bin && cp target/release/agentmux bin/
 ```
 
 Add to `~/.tmux.conf`:
 
 ```tmux
-run-shell ~/.tmux/plugins/agentpane/agentpane.tmux
+run-shell ~/.tmux/plugins/agentmux/agentmux.tmux
 ```
 
 ## Usage
@@ -58,9 +58,9 @@ run-shell ~/.tmux/plugins/agentpane/agentpane.tmux
 Or use the CLI directly:
 
 ```bash
-agentpane toggle   # Toggle sidebar
-agentpane open     # Open if not already open
-agentpane close    # Close all sidebars
+agentmux toggle   # Toggle sidebar
+agentmux open     # Open if not already open
+agentmux close    # Close all sidebars
 ```
 
 ## Configuration
@@ -69,10 +69,10 @@ Set these in `~/.tmux.conf` before the plugin line:
 
 ```tmux
 # Change toggle keybinding (default: a)
-set -g @agentpane-key 'a'
+set -g @agentmux-key 'a'
 
 # Set sidebar width (default: 60)
-set -g @agentpane-width 50
+set -g @agentmux-width 50
 ```
 
 ## Supported Agents
@@ -90,16 +90,16 @@ Let's be honest. In the age of AI-assisted development, the lifecycle of any int
 
 I decided to skip that step.
 
-agentpane is written in Rust from day one — not because I wanted to be trendy, but because I wanted to be *last*. No one's going to rewrite-it-in-Rust if it's already in Rust. The PR writes itself: "closes #1: rewrite in Rust" — filed and merged before the repo is in public.
+agentmux is written in Rust from day one — not because I wanted to be trendy, but because I wanted to be *last*. No one's going to rewrite-it-in-Rust if it's already in Rust. The PR writes itself: "closes #1: rewrite in Rust" — filed and merged before the repo is in public.
 
 And it turns out Rust is genuinely the right tool here:
 
 - **Zero runtime dependencies** — A single static binary. No Node.js, no Python, no Bun. `prefix + I` and you're done.
 - **Low resource footprint** — Inactive sidebars cost near-zero CPU. One tmux query per second, no file I/O. Your laptop fan stays quiet.
 - **Fast startup** — Millisecond launch. No interpreter warmup, no `npm install`, no waiting for your JIT to warm up while you watch a spinner.
-- **Cross-platform builds** — One CI matrix, four targets (macOS ARM/Intel, Linux, Windows). No platform-specific shims or runtime bundles.
+- **Cross-platform builds** — One CI matrix, six targets (macOS ARM/Intel, Linux x86_64/ARM64, Windows x86_64/ARM64). No platform-specific shims or runtime bundles.
 
-So yes — I chose Rust because it's fast, correct, and dependency-free. But mostly because I didn't want to wake up to a PR titled *"agentpane-rs: A blazingly fast rewrite"*. You're welcome.
+So yes — I chose Rust because it's fast, correct, and dependency-free. But mostly because I didn't want to wake up to a PR titled *"agentmux-rs: A blazingly fast rewrite"*. You're welcome.
 
 ## Architecture
 
