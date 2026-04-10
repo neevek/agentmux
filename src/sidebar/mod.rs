@@ -199,7 +199,7 @@ pub fn run() {
                 last_width_save = Instant::now();
             }
             last_width = width;
-            let stats = history.aggregated_stats();
+            let stats = history.aggregated_stats(&cached_agents);
             print!(
                 "{}",
                 render::render_sidebar(

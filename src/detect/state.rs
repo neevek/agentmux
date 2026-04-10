@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ pub struct SessionDetails {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub turn_count: u32,
+    pub jsonl_path: Option<PathBuf>,
 }
 
 impl Default for SessionDetails {
@@ -40,6 +41,7 @@ impl Default for SessionDetails {
             model: None,
             effort: None,
             turn_count: 0,
+            jsonl_path: None,
         }
     }
 }
@@ -50,8 +52,14 @@ pub struct SessionCache {
 
 #[derive(Clone)]
 struct CachedData {
-    file_size: u64,
+    metadata: FileMetadata,
     tokens: ParsedTokens,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileMetadata {
+    pub(crate) size: u64,
+    pub(crate) modified_ts: u64,
 }
 
 #[derive(Clone)]
@@ -75,19 +83,19 @@ impl SessionCache {
     }
 
     fn get_or_update(&mut self, path: &Path, parser: fn(&Path) -> ParsedTokens) -> &ParsedTokens {
-        let current_size = fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+        let current_metadata = file_metadata(path);
 
         let needs_update = self
             .entries
             .get(path)
-            .is_none_or(|c| c.file_size != current_size);
+            .is_none_or(|c| c.metadata != current_metadata);
 
         if needs_update {
             let tokens = parser(path);
             self.entries.insert(
                 path.to_path_buf(),
                 CachedData {
-                    file_size: current_size,
+                    metadata: current_metadata,
                     tokens,
                 },
             );
@@ -113,17 +121,27 @@ pub fn claude_code_details(
     let encoded = encode_project_dir(cwd);
     let projects_dir = home.join(".claude").join("projects").join(&encoded);
     let jsonl_path = find_most_recent_jsonl(&projects_dir);
-    agent_details(jsonl_path.as_deref(), agent_age_secs, cache, detect_claude_state, parse_claude_tokens)
+    agent_details(
+        jsonl_path.as_deref(),
+        agent_age_secs,
+        cache,
+        detect_claude_state,
+        parse_claude_tokens,
+    )
 }
 
-pub fn codex_details(
-    cwd: &str,
-    agent_age_secs: u64,
-    cache: &mut SessionCache,
-) -> SessionDetails {
+pub fn codex_details(cwd: &str, agent_age_secs: u64, cache: &mut SessionCache) -> SessionDetails {
     let sessions_dir = codex_sessions_dir();
-    let jsonl_path = sessions_dir.as_ref().and_then(|d| find_codex_jsonl_for_cwd(d, cwd));
-    agent_details(jsonl_path.as_deref(), agent_age_secs, cache, detect_codex_state, parse_codex_tokens)
+    let jsonl_path = sessions_dir
+        .as_ref()
+        .and_then(|d| find_codex_jsonl_for_cwd(d, cwd));
+    agent_details(
+        jsonl_path.as_deref(),
+        agent_age_secs,
+        cache,
+        detect_codex_state,
+        parse_codex_tokens,
+    )
 }
 
 fn agent_details(
@@ -158,6 +176,7 @@ fn agent_details(
         model: cached.model.clone(),
         effort: cached.effort.clone(),
         turn_count: cached.turn_count,
+        jsonl_path: Some(path.to_path_buf()),
     }
 }
 
@@ -202,6 +221,25 @@ fn file_recently_modified(path: &Path, threshold: Duration) -> bool {
         .is_some_and(|age| age < threshold)
 }
 
+pub(crate) fn file_metadata(path: &Path) -> FileMetadata {
+    let Ok(metadata) = fs::metadata(path) else {
+        return FileMetadata {
+            size: 0,
+            modified_ts: 0,
+        };
+    };
+    let modified_ts = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    FileMetadata {
+        size: metadata.len(),
+        modified_ts,
+    }
+}
+
 fn encode_project_dir(path: &str) -> String {
     path.chars()
         .map(|c| match c {
@@ -242,7 +280,9 @@ fn find_codex_jsonl_for_cwd(sessions_dir: &Path, cwd: &str) -> Option<PathBuf> {
     let mut all_files: Vec<(PathBuf, SystemTime)> = Vec::new();
 
     fn walk(dir: &Path, files: &mut Vec<(PathBuf, SystemTime)>) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -305,8 +345,12 @@ fn read_jsonl(path: &Path, tail_bytes: Option<u64>) -> Vec<Value> {
 
 fn detect_claude_state(path: &Path) -> AgentState {
     for entry in read_jsonl(path, Some(TAIL_BYTES)).iter().rev() {
-        let Some(msg) = entry.get("message") else { continue };
-        let Some(role) = json_str(msg, &["role"]) else { continue };
+        let Some(msg) = entry.get("message") else {
+            continue;
+        };
+        let Some(role) = json_str(msg, &["role"]) else {
+            continue;
+        };
         match role {
             "assistant" => {
                 if let Some(Value::Array(items)) = msg.get("content") {
@@ -327,17 +371,26 @@ fn detect_claude_state(path: &Path) -> AgentState {
                 let text = match msg.get("content") {
                     Some(Value::String(s)) => Some(s.as_str()),
                     Some(Value::Array(items)) => items.iter().find_map(|c| {
-                        if json_str(c, &["type"]) == Some("text") { c.get("text")?.as_str() } else { None }
+                        if json_str(c, &["type"]) == Some("text") {
+                            c.get("text")?.as_str()
+                        } else {
+                            None
+                        }
                     }),
                     _ => None,
                 };
                 if let Some(text) = text {
-                    if text.starts_with("[Request interrupted") || text.contains("<command-name>/exit</command-name>") {
+                    if text.starts_with("[Request interrupted")
+                        || text.contains("<command-name>/exit</command-name>")
+                    {
                         return AgentState::Idle;
                     }
-                    if text.starts_with('<') || text.starts_with('{') { continue; }
+                    if text.starts_with('<') || text.starts_with('{') {
+                        continue;
+                    }
                 }
-                if matches!(msg.get("content"), Some(Value::Array(items)) if items.iter().any(|c| json_str(c, &["type"]) == Some("tool_result"))) {
+                if matches!(msg.get("content"), Some(Value::Array(items)) if items.iter().any(|c| json_str(c, &["type"]) == Some("tool_result")))
+                {
                     return AgentState::Working;
                 }
                 return AgentState::Working;
@@ -357,7 +410,8 @@ fn detect_codex_state(path: &Path) -> AgentState {
                         "task_started" | "user_message" => return AgentState::Working,
                         "task_complete" | "turn_aborted" => return AgentState::Idle,
                         "agent_message" => {
-                            return if json_str(entry, &["payload", "phase"]) == Some("final_answer") {
+                            return if json_str(entry, &["payload", "phase"]) == Some("final_answer")
+                            {
                                 AgentState::Idle
                             } else {
                                 AgentState::Working
@@ -369,15 +423,23 @@ fn detect_codex_state(path: &Path) -> AgentState {
             }
             Some("response_item") => {
                 if let Some(it) = json_str(entry, &["payload", "type"]) {
-                    if it == "function_call" { return AgentState::Working; }
-                    if it == "message" && json_str(entry, &["payload", "phase"]) == Some("final_answer") {
+                    if it == "function_call" {
+                        return AgentState::Working;
+                    }
+                    if it == "message"
+                        && json_str(entry, &["payload", "phase"]) == Some("final_answer")
+                    {
                         return AgentState::Idle;
                     }
                 }
             }
             _ => {
                 if let Some(role) = json_str(entry, &["role"]) {
-                    return if role == "user" { AgentState::Working } else { AgentState::Idle };
+                    return if role == "user" {
+                        AgentState::Working
+                    } else {
+                        AgentState::Idle
+                    };
                 }
             }
         }
@@ -396,11 +458,14 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
     let mut last_activity: Option<String> = None;
     let mut last_turn_input: u64 = 0;
     let mut model_name: Option<String> = None;
-    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut assistant_messages: Vec<&Value> = Vec::new();
+    let mut assistant_id_indexes: HashMap<String, usize> = HashMap::new();
     let mut turn_count: u32 = 0;
 
     for entry in &entries {
-        let Some(msg) = entry.get("message") else { continue };
+        let Some(msg) = entry.get("message") else {
+            continue;
+        };
         let role = json_str(msg, &["role"]);
 
         if role == Some("user") {
@@ -411,7 +476,11 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
                 let text = match msg.get("content") {
                     Some(Value::String(s)) => Some(s.as_str()),
                     Some(Value::Array(items)) => items.iter().find_map(|c| {
-                        if json_str(c, &["type"]) == Some("text") { c.get("text")?.as_str() } else { None }
+                        if json_str(c, &["type"]) == Some("text") {
+                            c.get("text")?.as_str()
+                        } else {
+                            None
+                        }
                     }),
                     _ => None,
                 };
@@ -422,13 +491,24 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
             continue;
         }
 
-        if role != Some("assistant") { continue; }
-
-        // Deduplicate: Claude Code writes streaming + final entries with the same id
-        if msg.get("id").and_then(|v| v.as_str()).is_some_and(|id| !seen_ids.insert(id.to_string())) {
+        if role != Some("assistant") {
             continue;
         }
 
+        // Claude Code writes streaming + final entries with the same id; keep the final entry.
+        if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+            if let Some(index) = assistant_id_indexes.get(id).copied() {
+                assistant_messages[index] = msg;
+            } else {
+                assistant_id_indexes.insert(id.to_string(), assistant_messages.len());
+                assistant_messages.push(msg);
+            }
+        } else {
+            assistant_messages.push(msg);
+        }
+    }
+
+    for msg in assistant_messages {
         if let Some(m) = json_str(msg, &["model"]) {
             model_name = Some(m.to_string());
         }
@@ -457,11 +537,22 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
 
     let context_pct = model_name.as_deref().and_then(|m| {
         let max_ctx = model_context_window(m)?;
-        (last_turn_input > 0).then(|| ((last_turn_input as f64 / max_ctx as f64) * 100.0).min(100.0) as u8)
+        (last_turn_input > 0)
+            .then(|| ((last_turn_input as f64 / max_ctx as f64) * 100.0).min(100.0) as u8)
     });
 
     let effort = claude_effort_level();
-    ParsedTokens { input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, last_activity, context_pct, model: model_name, effort, turn_count }
+    ParsedTokens {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        last_activity,
+        context_pct,
+        model: model_name,
+        effort,
+        turn_count,
+    }
 }
 
 fn claude_effort_level() -> Option<String> {
@@ -500,26 +591,32 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
                     effort = Some(e.to_string());
                 }
             }
-            Some("event_msg") => {
-                match json_str(entry, &["payload", "type"]) {
-                    Some("token_count") => {
-                        if let Some(info) = entry.get("payload").and_then(|p| p.get("info")) {
-                            let get_from = |section: &str, field: &str| {
-                                info.get(section).and_then(|s| s.get(field)).and_then(|v| v.as_u64()).unwrap_or(0)
-                            };
-                            input_tokens = get_from("total_token_usage", "input_tokens");
-                            output_tokens = get_from("total_token_usage", "output_tokens");
-                            last_turn_input = get_from("last_token_usage", "input_tokens");
-                            context_window = info.get("model_context_window").and_then(|v| v.as_u64()).unwrap_or(context_window);
-                        }
+            Some("event_msg") => match json_str(entry, &["payload", "type"]) {
+                Some("token_count") => {
+                    if let Some(info) = entry.get("payload").and_then(|p| p.get("info")) {
+                        let get_from = |section: &str, field: &str| {
+                            info.get(section)
+                                .and_then(|s| s.get(field))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                        };
+                        input_tokens = get_from("total_token_usage", "input_tokens");
+                        output_tokens = get_from("total_token_usage", "output_tokens");
+                        last_turn_input = get_from("last_token_usage", "input_tokens");
+                        context_window = info
+                            .get("model_context_window")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(context_window);
                     }
-                    Some("user_message") => {
-                        turn_count += 1;
-                    }
-                    _ => {}
                 }
-            }
-            Some("response_item") if json_str(entry, &["payload", "type"]) == Some("function_call") => {
+                Some("user_message") => {
+                    turn_count += 1;
+                }
+                _ => {}
+            },
+            Some("response_item")
+                if json_str(entry, &["payload", "type"]) == Some("function_call") =>
+            {
                 if let Some(name) = json_str(entry, &["payload", "name"]) {
                     last_activity = Some(name.to_string());
                 }
@@ -531,7 +628,17 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
     let context_pct = (context_window > 0 && last_turn_input > 0)
         .then(|| ((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8);
 
-    ParsedTokens { input_tokens, output_tokens, cache_read_tokens: 0, cache_creation_tokens: 0, last_activity, context_pct, model, effort, turn_count }
+    ParsedTokens {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        last_activity,
+        context_pct,
+        model,
+        effort,
+        turn_count,
+    }
 }
 
 fn model_context_window(model: &str) -> Option<u64> {
@@ -556,12 +663,18 @@ fn extract_tool_detail(name: &str, item: &Value) -> String {
             format!("{name} {file}")
         }
         "Bash" => {
-            let cmd = input.and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or("");
+            let cmd = input
+                .and_then(|i| i.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
             let short = cmd.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
             format!("Bash {short}")
         }
         "Grep" | "Glob" => {
-            let pat = input.and_then(|i| i.get("pattern")).and_then(|p| p.as_str()).unwrap_or("");
+            let pat = input
+                .and_then(|i| i.get("pattern"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("");
             format!("{name} {pat}")
         }
         _ => name.to_string(),
@@ -599,10 +712,28 @@ pub(crate) fn extract_codex_session_id(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_temp_jsonl(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agentmux-{name}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        path
+    }
 
     #[test]
     fn test_encode_project_dir() {
-        assert_eq!(encode_project_dir("/Users/foo/myproject"), "-Users-foo-myproject");
+        assert_eq!(
+            encode_project_dir("/Users/foo/myproject"),
+            "-Users-foo-myproject"
+        );
     }
 
     #[test]
@@ -611,5 +742,24 @@ mod tests {
         assert_eq!(format_tokens(500), "500");
         assert_eq!(format_tokens(1500), "1.5k");
         assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn claude_duplicate_message_ids_keep_final_usage() {
+        let path = write_temp_jsonl(
+            "claude-duplicate-final",
+            r#"{"sessionId":"s1","message":{"role":"assistant","id":"m1","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":1}}}
+{"sessionId":"s1","message":{"role":"assistant","id":"m1","model":"claude-sonnet-4-5","usage":{"input_tokens":30,"cache_read_input_tokens":5,"cache_creation_input_tokens":7,"output_tokens":20}}}
+"#,
+        );
+
+        let tokens = parse_claude_tokens(&path);
+
+        assert_eq!(tokens.input_tokens, 42);
+        assert_eq!(tokens.output_tokens, 20);
+        assert_eq!(tokens.cache_read_tokens, 5);
+        assert_eq!(tokens.cache_creation_tokens, 7);
+
+        let _ = fs::remove_file(path);
     }
 }
