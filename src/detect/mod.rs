@@ -2,6 +2,8 @@ pub mod history;
 pub mod process;
 pub mod state;
 
+use std::path::PathBuf;
+
 use crate::tmux;
 use process::AgentKind;
 pub use state::SessionCache;
@@ -23,6 +25,8 @@ pub struct AgentInfo {
     pub effort: Option<String>,
     pub cost_usd: f64,
     pub turn_count: u32,
+    pub session_id: Option<String>,
+    pub jsonl_path: Option<PathBuf>,
 }
 
 /// Full scan: find all agent panes in the session and determine their state.
@@ -56,6 +60,10 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
                     details.cache_creation_tokens,
                 ))
                 .unwrap_or(0.0);
+            let session_id = details.jsonl_path.as_deref().and_then(|path| match d.kind {
+                AgentKind::ClaudeCode => state::extract_claude_session_id(path),
+                AgentKind::Codex => state::extract_codex_session_id(path),
+            });
             AgentInfo {
                 kind: d.kind,
                 pane_id: d.pane_id,
@@ -72,6 +80,8 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
                 effort: details.effort,
                 cost_usd,
                 turn_count: details.turn_count,
+                session_id,
+                jsonl_path: details.jsonl_path,
             }
         })
         .collect();
