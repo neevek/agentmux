@@ -7,36 +7,29 @@ const WIDTH_OPTION: &str = "@agentmux-width";
 const SELECTED_OPTION: &str = "@agentmux-selected";
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PaneInfo {
     pub id: String,
-    pub session_name: String,
     pub window_id: String,
     pub window_index: u32,
     pub pid: u32,
     pub cwd: String,
     pub title: String,
-    pub width: u32,
-    pub height: u32,
 }
 
-const PANE_FORMAT: &str = "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}\t#{pane_width}\t#{pane_height}";
+const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}";
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() < 9 {
+    if parts.len() < 6 {
         return None;
     }
     Some(PaneInfo {
         id: parts[0].to_string(),
-        session_name: parts[1].to_string(),
-        window_id: parts[2].to_string(),
-        window_index: parts[3].parse().unwrap_or(0),
-        pid: parts[4].parse().unwrap_or(0),
-        cwd: parts[5].to_string(),
-        title: parts[6].to_string(),
-        width: parts[7].parse().unwrap_or(0),
-        height: parts[8].parse().unwrap_or(0),
+        window_id: parts[1].to_string(),
+        window_index: parts[2].parse().unwrap_or(0),
+        pid: parts[3].parse().unwrap_or(0),
+        cwd: parts[4].to_string(),
+        title: parts[5].to_string(),
     })
 }
 

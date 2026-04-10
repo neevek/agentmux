@@ -25,6 +25,7 @@ pub struct SessionDetails {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub turn_count: u32,
+    pub session_id: Option<String>,
     pub jsonl_path: Option<PathBuf>,
 }
 
@@ -41,6 +42,7 @@ impl Default for SessionDetails {
             model: None,
             effort: None,
             turn_count: 0,
+            session_id: None,
             jsonl_path: None,
         }
     }
@@ -73,6 +75,7 @@ pub(crate) struct ParsedTokens {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) turn_count: u32,
+    pub(crate) session_id: Option<String>,
 }
 
 impl SessionCache {
@@ -82,9 +85,12 @@ impl SessionCache {
         }
     }
 
-    fn get_or_update(&mut self, path: &Path, parser: fn(&Path) -> ParsedTokens) -> &ParsedTokens {
-        let current_metadata = file_metadata(path);
-
+    fn get_or_update_with_metadata(
+        &mut self,
+        path: &Path,
+        parser: fn(&Path) -> ParsedTokens,
+        current_metadata: FileMetadata,
+    ) -> &ParsedTokens {
         let needs_update = self
             .entries
             .get(path)
@@ -154,17 +160,32 @@ fn agent_details(
     let Some(path) = jsonl_path else {
         return SessionDetails::default();
     };
-    if file_older_than_process(path, agent_age_secs) {
+    let Ok(meta) = fs::metadata(path) else {
+        return SessionDetails::default();
+    };
+    let mtime = meta.modified().ok();
+    let file_age = mtime
+        .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    if file_age > agent_age_secs + 5 {
         return SessionDetails::default();
     }
 
-    let state = if file_recently_modified(path, ACTIVE_WRITE_THRESHOLD) {
+    let state = if file_age < ACTIVE_WRITE_THRESHOLD.as_secs() {
         AgentState::Working
     } else {
         detect_state(path)
     };
 
-    let cached = cache.get_or_update(path, parse_tokens);
+    let metadata = FileMetadata {
+        size: meta.len(),
+        modified_ts: mtime
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    let cached = cache.get_or_update_with_metadata(path, parse_tokens, metadata);
     SessionDetails {
         state,
         input_tokens: cached.input_tokens,
@@ -176,6 +197,7 @@ fn agent_details(
         model: cached.model.clone(),
         effort: cached.effort.clone(),
         turn_count: cached.turn_count,
+        session_id: cached.session_id.clone(),
         jsonl_path: Some(path.to_path_buf()),
     }
 }
@@ -201,24 +223,6 @@ fn json_str<'a>(val: &'a Value, path: &[&str]) -> Option<&'a str> {
         current = current.get(*key)?;
     }
     current.as_str()
-}
-
-fn file_older_than_process(path: &Path, agent_age_secs: u64) -> bool {
-    let file_age = fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX);
-    file_age > agent_age_secs + 5
-}
-
-fn file_recently_modified(path: &Path, threshold: Duration) -> bool {
-    fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-        .is_some_and(|age| age < threshold)
 }
 
 pub(crate) fn file_metadata(path: &Path) -> FileMetadata {
@@ -273,55 +277,61 @@ fn find_most_recent_jsonl(dir: &Path) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
+/// Recursively collect all .jsonl files under a directory.
+pub(crate) fn walk_jsonl(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_jsonl(&path, files);
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            files.push(path);
+        }
+    }
+}
+
 fn find_codex_jsonl_for_cwd(sessions_dir: &Path, cwd: &str) -> Option<PathBuf> {
     if !sessions_dir.is_dir() {
         return None;
     }
-    let mut all_files: Vec<(PathBuf, SystemTime)> = Vec::new();
-
-    fn walk(dir: &Path, files: &mut Vec<(PathBuf, SystemTime)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, files);
-            } else if let Some(mtime) = path
-                .extension()
-                .is_some_and(|ext| ext == "jsonl")
-                .then(|| entry.metadata().ok().and_then(|m| m.modified().ok()))
-                .flatten()
-            {
-                files.push((path, mtime));
-            }
-        }
-    }
-
-    walk(sessions_dir, &mut all_files);
+    let mut all_files: Vec<PathBuf> = Vec::new();
+    walk_jsonl(sessions_dir, &mut all_files);
     if all_files.is_empty() {
         return None;
     }
-    all_files.sort_by(|a, b| b.1.cmp(&a.1));
+    all_files.sort_by(|a, b| {
+        let mtime = |p: &Path| {
+            fs::metadata(p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        };
+        mtime(b).cmp(&mtime(a))
+    });
 
-    for (path, _) in &all_files {
+    for path in &all_files {
         if read_codex_session_cwd(path).is_some_and(|s| s == cwd) {
             return Some(path.clone());
         }
     }
-    Some(all_files.into_iter().next()?.0)
+    Some(all_files.into_iter().next()?)
 }
 
-fn read_codex_session_cwd(path: &Path) -> Option<String> {
+/// Parse the first line of a Codex JSONL file if it is a `session_meta` entry.
+fn parse_codex_session_meta(path: &Path) -> Option<Value> {
     let file = fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
     let mut first_line = String::new();
     std::io::BufRead::read_line(&mut reader, &mut first_line).ok()?;
     let entry: Value = serde_json::from_str(&first_line).ok()?;
-    if json_str(&entry, &["type"]) != Some("session_meta") {
-        return None;
-    }
-    json_str(&entry, &["payload", "cwd"]).map(|s| s.to_string())
+    (json_str(&entry, &["type"]) == Some("session_meta")).then_some(entry)
+}
+
+fn read_codex_session_cwd(path: &Path) -> Option<String> {
+    let meta = parse_codex_session_meta(path)?;
+    json_str(&meta, &["payload", "cwd"]).map(|s| s.to_string())
 }
 
 fn read_jsonl(path: &Path, tail_bytes: Option<u64>) -> Vec<Value> {
@@ -461,8 +471,15 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
     let mut assistant_messages: Vec<&Value> = Vec::new();
     let mut assistant_id_indexes: HashMap<String, usize> = HashMap::new();
     let mut turn_count: u32 = 0;
+    let mut session_id: Option<String> = None;
 
     for entry in &entries {
+        // Extract sessionId from any entry that has it (typically the first)
+        if session_id.is_none() {
+            if let Some(sid) = json_str(entry, &["sessionId"]) {
+                session_id = Some(sid.to_string());
+            }
+        }
         let Some(msg) = entry.get("message") else {
             continue;
         };
@@ -542,6 +559,10 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
     });
 
     let effort = claude_effort_level();
+    // Fallback session_id: filename stem (typically a UUID)
+    if session_id.is_none() {
+        session_id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+    }
     ParsedTokens {
         input_tokens,
         output_tokens,
@@ -552,21 +573,16 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
         model: model_name,
         effort,
         turn_count,
+        session_id,
     }
 }
 
 fn claude_effort_level() -> Option<String> {
-    use std::sync::OnceLock;
-    static EFFORT: OnceLock<Option<String>> = OnceLock::new();
-    EFFORT
-        .get_or_init(|| {
-            let home = dirs::home_dir()?;
-            let path = home.join(".claude").join("settings.json");
-            let content = fs::read_to_string(path).ok()?;
-            let val: Value = serde_json::from_str(&content).ok()?;
-            json_str(&val, &["effortLevel"]).map(|s| s.to_string())
-        })
-        .clone()
+    let home = dirs::home_dir()?;
+    let path = home.join(".claude").join("settings.json");
+    let content = fs::read_to_string(path).ok()?;
+    let val: Value = serde_json::from_str(&content).ok()?;
+    json_str(&val, &["effortLevel"]).map(|s| s.to_string())
 }
 
 pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
@@ -579,8 +595,15 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
     let mut model: Option<String> = None;
     let mut effort: Option<String> = None;
     let mut turn_count: u32 = 0;
+    let mut session_id: Option<String> = None;
 
     for entry in &entries {
+        // Extract session id from session_meta entry
+        if session_id.is_none() {
+            if json_str(entry, &["type"]) == Some("session_meta") {
+                session_id = json_str(entry, &["payload", "id"]).map(|s| s.to_string());
+            }
+        }
         match json_str(entry, &["type"]) {
             Some("turn_context") => {
                 // Primary source for model name and effort level
@@ -628,6 +651,9 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
     let context_pct = (context_window > 0 && last_turn_input > 0)
         .then(|| ((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8);
 
+    if session_id.is_none() {
+        session_id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+    }
     ParsedTokens {
         input_tokens,
         output_tokens,
@@ -638,6 +664,7 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
         model,
         effort,
         turn_count,
+        session_id,
     }
 }
 
@@ -696,13 +723,8 @@ pub(crate) fn extract_claude_session_id(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn extract_codex_session_id(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut first_line = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut first_line).ok()?;
-    let val: Value = serde_json::from_str(&first_line).ok()?;
-    if json_str(&val, &["type"]) == Some("session_meta") {
-        if let Some(id) = json_str(&val, &["payload", "id"]) {
+    if let Some(meta) = parse_codex_session_meta(path) {
+        if let Some(id) = json_str(&meta, &["payload", "id"]) {
             return Some(id.to_string());
         }
     }

@@ -23,18 +23,23 @@ impl AgentKind {
             AgentKind::Codex => "Codex",
         }
     }
+
+    /// Stable key used in the database and for internal lookups.
+    pub fn db_key(&self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
 }
 
 const ALL_AGENTS: &[AgentKind] = &[AgentKind::ClaudeCode, AgentKind::Codex];
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DetectedAgent {
     pub kind: AgentKind,
     pub pane_id: String,
-    pub pane_pid: u32,
     pub cwd: String,
-    pub session_name: String,
     pub window_id: String,
     pub window_index: u32,
     /// Elapsed seconds of the matched agent process
@@ -184,9 +189,7 @@ pub fn scan_panes_for_agents(panes: &[PaneInfo], sidebar_title: &str) -> Vec<Det
                 results.push(DetectedAgent {
                     kind: *agent,
                     pane_id: pane.id.clone(),
-                    pane_pid: pane.pid,
                     cwd: pane.cwd.clone(),
-                    session_name: pane.session_name.clone(),
                     window_id: pane.window_id.clone(),
                     window_index: pane.window_index,
                     elapsed_secs,
