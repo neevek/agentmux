@@ -52,7 +52,7 @@ struct SessionBaseline {
 }
 
 struct ActiveSession {
-    agent_type: String,
+    kind: AgentKind,
     path: PathBuf,
     parse_fn: fn(&Path) -> ParsedTokens,
     baseline: SessionBaseline,
@@ -241,22 +241,8 @@ fn discover_codex_jsonl_files() -> Vec<PathBuf> {
         return Vec::new();
     };
     let mut files = Vec::new();
-    walk_jsonl(&sessions_dir, &mut files);
+    super::state::walk_jsonl(&sessions_dir, &mut files);
     files
-}
-
-fn walk_jsonl(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_jsonl(&path, files);
-        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-            files.push(path);
-        }
-    }
 }
 
 // --- File helpers ---
@@ -296,11 +282,10 @@ fn add_period_delta(period: &mut AgentPeriodStats, delta: &AgentTotals) {
     add_totals(&mut period.total, delta);
 }
 
-fn add_agent_delta(stats: &mut AggregatedStats, agent_type: &str, delta: &AgentTotals) {
-    match agent_type {
-        "claude" => add_period_delta(&mut stats.claude, delta),
-        "codex" => add_period_delta(&mut stats.codex, delta),
-        _ => {}
+fn add_agent_delta(stats: &mut AggregatedStats, kind: AgentKind, delta: &AgentTotals) {
+    match kind {
+        AgentKind::ClaudeCode => add_period_delta(&mut stats.claude, delta),
+        AgentKind::Codex => add_period_delta(&mut stats.codex, delta),
     }
 }
 
@@ -528,13 +513,14 @@ fn load_baselines(db: &sqlite::Connection) -> HashMap<String, SessionBaseline> {
 
 fn process_file(
     db: &sqlite::Connection,
-    agent_type: &str,
+    kind: AgentKind,
     session_id: &str,
     path: &Path,
     parse_fn: fn(&Path) -> ParsedTokens,
     baselines: &mut HashMap<String, SessionBaseline>,
     today: &str,
 ) {
+    let agent_type = kind.db_key();
     let metadata = file_metadata(path);
     let key = format!("{agent_type}:{session_id}");
 
@@ -547,7 +533,7 @@ fn process_file(
     }
 
     let tokens = parse_fn(path);
-    let cost = session_cost(agent_type, &tokens);
+    let cost = session_cost(kind, &tokens);
 
     // Compute delta and attribute to the correct date
     let current = tokens_to_totals(&tokens, cost);
@@ -586,7 +572,7 @@ fn scan_and_update(
         if let Some(sid) = extract_claude_session_id(&path) {
             process_file(
                 db,
-                "claude",
+                AgentKind::ClaudeCode,
                 &sid,
                 &path,
                 parse_claude_tokens,
@@ -599,7 +585,7 @@ fn scan_and_update(
         if let Some(sid) = extract_codex_session_id(&path) {
             process_file(
                 db,
-                "codex",
+                AgentKind::Codex,
                 &sid,
                 &path,
                 parse_codex_tokens,
@@ -614,16 +600,15 @@ fn scan_and_update(
     reset_runtime_baseline(&mut shared.lock().unwrap(), snapshot, baselines.clone());
 }
 
-fn parser_for_agent(agent_type: &str) -> Option<fn(&Path) -> ParsedTokens> {
-    match agent_type {
-        "claude" => Some(parse_claude_tokens),
-        "codex" => Some(parse_codex_tokens),
-        _ => None,
+fn parser_for_kind(kind: AgentKind) -> fn(&Path) -> ParsedTokens {
+    match kind {
+        AgentKind::ClaudeCode => parse_claude_tokens,
+        AgentKind::Codex => parse_codex_tokens,
     }
 }
 
-fn active_key(agent_type: &str, session_id: &str) -> String {
-    format!("{agent_type}:{session_id}")
+fn active_key(kind: AgentKind, session_id: &str) -> String {
+    format!("{}:{session_id}", kind.db_key())
 }
 
 fn zero_baseline(metadata: FileMetadata) -> SessionBaseline {
@@ -638,13 +623,13 @@ fn zero_baseline(metadata: FileMetadata) -> SessionBaseline {
 }
 
 fn current_session_baseline(
-    agent_type: &str,
+    kind: AgentKind,
     path: &Path,
     parse_fn: fn(&Path) -> ParsedTokens,
 ) -> SessionBaseline {
     let metadata = file_metadata(path);
     let tokens = parse_fn(path);
-    let cost = session_cost(agent_type, &tokens);
+    let cost = session_cost(kind, &tokens);
     SessionBaseline {
         input_tokens: tokens.input_tokens,
         output_tokens: tokens.output_tokens,
@@ -655,12 +640,12 @@ fn current_session_baseline(
     }
 }
 
-fn session_cost(agent_type: &str, tokens: &ParsedTokens) -> f64 {
+fn session_cost(kind: AgentKind, tokens: &ParsedTokens) -> f64 {
     tokens
         .model
         .as_deref()
         .map(|m| {
-            let (cr, cc) = if agent_type == "claude" {
+            let (cr, cc) = if kind == AgentKind::ClaudeCode {
                 (tokens.cache_read_tokens, tokens.cache_creation_tokens)
             } else {
                 (0, 0)
@@ -685,7 +670,7 @@ fn record_active_delta(runtime: &mut HistoryRuntime, key: &str, current: Session
     };
     let current_totals = baseline_totals(&current);
     let delta = session_delta(&current_totals, &active.baseline);
-    add_agent_delta(&mut runtime.active_delta, &active.agent_type, &delta);
+    add_agent_delta(&mut runtime.active_delta, active.kind, &delta);
     active.baseline = current;
 }
 
@@ -693,32 +678,35 @@ fn finalize_active_session(runtime: &mut HistoryRuntime, key: &str) {
     let Some(active) = runtime.active_sessions.remove(key) else {
         return;
     };
-    let current = current_session_baseline(&active.agent_type, &active.path, active.parse_fn);
+    let current = current_session_baseline(active.kind, &active.path, active.parse_fn);
     let delta = session_delta(&baseline_totals(&current), &active.baseline);
-    add_agent_delta(&mut runtime.active_delta, &active.agent_type, &delta);
+    add_agent_delta(&mut runtime.active_delta, active.kind, &delta);
 }
 
 fn refresh_active_sessions(runtime: &mut HistoryRuntime, agents: &[AgentInfo]) {
     let mut seen = HashSet::new();
 
     for agent in agents {
-        let agent_type = match agent.kind {
-            AgentKind::ClaudeCode => "claude",
-            AgentKind::Codex => "codex",
-        };
         let Some(session_id) = agent.session_id.as_deref() else {
             continue;
         };
         let Some(path) = agent.jsonl_path.as_deref() else {
             continue;
         };
-        let Some(parse_fn) = parser_for_agent(agent_type) else {
-            continue;
-        };
+        let parse_fn = parser_for_kind(agent.kind);
 
-        let key = active_key(agent_type, session_id);
+        let key = active_key(agent.kind, session_id);
         seen.insert(key.clone());
-        let current = current_session_baseline(agent_type, path, parse_fn);
+
+        // Skip re-parsing if file is unchanged since last baseline
+        let metadata = file_metadata(path);
+        if let Some(active) = runtime.active_sessions.get(&key) {
+            if file_is_unchanged(&active.baseline, metadata) {
+                continue;
+            }
+        }
+
+        let current = current_session_baseline(agent.kind, path, parse_fn);
 
         if runtime.active_sessions.contains_key(&key) {
             record_active_delta(runtime, &key, current);
@@ -729,11 +717,11 @@ fn refresh_active_sessions(runtime: &mut HistoryRuntime, agents: &[AgentInfo]) {
                 .cloned()
                 .unwrap_or_else(|| zero_baseline(file_metadata(path)));
             let delta = session_delta(&baseline_totals(&current), &db_baseline);
-            add_agent_delta(&mut runtime.active_delta, agent_type, &delta);
+            add_agent_delta(&mut runtime.active_delta, agent.kind, &delta);
             runtime.active_sessions.insert(
                 key,
                 ActiveSession {
-                    agent_type: agent_type.to_string(),
+                    kind: agent.kind,
                     path: path.to_path_buf(),
                     parse_fn,
                     baseline: current,
@@ -836,14 +824,10 @@ impl HistoryStore {
         let current_keys: HashSet<String> = active_agents
             .iter()
             .filter_map(|agent| {
-                let agent_type = match agent.kind {
-                    AgentKind::ClaudeCode => "claude",
-                    AgentKind::Codex => "codex",
-                };
                 agent
                     .session_id
                     .as_deref()
-                    .map(|session_id| active_key(agent_type, session_id))
+                    .map(|session_id| active_key(agent.kind, session_id))
             })
             .collect();
         let has_closed_sessions = runtime

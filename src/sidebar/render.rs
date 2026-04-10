@@ -477,7 +477,7 @@ fn emit_stats_row(
     totals: &AgentTotals,
 ) -> u32 {
     let cost_str = format_cost(totals.cost_usd);
-    let turns_str = format_compact_count(totals.turns);
+    let turns_str = format_tokens(totals.turns as u64);
     let in_str = format_tokens(totals.input_tokens);
     let out_str = format_tokens(totals.output_tokens);
 
@@ -550,43 +550,7 @@ fn emit_line_clear(buf: &mut String, row: u32) {
     buf.push_str(&format!("\x1b[{row};1H\x1b[K"));
 }
 
-fn short_model_name(model: &str) -> String {
-    // Claude: "claude-opus-4-6-20260401" → "opus 4.6"
-    for family in &["opus", "sonnet", "haiku"] {
-        if let Some(pos) = model.find(family) {
-            let after = &model[pos + family.len()..];
-            let version_parts: Vec<&str> = after
-                .split('-')
-                .filter(|s| !s.is_empty() && s.len() < 8 && s.chars().all(|c| c.is_ascii_digit()))
-                .collect();
-            return if version_parts.is_empty() {
-                family.to_string()
-            } else {
-                format!("{}-{}", family, version_parts.join("."))
-            };
-        }
-    }
-    // OpenAI models — check specific variants before broad patterns
-    for prefix in &[
-        "o4-mini",
-        "o3-mini",
-        "o3",
-        "gpt-5.4-mini",
-        "gpt-5.4-nano",
-        "gpt-5.4",
-        "gpt-5.3-codex",
-        "gpt-4.1-mini",
-        "gpt-4.1-nano",
-        "gpt-4.1",
-        "gpt-4o-mini",
-        "gpt-4o",
-    ] {
-        if model.contains(prefix) {
-            return prefix.to_string();
-        }
-    }
-    model.to_string()
-}
+use crate::detect::short_model_name;
 
 fn table_border(col_widths: &[usize], junction: char) -> String {
     col_widths
@@ -604,16 +568,6 @@ fn centered_in(text: &str, cell_width: usize) -> String {
     let left = pad / 2;
     let right = pad - left;
     format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
-}
-
-fn format_compact_count(n: u32) -> String {
-    if n < 1000 {
-        format!("{n}")
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
 }
 
 fn format_cost(cost: f64) -> String {
