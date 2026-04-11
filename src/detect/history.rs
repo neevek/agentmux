@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,8 +46,6 @@ struct SessionBaseline {
 
 struct ActiveSession {
     kind: AgentKind,
-    path: PathBuf,
-    parse_fn: fn(&Path) -> ParsedTokens,
     baseline: SessionBaseline,
 }
 
@@ -561,13 +559,6 @@ fn scan_and_update(
     reset_runtime_baseline(runtime, snapshot, baselines);
 }
 
-fn parser_for_kind(kind: AgentKind) -> fn(&Path) -> ParsedTokens {
-    match kind {
-        AgentKind::ClaudeCode => parse_claude_tokens,
-        AgentKind::Codex => parse_codex_tokens,
-    }
-}
-
 fn active_key(kind: AgentKind, session_id: &str) -> String {
     format!("{}:{session_id}", kind.db_key())
 }
@@ -583,19 +574,20 @@ fn zero_baseline(metadata: FileMetadata) -> SessionBaseline {
     }
 }
 
-fn current_session_baseline(
-    kind: AgentKind,
-    path: &Path,
-    parse_fn: fn(&Path) -> ParsedTokens,
-) -> SessionBaseline {
-    let metadata = file_metadata(path);
-    let tokens = parse_fn(path);
-    let cost = session_cost(kind, &tokens);
+fn current_session_baseline(agent: &AgentInfo) -> SessionBaseline {
+    let metadata = agent
+        .jsonl_path
+        .as_deref()
+        .map(file_metadata)
+        .unwrap_or(FileMetadata {
+            size: 0,
+            modified_ts: 0,
+        });
     SessionBaseline {
-        input_tokens: tokens.input_tokens,
-        output_tokens: tokens.output_tokens,
-        cost_usd: cost,
-        turns: tokens.turn_count,
+        input_tokens: agent.input_tokens,
+        output_tokens: agent.output_tokens,
+        cost_usd: agent.cost_usd,
+        turns: agent.turn_count,
         file_size: metadata.size,
         last_modified_ts: metadata.modified_ts,
     }
@@ -640,15 +632,6 @@ fn record_active_delta(runtime: &mut HistoryRuntime, key: &str, current: Session
     active.baseline = current;
 }
 
-fn finalize_active_session(runtime: &mut HistoryRuntime, key: &str) {
-    let Some(active) = runtime.active_sessions.remove(key) else {
-        return;
-    };
-    let current = current_session_baseline(active.kind, &active.path, active.parse_fn);
-    let delta = session_delta(&baseline_totals(&current), &active.baseline);
-    add_agent_delta(&mut runtime.active_delta, active.kind, &delta);
-}
-
 fn refresh_active_sessions(
     runtime: &mut HistoryRuntime,
     baselines: &HashMap<String, SessionBaseline>,
@@ -660,37 +643,39 @@ fn refresh_active_sessions(
         let Some(session_id) = agent.session_id.as_deref() else {
             continue;
         };
-        let Some(path) = agent.jsonl_path.as_deref() else {
+        let Some(_path) = agent.jsonl_path.as_deref() else {
             continue;
         };
         let key = active_key(agent.kind, session_id);
         seen.insert(key.clone());
-        let parse_fn = parser_for_kind(agent.kind);
-        let metadata = file_metadata(path);
-        if let Some(active) = runtime.active_sessions.get(&key)
-            && file_is_unchanged(&active.baseline, metadata)
-        {
-            continue;
+        let current = current_session_baseline(agent);
+        if let Some(active) = runtime.active_sessions.get(&key) {
+            let unchanged = active.baseline.input_tokens == current.input_tokens
+                && active.baseline.output_tokens == current.output_tokens
+                && active.baseline.turns == current.turns
+                && (active.baseline.cost_usd - current.cost_usd).abs() < f64::EPSILON;
+            if unchanged {
+                continue;
+            }
         }
 
-        let current = current_session_baseline(agent.kind, path, parse_fn);
         if runtime.active_sessions.contains_key(&key) {
             record_active_delta(runtime, &key, current);
             continue;
         }
 
-        let baseline = baselines
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| zero_baseline(metadata));
+        let baseline = baselines.get(&key).cloned().unwrap_or_else(|| {
+            zero_baseline(FileMetadata {
+                size: 0,
+                modified_ts: 0,
+            })
+        });
         let delta = session_delta(&baseline_totals(&current), &baseline);
         add_agent_delta(&mut runtime.active_delta, agent.kind, &delta);
         runtime.active_sessions.insert(
             key,
             ActiveSession {
                 kind: agent.kind,
-                path: path.to_path_buf(),
-                parse_fn,
                 baseline: current,
             },
         );
@@ -703,7 +688,7 @@ fn refresh_active_sessions(
         .cloned()
         .collect();
     for key in stale {
-        finalize_active_session(runtime, &key);
+        runtime.active_sessions.remove(&key);
     }
 }
 
@@ -712,6 +697,7 @@ mod tests {
     use super::*;
     use crate::detect::state::AgentState;
     use std::io::Write;
+    use std::time::UNIX_EPOCH;
 
     fn write_temp_jsonl(name: &str, contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -728,24 +714,28 @@ mod tests {
     }
 
     fn claude_agent(path: &Path) -> AgentInfo {
+        let parsed = parse_claude_tokens(path);
         AgentInfo {
             kind: AgentKind::ClaudeCode,
+            agent_pid: Some(42),
             pane_id: "%1".to_string(),
             cwd: "/tmp".to_string(),
             window_id: "@1".to_string(),
             window_name: "win".to_string(),
             state: AgentState::Working,
             elapsed_secs: 10,
-            input_tokens: 0,
-            output_tokens: 0,
-            last_activity: None,
-            context_pct: None,
-            model: None,
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            last_activity: parsed.last_activity,
+            context_pct: parsed.context_pct,
+            model: parsed.model,
             effort: None,
             cost_usd: 0.0,
-            turn_count: 0,
-            session_id: Some("s1".to_string()),
+            turn_count: parsed.turn_count,
+            session_id: parsed.session_id,
             jsonl_path: Some(path.to_path_buf()),
+            resumed: false,
+            details_ready: true,
         }
     }
 
@@ -832,6 +822,35 @@ mod tests {
         assert_eq!(runtime.active_delta.claude.today.output_tokens, 5);
         assert_eq!(runtime.active_delta.claude.seven_days.input_tokens, 20);
         assert_eq!(runtime.active_delta.claude.total.input_tokens, 20);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn finalizing_active_session_keeps_last_observed_overlay() {
+        let path = write_temp_jsonl(
+            "active-finalize-start",
+            r#"{"sessionId":"s1","message":{"role":"assistant","id":"m1","usage":{"input_tokens":30,"output_tokens":7}}}
+"#,
+        );
+        let mut runtime = HistoryRuntime::default();
+        let baselines = HashMap::new();
+
+        refresh_active_sessions(&mut runtime, &baselines, &[claude_agent(&path)]);
+        assert_eq!(runtime.active_delta.claude.today.input_tokens, 30);
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(
+            br#"{"sessionId":"s1","message":{"role":"assistant","id":"m2","usage":{"input_tokens":45,"output_tokens":9}}}
+"#,
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        refresh_active_sessions(&mut runtime, &baselines, &[]);
+
+        assert_eq!(runtime.active_delta.claude.today.input_tokens, 30);
+        assert_eq!(runtime.active_delta.claude.today.output_tokens, 7);
 
         let _ = fs::remove_file(path);
     }

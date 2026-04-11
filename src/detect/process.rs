@@ -45,6 +45,7 @@ pub struct DetectedAgent {
     pub window_id: String,
     pub window_index: u32,
     pub agent_pid: u32,
+    pub resumed: bool,
     /// Elapsed seconds of the matched agent process
     pub elapsed_secs: u64,
 }
@@ -52,21 +53,24 @@ pub struct DetectedAgent {
 struct ProcessTree {
     children_of: HashMap<u32, Vec<u32>>,
     comm_of: HashMap<u32, String>,
+    args_of: HashMap<u32, String>,
     etime_of: HashMap<u32, u64>,
 }
 
 fn build_process_tree() -> ProcessTree {
     let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut comm_of: HashMap<u32, String> = HashMap::new();
+    let mut args_of: HashMap<u32, String> = HashMap::new();
     let mut etime_of: HashMap<u32, u64> = HashMap::new();
 
     let Ok(output) = Command::new("ps")
-        .args(["-eo", "pid=,ppid=,etime=,comm="])
+        .args(["-eo", "pid=,ppid=,etime=,comm=,args="])
         .output()
     else {
         return ProcessTree {
             children_of,
             comm_of,
+            args_of,
             etime_of,
         };
     };
@@ -76,7 +80,7 @@ fn build_process_tree() -> ProcessTree {
         // Format: "  PID  PPID      ELAPSED COMMAND..."
         // split_whitespace() correctly handles variable-width column spacing
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 4 {
+        if tokens.len() < 5 {
             continue;
         }
         let Some(pid) = tokens[0].parse::<u32>().ok() else {
@@ -86,16 +90,18 @@ fn build_process_tree() -> ProcessTree {
             continue;
         };
         let etime = parse_etime(tokens[2]);
-        // comm may contain spaces (e.g., "Google Chrome Helper"), rejoin remaining tokens
-        let comm = tokens[3..].join(" ").to_lowercase();
+        let comm = tokens[3].to_lowercase();
+        let args = tokens[4..].join(" ").to_lowercase();
         children_of.entry(ppid).or_default().push(pid);
         comm_of.insert(pid, comm);
+        args_of.insert(pid, args);
         etime_of.insert(pid, etime);
     }
 
     ProcessTree {
         children_of,
         comm_of,
+        args_of,
         etime_of,
     }
 }
@@ -148,11 +154,66 @@ fn comm_matches(comm: &str, pattern: &str) -> bool {
     true
 }
 
+pub fn command_looks_like_agent(comm: &str) -> bool {
+    let comm = comm.to_lowercase();
+    ALL_AGENTS.iter().any(|agent| {
+        agent
+            .process_patterns()
+            .iter()
+            .any(|pattern| comm_matches(&comm, pattern))
+    })
+}
+
+pub fn query_process_elapsed(pids: &[u32]) -> HashMap<u32, u64> {
+    let mut etime_of: HashMap<u32, u64> = HashMap::new();
+    if pids.is_empty() {
+        return etime_of;
+    }
+
+    let pid_list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "pid=,etime=", "-p", &pid_list])
+        .output()
+    else {
+        return etime_of;
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let Some(pid) = tokens[0].parse::<u32>().ok() else {
+            continue;
+        };
+        etime_of.insert(pid, parse_etime(tokens[1]));
+    }
+
+    etime_of
+}
+
 /// Walk child processes up to 3 levels deep looking for agent patterns.
 /// Returns the matched child pid if found.
 fn match_process_tree(pid: u32, patterns: &[&str], tree: &ProcessTree, depth: u32) -> Option<u32> {
     if depth > 4 {
         return None;
+    }
+    let matches_pid = tree
+        .comm_of
+        .get(&pid)
+        .is_some_and(|comm| patterns.iter().any(|pat| comm_matches(comm, pat)))
+        || tree
+            .args_of
+            .get(&pid)
+            .is_some_and(|args| patterns.iter().any(|pat| comm_matches(args, pat)));
+    if matches_pid {
+        return Some(pid);
     }
     let children = tree.children_of.get(&pid)?;
     for &child_pid in children {
@@ -160,6 +221,10 @@ fn match_process_tree(pid: u32, patterns: &[&str], tree: &ProcessTree, depth: u3
             .comm_of
             .get(&child_pid)
             .is_some_and(|comm| patterns.iter().any(|pat| comm_matches(comm, pat)))
+            || tree
+                .args_of
+                .get(&child_pid)
+                .is_some_and(|args| patterns.iter().any(|pat| comm_matches(args, pat)))
         {
             return Some(child_pid);
         }
@@ -168,6 +233,16 @@ fn match_process_tree(pid: u32, patterns: &[&str], tree: &ProcessTree, depth: u3
         }
     }
     None
+}
+
+fn process_args_indicate_resume(kind: AgentKind, args: Option<&str>) -> bool {
+    let Some(args) = args else {
+        return false;
+    };
+    match kind {
+        AgentKind::ClaudeCode => args.split_whitespace().any(|part| part == "-r" || part == "--resume"),
+        AgentKind::Codex => args.split_whitespace().any(|part| part == "resume"),
+    }
 }
 
 /// Scan tmux panes for running coding agents.
@@ -191,6 +266,10 @@ pub fn scan_panes_for_agents(panes: &[PaneInfo], sidebar_title: &str) -> Vec<Det
                     window_id: pane.window_id.clone(),
                     window_index: pane.window_index,
                     agent_pid: matched_pid,
+                    resumed: process_args_indicate_resume(
+                        *agent,
+                        tree.args_of.get(&matched_pid).map(String::as_str),
+                    ),
                     elapsed_secs,
                 });
                 break;
@@ -216,6 +295,29 @@ mod tests {
         assert!(comm_matches("codex", "codex"));
         assert!(comm_matches("/usr/local/bin/codex", "codex"));
         assert!(!comm_matches("mycodex", "codex"));
+    }
+
+    #[test]
+    fn test_command_looks_like_agent() {
+        assert!(command_looks_like_agent("codex"));
+        assert!(command_looks_like_agent("/usr/bin/claude"));
+        assert!(!command_looks_like_agent("zsh"));
+    }
+
+    #[test]
+    fn process_tree_matches_root_pid_and_args() {
+        let tree = ProcessTree {
+            children_of: HashMap::from([(10, vec![11])]),
+            comm_of: HashMap::from([(10, "claude".to_string()), (11, "node".to_string())]),
+            args_of: HashMap::from([
+                (10, "claude --dangerously-skip-permissions".to_string()),
+                (11, "node /opt/bin/codex".to_string()),
+            ]),
+            etime_of: HashMap::new(),
+        };
+
+        assert_eq!(match_process_tree(10, &["claude"], &tree, 0), Some(10));
+        assert_eq!(match_process_tree(11, &["codex"], &tree, 0), Some(11));
     }
 
     #[test]

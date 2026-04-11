@@ -34,9 +34,12 @@ pub fn header_rows(expanded: bool) -> u32 {
 
 /// Calculate the row count for a single agent item.
 pub fn item_row_count(agent: &AgentInfo) -> u32 {
-    // Always: top margin (1) + summary (1) + path (1) + state/activity (1) + bottom margin (1)
-    let mut rows = 5u32;
+    // Always: top margin (1) + summary (1) + path (1) + bottom margin (1)
+    let mut rows = 4u32;
     if has_metadata_line(agent) {
+        rows += 1;
+    }
+    if agent.details_ready {
         rows += 1;
     }
     rows
@@ -435,16 +438,18 @@ pub fn render_sidebar(
             );
             row += 1;
 
-            // Line 4: state dot + last activity / fallback text
-            let activity_text = agent.last_activity.as_deref().unwrap_or("");
-            let state_prefix = format!("{state_color}{BOLD}●{RESET}{bg}  ");
-            let state_line = if activity_text.is_empty() {
-                format!("  {state_prefix}{}", state_label(agent.state))
-            } else {
-                format!("  {state_prefix}{DIM}{activity_text}{RESET}")
-            };
-            emit(&mut buf, row, bg, &state_line);
-            row += 1;
+            if agent.details_ready {
+                // Line 4: state dot + last activity / fallback text
+                let activity_text = agent.last_activity.as_deref().unwrap_or("");
+                let state_prefix = format!("{state_color}{BOLD}●{RESET}{bg}  ");
+                let state_line = if activity_text.is_empty() {
+                    format!("  {state_prefix}{}", state_label(agent.state))
+                } else {
+                    format!("  {state_prefix}{DIM}{activity_text}{RESET}")
+                };
+                emit(&mut buf, row, bg, &state_line);
+                row += 1;
+            }
 
             // Bottom margin
             emit(&mut buf, row, bg, "");
@@ -633,6 +638,7 @@ mod tests {
     fn sample_agent() -> AgentInfo {
         AgentInfo {
             kind: AgentKind::Codex,
+            agent_pid: Some(42),
             pane_id: "%1".to_string(),
             cwd: "/tmp/project".to_string(),
             window_id: "@1".to_string(),
@@ -649,6 +655,8 @@ mod tests {
             turn_count: 3,
             session_id: Some("session-1".to_string()),
             jsonl_path: None,
+            resumed: false,
+            details_ready: true,
         }
     }
 
@@ -721,6 +729,18 @@ mod tests {
 
         assert_eq!(item_row_count(&with_metadata), 6);
         assert_eq!(item_row_count(&without_metadata), 5);
+    }
+
+    #[test]
+    fn item_row_count_collapses_state_row_for_provisional_items() {
+        let mut provisional = sample_agent();
+        provisional.details_ready = false;
+        provisional.model = None;
+        provisional.effort = None;
+        provisional.context_pct = None;
+        provisional.turn_count = 0;
+
+        assert_eq!(item_row_count(&provisional), 4);
     }
 
     #[test]
@@ -819,6 +839,37 @@ mod tests {
         );
 
         assert!(strip_ansi(&rendered).contains("●  idle"));
+    }
+
+    #[test]
+    fn render_hides_state_row_for_provisional_items() {
+        let mut agent = sample_agent();
+        agent.details_ready = false;
+        agent.last_activity = None;
+
+        let rendered = render_sidebar(
+            &[agent],
+            100,
+            30,
+            0,
+            0,
+            &HashSet::new(),
+            &AggregatedStats::default(),
+            false,
+            false,
+        );
+        let rows = rendered_rows(&rendered);
+        let dir_row = rows
+            .iter()
+            .find(|(_, line)| line.contains("[main] /tmp/project"))
+            .unwrap()
+            .0;
+
+        assert!(!strip_ansi(&rendered).contains("●  "));
+        assert!(
+            rows.iter()
+                .all(|(row, line)| *row != dir_row + 1 || line.trim().is_empty())
+        );
     }
 
     #[test]

@@ -40,11 +40,13 @@ fn main() {
 fn cmd_toggle() {
     let session = tmux::current_session().expect("not running inside tmux");
     let sidebars = tmux::find_all_sidebar_panes(&session);
+    let current_window = tmux::current_window_id().expect("no current window");
     if sidebars.is_empty() {
         // Create sidebar only in current window, hooks handle the rest lazily
-        let current_window = tmux::current_window_id().expect("no current window");
         create_sidebar_in_window(&current_window);
         install_hooks();
+    } else if tmux::sidebar_pid_in_window(&current_window).is_none() {
+        create_sidebar_in_window(&current_window);
     } else {
         close_all_sidebars(&sidebars);
         uninstall_hooks();
@@ -53,12 +55,14 @@ fn cmd_toggle() {
 
 fn cmd_open() {
     let session = tmux::current_session().expect("not running inside tmux");
-    if !tmux::find_all_sidebar_panes(&session).is_empty() {
+    let current_window = tmux::current_window_id().expect("no current window");
+    if tmux::sidebar_pid_in_window(&current_window).is_some() {
         return;
     }
-    let current_window = tmux::current_window_id().expect("no current window");
     create_sidebar_in_window(&current_window);
-    install_hooks();
+    if tmux::find_all_sidebar_panes(&session).len() == 1 {
+        install_hooks();
+    }
 }
 
 fn cmd_close() {
@@ -78,6 +82,9 @@ fn cmd_ensure() {
     if tmux::sidebar_pid_in_window(&current_window).is_some() {
         return; // sidebar already exists in this window
     }
+    if tmux::is_window_suppressed(&current_window) {
+        return;
+    }
     // Only create if sidebar is "on" (at least one exists in another window)
     let session = tmux::current_session().expect("not running inside tmux");
     if tmux::find_all_sidebar_panes(&session).is_empty() {
@@ -93,6 +100,7 @@ fn close_all_sidebars(sidebars: &[(String, String)]) {
 }
 
 fn create_sidebar_in_window(window_id: &str) {
+    tmux::clear_window_suppressed(window_id);
     let binary = tmux::self_binary();
     let cmd = format!("{} sidebar", binary);
     if let Some(new_pane_id) = tmux::create_sidebar_in(window_id, &cmd) {
