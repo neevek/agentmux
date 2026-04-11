@@ -34,12 +34,9 @@ pub fn header_rows(expanded: bool) -> u32 {
 
 /// Calculate the row count for a single agent item.
 pub fn item_row_count(agent: &AgentInfo) -> u32 {
-    // Always: top margin (1) + info (1) + path (1) + bottom margin (1) = 4
-    let mut rows = 4u32;
-    if agent.model.is_some() {
-        rows += 1;
-    }
-    if agent.last_activity.is_some() {
+    // Always: top margin (1) + summary (1) + path (1) + state/activity (1) + bottom margin (1)
+    let mut rows = 5u32;
+    if has_metadata_line(agent) {
         rows += 1;
     }
     rows
@@ -359,7 +356,6 @@ pub fn render_sidebar(
                 AgentState::Working => GREEN,
                 AgentState::Idle => GRAY,
             };
-
             let elapsed = format_elapsed(agent.elapsed_secs);
             let short_cwd = truncate_path(&agent.cwd, w.saturating_sub(6));
             let win_name = &agent.window_name;
@@ -395,18 +391,42 @@ pub fn render_sidebar(
             emit(&mut buf, row, bg, "");
             row += 1;
 
-            // Line 1: ● name elapsed | ↑in ↓out | $cost | N% left | N msgs
+            // Line 1: name elapsed | ↑in ↓out | $cost
             emit(
                 &mut buf,
                 row,
                 bg,
                 &format!(
-                    "  {state_color}● {RESET}{bg} {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
+                    "  {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
                 ),
             );
             row += 1;
 
-            // Line 2: [window] cwd
+            // Line 2 (optional): model (effort) | N% left | N msgs
+            let mut metadata_parts: Vec<String> = Vec::new();
+            if let Some(model_display) = metadata_model_display(agent) {
+                metadata_parts.push(format!("{SAPPHIRE}{model_display}{RESET}"));
+            }
+            if let Some(pct) = agent.context_pct {
+                let left = 100u8.saturating_sub(pct);
+                let ctx_color = if left <= 20 { YELLOW } else { TEAL };
+                metadata_parts.push(format!("{ctx_color}{left}% left{RESET}"));
+            }
+            if agent.turn_count > 0 {
+                let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
+                metadata_parts.push(format!("{FLAMINGO}{} {msg_label}{RESET}", agent.turn_count));
+            }
+            if !metadata_parts.is_empty() {
+                emit(
+                    &mut buf,
+                    row,
+                    bg,
+                    &format!("  {}", metadata_parts.join(&sep)),
+                );
+                row += 1;
+            }
+
+            // Line 3: [window] cwd
             emit(
                 &mut buf,
                 row,
@@ -415,41 +435,16 @@ pub fn render_sidebar(
             );
             row += 1;
 
-            // Line 3 (optional): model (effort) | N% left | N msgs
-            if let Some(ref model) = agent.model {
-                let model_short = short_model_name(model);
-                let model_display = match &agent.effort {
-                    Some(effort) => format!("{model_short} ({effort})"),
-                    None => model_short,
-                };
-                let left = match agent.context_pct {
-                    Some(pct) => 100u8.saturating_sub(pct),
-                    None => 100,
-                };
-                let ctx_color = if left <= 20 { YELLOW } else { TEAL };
-                let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
-                emit(
-                    &mut buf,
-                    row,
-                    bg,
-                    &format!(
-                        "  {SAPPHIRE}{model_display}{RESET}{bg}{sep}{ctx_color}{left}% left{RESET}{bg}{sep}{FLAMINGO}{} {msg_label}{RESET}",
-                        agent.turn_count,
-                    ),
-                );
-                row += 1;
-            }
-
-            // Line 4 (optional): > last activity
-            if let Some(ref activity) = agent.last_activity {
-                emit(
-                    &mut buf,
-                    row,
-                    bg,
-                    &format!("  {GREEN}{BOLD}>{RESET}{bg} {DIM}{activity}{RESET}"),
-                );
-                row += 1;
-            }
+            // Line 4: state dot + last activity / fallback text
+            let activity_text = agent.last_activity.as_deref().unwrap_or("");
+            let state_prefix = format!("{state_color}{BOLD}●{RESET}{bg}  ");
+            let state_line = if activity_text.is_empty() {
+                format!("  {state_prefix}{}", state_label(agent.state))
+            } else {
+                format!("  {state_prefix}{DIM}{activity_text}{RESET}")
+            };
+            emit(&mut buf, row, bg, &state_line);
+            row += 1;
 
             // Bottom margin
             emit(&mut buf, row, bg, "");
@@ -580,6 +575,25 @@ fn format_cost(cost: f64) -> String {
     }
 }
 
+fn has_metadata_line(agent: &AgentInfo) -> bool {
+    metadata_model_display(agent).is_some() || agent.context_pct.is_some() || agent.turn_count > 0
+}
+
+fn metadata_model_display(agent: &AgentInfo) -> Option<String> {
+    match (&agent.model, &agent.effort) {
+        (Some(model), Some(effort)) => Some(format!("{} ({effort})", short_model_name(model))),
+        (Some(model), None) => Some(short_model_name(model)),
+        (None, Some(_)) | (None, None) => None,
+    }
+}
+
+fn state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "working...",
+        AgentState::Idle => "idle",
+    }
+}
+
 fn truncate_path(path: &str, max_len: usize) -> String {
     use std::sync::OnceLock;
     static HOME: OnceLock<String> = OnceLock::new();
@@ -608,4 +622,225 @@ fn truncate_path(path: &str, max_len: usize) -> String {
 
     let truncated: String = display.chars().take(max_len.saturating_sub(3)).collect();
     format!("{truncated}...")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::history::AggregatedStats;
+    use crate::detect::process::AgentKind;
+
+    fn sample_agent() -> AgentInfo {
+        AgentInfo {
+            kind: AgentKind::Codex,
+            pane_id: "%1".to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: AgentState::Working,
+            elapsed_secs: 61,
+            input_tokens: 1_000,
+            output_tokens: 200,
+            last_activity: Some("exec_command cargo test".to_string()),
+            context_pct: Some(25),
+            model: Some("gpt-5.4".to_string()),
+            effort: Some("medium".to_string()),
+            cost_usd: 1.25,
+            turn_count: 3,
+            session_id: Some("session-1".to_string()),
+            jsonl_path: None,
+        }
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if matches!(chars.peek(), Some('[')) {
+                    let _ = chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    fn rendered_rows(rendered: &str) -> Vec<(u32, String)> {
+        let mut rows = Vec::new();
+        let mut cursor = 0usize;
+
+        while let Some((row, content_start, marker_start)) = next_row_marker(rendered, cursor) {
+            let next_cursor = next_row_marker(rendered, content_start)
+                .map(|(_, _, start)| start)
+                .unwrap_or(rendered.len());
+            rows.push((
+                row,
+                strip_ansi(&rendered[content_start..next_cursor]).replace('\u{0}', ""),
+            ));
+            cursor = next_cursor.max(marker_start + 1);
+        }
+
+        rows
+    }
+
+    fn next_row_marker(text: &str, from: usize) -> Option<(u32, usize, usize)> {
+        let bytes = text.as_bytes();
+        let mut i = from;
+        while i + 3 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+                let digit_start = i + 2;
+                let mut j = digit_start;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > digit_start && bytes.get(j..j + 3) == Some(b";1H") {
+                    let row = text[digit_start..j].parse::<u32>().ok()?;
+                    return Some((row, j + 3, i));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    #[test]
+    fn item_row_count_reserves_state_line_and_optional_metadata_line() {
+        let with_metadata = sample_agent();
+        let mut without_metadata = sample_agent();
+        without_metadata.model = None;
+        without_metadata.effort = None;
+        without_metadata.context_pct = None;
+        without_metadata.turn_count = 0;
+
+        assert_eq!(item_row_count(&with_metadata), 6);
+        assert_eq!(item_row_count(&without_metadata), 5);
+    }
+
+    #[test]
+    fn render_orders_metadata_before_dir_and_prefixes_state_line() {
+        let rendered = render_sidebar(
+            &[sample_agent()],
+            100,
+            30,
+            0,
+            0,
+            &HashSet::new(),
+            &AggregatedStats::default(),
+            false,
+            false,
+        );
+        let rows = rendered_rows(&rendered);
+        let model_row = rows
+            .iter()
+            .find(|(_, line)| line.contains("gpt-5.4 (medium)"))
+            .unwrap()
+            .0;
+        let dir_row = rows
+            .iter()
+            .find(|(_, line)| line.contains("[main] /tmp/project"))
+            .unwrap()
+            .0;
+        let state_row = rows
+            .iter()
+            .find(|(_, line)| line.contains("●  exec_command cargo test"))
+            .unwrap()
+            .0;
+
+        assert!(model_row < dir_row);
+        assert!(dir_row < state_row);
+        assert!(!rows.iter().any(
+            |(_, line)| line.contains("working") || line.contains("> exec_command cargo test")
+        ));
+    }
+
+    #[test]
+    fn render_collapses_metadata_row_and_uses_working_fallback_when_empty() {
+        let mut agent = sample_agent();
+        agent.model = None;
+        agent.effort = None;
+        agent.context_pct = None;
+        agent.turn_count = 0;
+        agent.last_activity = None;
+
+        let rendered = render_sidebar(
+            &[agent],
+            100,
+            30,
+            0,
+            0,
+            &HashSet::new(),
+            &AggregatedStats::default(),
+            false,
+            false,
+        );
+        let rows = rendered_rows(&rendered);
+        let dir_row = rows
+            .iter()
+            .find(|(_, line)| line.contains("[main] /tmp/project"))
+            .unwrap()
+            .0;
+        let state_row = rows
+            .iter()
+            .find(|(_, line)| line.contains("●  working..."))
+            .unwrap()
+            .0;
+
+        assert_eq!(dir_row + 1, state_row);
+        assert!(
+            !rows
+                .iter()
+                .any(|(_, line)| line.contains("gpt-5.4") || line.contains("% left"))
+        );
+    }
+
+    #[test]
+    fn render_uses_idle_fallback_when_last_message_is_empty() {
+        let mut agent = sample_agent();
+        agent.state = AgentState::Idle;
+        agent.last_activity = None;
+
+        let rendered = render_sidebar(
+            &[agent],
+            100,
+            30,
+            0,
+            0,
+            &HashSet::new(),
+            &AggregatedStats::default(),
+            false,
+            false,
+        );
+
+        assert!(strip_ansi(&rendered).contains("●  idle"));
+    }
+
+    #[test]
+    fn render_does_not_show_effort_only_metadata_row() {
+        let mut agent = sample_agent();
+        agent.model = None;
+        agent.effort = Some("medium".to_string());
+        agent.context_pct = None;
+        agent.turn_count = 0;
+
+        let rendered = render_sidebar(
+            &[agent],
+            100,
+            30,
+            0,
+            0,
+            &HashSet::new(),
+            &AggregatedStats::default(),
+            false,
+            false,
+        );
+
+        assert!(!strip_ansi(&rendered).contains("effort: medium"));
+    }
 }
