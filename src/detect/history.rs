@@ -18,7 +18,7 @@ const OWNER_HEARTBEAT_STALE_SECS: u64 = DELTA_INTERVAL_SECS * 3;
 
 // --- Public data structures ---
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -26,14 +26,14 @@ pub struct AgentTotals {
     pub turns: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentPeriodStats {
     pub today: AgentTotals,
     pub seven_days: AgentTotals,
     pub total: AgentTotals,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AggregatedStats {
     pub claude: AgentPeriodStats,
     pub codex: AgentPeriodStats,
@@ -56,6 +56,12 @@ struct ActiveSession {
     path: PathBuf,
     parse_fn: fn(&Path) -> ParsedTokens,
     baseline: SessionBaseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullScanReason {
+    Startup,
+    DailyRollover,
 }
 
 #[derive(Default)]
@@ -120,6 +126,10 @@ fn write_runtime_state(db: &sqlite::Connection, key: &str, value: &str) {
     let _ = stmt.next();
 }
 
+fn mark_full_refresh(db: &sqlite::Connection) {
+    write_runtime_state(db, "last_full_refresh_marker", &full_refresh_marker_value());
+}
+
 fn ensure_runtime_state_table(db: &sqlite::Connection) {
     let _ = db.execute(
         "CREATE TABLE IF NOT EXISTS runtime_state (
@@ -169,12 +179,24 @@ fn daily_refresh_date(db: &sqlite::Connection) -> Option<String> {
 
 fn set_daily_refresh_date(db: &sqlite::Connection, date: &str) {
     write_runtime_state(db, "last_daily_refresh_date", date);
-    write_runtime_state(db, "last_full_refresh_marker", &full_refresh_marker_value());
+    mark_full_refresh(db);
 }
 
 fn full_refresh_marker(db: &sqlite::Connection) -> Option<String> {
     ensure_runtime_state_table(db);
     read_runtime_state(db, "last_full_refresh_marker")
+}
+
+fn merge_pending_full_scan(
+    pending: Option<FullScanReason>,
+    today: &str,
+    last_daily_refresh: Option<&str>,
+) -> Option<FullScanReason> {
+    match pending {
+        Some(reason) => Some(reason),
+        None if last_daily_refresh != Some(today) => Some(FullScanReason::DailyRollover),
+        None => None,
+    }
 }
 
 // --- Date helpers ---
@@ -519,7 +541,7 @@ fn process_file(
     parse_fn: fn(&Path) -> ParsedTokens,
     baselines: &mut HashMap<String, SessionBaseline>,
     today: &str,
-) {
+) -> bool {
     let agent_type = kind.db_key();
     let metadata = file_metadata(path);
     let key = format!("{agent_type}:{session_id}");
@@ -529,7 +551,7 @@ fn process_file(
         .get(&key)
         .is_some_and(|bl| file_is_unchanged(bl, metadata))
     {
-        return;
+        return false;
     }
 
     let tokens = parse_fn(path);
@@ -559,18 +581,20 @@ fn process_file(
             last_modified_ts: metadata.modified_ts,
         },
     );
+    true
 }
 
 fn scan_and_update(
     db: &sqlite::Connection,
     shared: &Arc<Mutex<HistoryRuntime>>,
     baselines: &mut HashMap<String, SessionBaseline>,
-) {
+) -> bool {
     let today = local_date_today();
+    let mut changed = false;
 
     for path in discover_claude_jsonl_files() {
         if let Some(sid) = extract_claude_session_id(&path) {
-            process_file(
+            changed |= process_file(
                 db,
                 AgentKind::ClaudeCode,
                 &sid,
@@ -583,7 +607,7 @@ fn scan_and_update(
     }
     for path in discover_codex_jsonl_files() {
         if let Some(sid) = extract_codex_session_id(&path) {
-            process_file(
+            changed |= process_file(
                 db,
                 AgentKind::Codex,
                 &sid,
@@ -598,6 +622,7 @@ fn scan_and_update(
     // Recompute snapshot from daily_totals
     let snapshot = compute_snapshot(db);
     reset_runtime_baseline(&mut shared.lock().unwrap(), snapshot, baselines.clone());
+    changed
 }
 
 fn parser_for_kind(kind: AgentKind) -> fn(&Path) -> ParsedTokens {
@@ -746,10 +771,16 @@ fn refresh_active_sessions(runtime: &mut HistoryRuntime, agents: &[AgentInfo]) {
 fn background_worker(shared: Arc<Mutex<HistoryRuntime>>) {
     let Some(db) = open_db() else { return };
 
-    let initialized = is_initialized();
+    let mut initialized = is_initialized();
     let mut baselines = load_baselines(&db);
     let mut is_owner = try_claim_owner(&db);
+    let mut was_owner = is_owner;
     let mut known_refresh_marker = full_refresh_marker(&db);
+    let mut pending_full_scan = if is_owner {
+        Some(FullScanReason::Startup)
+    } else {
+        None
+    };
 
     if is_owner && !initialized {
         // Reinitializing: clear stale data so sessions are re-attributed
@@ -759,45 +790,58 @@ fn background_worker(shared: Arc<Mutex<HistoryRuntime>>) {
         baselines = HashMap::new();
     }
 
-    // Scan all files: initialization inserts + computes snapshot,
-    // or subsequent run catches up with changes since last shutdown.
-    if is_owner {
-        scan_and_update(&db, &shared, &mut baselines);
-        set_daily_refresh_date(&db, &local_date_today());
-        known_refresh_marker = full_refresh_marker(&db);
-    } else {
-        let snapshot = compute_snapshot(&db);
-        reset_runtime_baseline(&mut shared.lock().unwrap(), snapshot, baselines.clone());
-    }
-
-    if is_owner && !initialized {
-        set_initialized();
-    }
+    // Load existing snapshot immediately so sidebar startup is non-blocking.
+    let snapshot = compute_snapshot(&db);
+    reset_runtime_baseline(&mut shared.lock().unwrap(), snapshot, baselines.clone());
 
     // Periodic ownership, daily refresh, and baseline synchronization.
     loop {
-        thread::sleep(Duration::from_secs(DELTA_INTERVAL_SECS));
         is_owner = try_claim_owner(&db);
 
         if is_owner {
             heartbeat_owner(&db);
+            if !was_owner && pending_full_scan.is_none() {
+                pending_full_scan = Some(FullScanReason::Startup);
+            }
+
             let today = local_date_today();
-            if daily_refresh_date(&db).as_deref() != Some(today.as_str()) {
-                baselines = load_baselines(&db);
+            pending_full_scan = merge_pending_full_scan(
+                pending_full_scan,
+                &today,
+                daily_refresh_date(&db).as_deref(),
+            );
+
+            if let Some(reason) = pending_full_scan {
+                if reason == FullScanReason::Startup && !initialized {
+                    // Reinitializing: clear stale data so sessions are
+                    // re-attributed to correct dates via file mtime.
+                    let _ = db.execute("DELETE FROM daily_totals");
+                    let _ = db.execute("DELETE FROM sessions");
+                    baselines = HashMap::new();
+                }
+
                 scan_and_update(&db, &shared, &mut baselines);
                 set_daily_refresh_date(&db, &today);
                 known_refresh_marker = full_refresh_marker(&db);
-                continue;
+                pending_full_scan = None;
+                if !initialized {
+                    set_initialized();
+                    initialized = true;
+                }
+            }
+        } else {
+            pending_full_scan = None;
+            let refresh_marker = full_refresh_marker(&db);
+            if refresh_marker != known_refresh_marker {
+                let snapshot = compute_snapshot(&db);
+                baselines = load_baselines(&db);
+                reset_runtime_baseline(&mut shared.lock().unwrap(), snapshot, baselines.clone());
+                known_refresh_marker = refresh_marker;
             }
         }
 
-        let refresh_marker = full_refresh_marker(&db);
-        if refresh_marker != known_refresh_marker {
-            let snapshot = compute_snapshot(&db);
-            baselines = load_baselines(&db);
-            reset_runtime_baseline(&mut shared.lock().unwrap(), snapshot, baselines.clone());
-            known_refresh_marker = refresh_marker;
-        }
+        was_owner = is_owner;
+        thread::sleep(Duration::from_secs(DELTA_INTERVAL_SECS));
     }
 }
 
@@ -944,6 +988,28 @@ mod tests {
         assert_eq!(delta.output_tokens, 0);
         assert_eq!(delta.cost_usd, 0.0);
         assert_eq!(delta.turns, 2);
+    }
+
+    #[test]
+    fn merge_pending_full_scan_preserves_existing_reason() {
+        let pending = merge_pending_full_scan(
+            Some(FullScanReason::Startup),
+            "2026-04-10",
+            Some("2026-04-09"),
+        );
+        assert_eq!(pending, Some(FullScanReason::Startup));
+    }
+
+    #[test]
+    fn merge_pending_full_scan_schedules_daily_rollover_when_date_stale() {
+        let pending = merge_pending_full_scan(None, "2026-04-10", Some("2026-04-09"));
+        assert_eq!(pending, Some(FullScanReason::DailyRollover));
+    }
+
+    #[test]
+    fn merge_pending_full_scan_leaves_none_when_date_matches() {
+        let pending = merge_pending_full_scan(None, "2026-04-10", Some("2026-04-10"));
+        assert_eq!(pending, None);
     }
 
     #[test]

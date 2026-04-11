@@ -1,9 +1,11 @@
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use super::process::{AgentKind, DetectedAgent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -50,12 +52,27 @@ impl Default for SessionDetails {
 
 pub struct SessionCache {
     entries: HashMap<PathBuf, CachedData>,
+    bindings: HashMap<AgentBindingKey, SessionBinding>,
+    path_owners: HashMap<PathBuf, AgentBindingKey>,
 }
 
 #[derive(Clone)]
 struct CachedData {
     metadata: FileMetadata,
     tokens: ParsedTokens,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentBindingKey {
+    kind: AgentKind,
+    pane_id: String,
+}
+
+#[derive(Clone)]
+struct SessionBinding {
+    jsonl_path: PathBuf,
+    session_id: Option<String>,
+    last_agent_pid: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +99,23 @@ impl SessionCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            bindings: HashMap::new(),
+            path_owners: HashMap::new(),
         }
+    }
+
+    pub fn retain_live_agents(&mut self, live_agents: &[DetectedAgent]) {
+        let live_keys: HashSet<AgentBindingKey> =
+            live_agents.iter().map(AgentBindingKey::from).collect();
+        self.bindings.retain(|key, binding| {
+            let keep = live_keys.contains(key);
+            if !keep {
+                self.path_owners.remove(&binding.jsonl_path);
+            }
+            keep
+        });
+        self.path_owners
+            .retain(|_, owner| live_keys.contains(owner));
     }
 
     fn get_or_update_with_metadata(
@@ -109,52 +142,206 @@ impl SessionCache {
 
         &self.entries[path].tokens
     }
+
+    fn claimed_paths_for_agent(&self, agent: &DetectedAgent) -> Vec<PathBuf> {
+        let key = AgentBindingKey::from(agent);
+        self.path_owners
+            .iter()
+            .filter(|(_, owner)| **owner != key)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    fn bound_path_for_agent(
+        &mut self,
+        agent: &DetectedAgent,
+        extract_session_id: fn(&Path) -> Option<String>,
+    ) -> Option<PathBuf> {
+        let key = AgentBindingKey::from(agent);
+        let binding = self.bindings.get(&key)?.clone();
+
+        if !binding.jsonl_path.is_file() {
+            self.unbind_agent(agent);
+            return None;
+        }
+        if self.path_owners.get(&binding.jsonl_path) != Some(&key) {
+            self.unbind_agent(agent);
+            return None;
+        }
+
+        let current_session_id = extract_session_id(&binding.jsonl_path);
+        if binding.session_id.is_some() && current_session_id != binding.session_id {
+            self.unbind_agent(agent);
+            return None;
+        }
+
+        if binding.last_agent_pid != agent.agent_pid
+            && let Some(existing) = self.bindings.get_mut(&key)
+        {
+            existing.last_agent_pid = agent.agent_pid;
+        }
+
+        Some(binding.jsonl_path)
+    }
+
+    fn bind_agent_path(
+        &mut self,
+        agent: &DetectedAgent,
+        jsonl_path: PathBuf,
+        session_id: Option<String>,
+    ) {
+        let key = AgentBindingKey::from(agent);
+        if let Some(owner) = self.path_owners.get(&jsonl_path) {
+            if owner != &key {
+                return;
+            }
+        }
+
+        if let Some(existing) = self.bindings.get(&key) {
+            if existing.jsonl_path != jsonl_path {
+                self.path_owners.remove(&existing.jsonl_path);
+            }
+        }
+
+        self.path_owners.insert(jsonl_path.clone(), key.clone());
+        self.bindings.insert(
+            key,
+            SessionBinding {
+                jsonl_path,
+                session_id,
+                last_agent_pid: agent.agent_pid,
+            },
+        );
+    }
+
+    fn unbind_agent(&mut self, agent: &DetectedAgent) {
+        let key = AgentBindingKey::from(agent);
+        if let Some(binding) = self.bindings.remove(&key) {
+            self.path_owners.remove(&binding.jsonl_path);
+        }
+    }
+}
+
+impl From<&DetectedAgent> for AgentBindingKey {
+    fn from(agent: &DetectedAgent) -> Self {
+        Self {
+            kind: agent.kind,
+            pane_id: agent.pane_id.clone(),
+        }
+    }
 }
 
 const ACTIVE_WRITE_THRESHOLD: Duration = Duration::from_secs(3);
 const TAIL_BYTES: u64 = 32768;
+/// Ambiguous in-turn events (plain user prompt, exec_command_end) should stay
+/// working for a long time, but eventually settle to idle for stalled/crashed
+/// sessions that never emit a completion marker.
+const INFERRED_WORKING_STALE_SECS: u64 = 24 * 60 * 60;
+/// Maximum acceptable difference (seconds) between a JSONL session's start age
+/// and the agent process age for the file to be considered a match.  Prevents
+/// a freshly-started process from claiming a session that began hours earlier.
+const MAX_CLAUDE_AGE_MISMATCH_SECS: u64 = 300;
 
 // --- Public API ---
 
-pub fn claude_code_details(
-    cwd: &str,
-    agent_age_secs: u64,
-    cache: &mut SessionCache,
-) -> SessionDetails {
+pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> SessionDetails {
     let Some(home) = dirs::home_dir() else {
         return SessionDetails::default();
     };
-    let encoded = encode_project_dir(cwd);
+    let encoded = encode_project_dir(&agent.cwd);
     let projects_dir = home.join(".claude").join("projects").join(&encoded);
-    let jsonl_path = find_most_recent_jsonl(&projects_dir);
-    agent_details(
+    let jsonl_path = cache
+        .bound_path_for_agent(agent, extract_claude_session_id)
+        .or_else(|| {
+            let claimed_paths = cache.claimed_paths_for_agent(agent);
+            find_claude_jsonl_for_cwd(&projects_dir, agent.elapsed_secs, &claimed_paths)
+        });
+    let details = agent_details(
         jsonl_path.as_deref(),
-        agent_age_secs,
+        agent.elapsed_secs,
         cache,
         detect_claude_state,
         parse_claude_tokens,
-    )
+    );
+    update_binding(cache, agent, &details);
+    details
 }
 
-pub fn codex_details(cwd: &str, agent_age_secs: u64, cache: &mut SessionCache) -> SessionDetails {
+pub fn codex_details(agent: &DetectedAgent, cache: &mut SessionCache) -> SessionDetails {
     let sessions_dir = codex_sessions_dir();
-    let jsonl_path = sessions_dir
-        .as_ref()
-        .and_then(|d| find_codex_jsonl_for_cwd(d, cwd));
-    agent_details(
+    let jsonl_path = cache
+        .bound_path_for_agent(agent, extract_codex_session_id)
+        .or_else(|| {
+            let claimed_paths = cache.claimed_paths_for_agent(agent);
+            sessions_dir.as_ref().and_then(|d| {
+                find_codex_jsonl_for_cwd(d, &agent.cwd, agent.elapsed_secs, &claimed_paths)
+            })
+        });
+    let details = agent_details(
         jsonl_path.as_deref(),
-        agent_age_secs,
+        agent.elapsed_secs,
         cache,
         detect_codex_state,
         parse_codex_tokens,
-    )
+    );
+    update_binding(cache, agent, &details);
+    details
+}
+
+pub(crate) fn binding_priority(agent: &DetectedAgent) -> u64 {
+    match agent.kind {
+        AgentKind::ClaudeCode => claude_binding_priority(agent),
+        AgentKind::Codex => codex_binding_priority(agent),
+    }
+}
+
+fn claude_binding_priority(agent: &DetectedAgent) -> u64 {
+    let Some(home) = dirs::home_dir() else {
+        return u64::MAX;
+    };
+    let encoded = encode_project_dir(&agent.cwd);
+    let projects_dir = home.join(".claude").join("projects").join(&encoded);
+    let now = unix_now_secs();
+    fs::read_dir(projects_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|path| claude_match_score(&path, agent.elapsed_secs, now))
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+fn codex_binding_priority(agent: &DetectedAgent) -> u64 {
+    let Some(sessions_dir) = codex_sessions_dir() else {
+        return u64::MAX;
+    };
+    let mut files = Vec::new();
+    walk_jsonl(&sessions_dir, &mut files);
+    let now = unix_now_secs();
+    files
+        .into_iter()
+        .filter_map(|path| codex_match_score(&path, &agent.cwd, agent.elapsed_secs, now))
+        .map(|score| score.age_mismatch_secs)
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+fn update_binding(cache: &mut SessionCache, agent: &DetectedAgent, details: &SessionDetails) {
+    if let Some(path) = &details.jsonl_path {
+        cache.bind_agent_path(agent, path.clone(), details.session_id.clone());
+    } else {
+        cache.unbind_agent(agent);
+    }
 }
 
 fn agent_details(
     jsonl_path: Option<&Path>,
     agent_age_secs: u64,
     cache: &mut SessionCache,
-    detect_state: fn(&Path) -> AgentState,
+    detect_state: fn(&Path, u64) -> AgentState,
     parse_tokens: fn(&Path) -> ParsedTokens,
 ) -> SessionDetails {
     let Some(path) = jsonl_path else {
@@ -175,7 +362,7 @@ fn agent_details(
     let state = if file_age < ACTIVE_WRITE_THRESHOLD.as_secs() {
         AgentState::Working
     } else {
-        detect_state(path)
+        detect_state(path, file_age)
     };
 
     let metadata = FileMetadata {
@@ -225,6 +412,13 @@ fn json_str<'a>(val: &'a Value, path: &[&str]) -> Option<&'a str> {
     current.as_str()
 }
 
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub(crate) fn file_metadata(path: &Path) -> FileMetadata {
     let Ok(metadata) = fs::metadata(path) else {
         return FileMetadata {
@@ -265,16 +459,96 @@ pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
     if p.is_dir() { Some(p) } else { None }
 }
 
-fn find_most_recent_jsonl(dir: &Path) -> Option<PathBuf> {
-    if !dir.is_dir() {
+fn find_claude_jsonl_for_cwd(
+    projects_dir: &Path,
+    agent_age_secs: u64,
+    used_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    find_claude_jsonl_for_cwd_at(projects_dir, agent_age_secs, used_paths, unix_now_secs())
+}
+
+fn find_claude_jsonl_for_cwd_at(
+    projects_dir: &Path,
+    agent_age_secs: u64,
+    used_paths: &[PathBuf],
+    now_secs: u64,
+) -> Option<PathBuf> {
+    if !projects_dir.is_dir() {
         return None;
     }
-    fs::read_dir(dir)
+    let all_files: Vec<PathBuf> = fs::read_dir(projects_dir)
         .ok()?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
         .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    if all_files.is_empty() {
+        return None;
+    }
+
+    let available_files: Vec<PathBuf> = all_files
+        .into_iter()
+        .filter(|path| !used_paths.iter().any(|used| used == path))
+        .collect();
+    if available_files.is_empty() {
+        return None;
+    }
+
+    let scored: Vec<(u64, PathBuf)> = available_files
+        .iter()
+        .filter_map(|path| {
+            claude_match_score(path, agent_age_secs, now_secs).map(|s| (s, path.clone()))
+        })
+        .collect();
+    if scored.is_empty() {
+        return most_recent_jsonl(&available_files);
+    }
+
+    scored
+        .into_iter()
+        .min_by_key(|(score, path)| {
+            let mtime = fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (*score, std::cmp::Reverse(mtime))
+        })
+        .filter(|(score, _)| *score <= MAX_CLAUDE_AGE_MISMATCH_SECS)
+        .map(|(_, path)| path)
+}
+
+/// Score a Claude JSONL by how closely its session start time matches the agent
+/// process age.  Lower is better; `None` means no usable timestamp was found.
+fn claude_match_score(path: &Path, agent_age_secs: u64, now_secs: u64) -> Option<u64> {
+    let start_secs = claude_session_start_secs(path)?;
+    let start_age = now_secs.checked_sub(start_secs)?;
+    Some(start_age.abs_diff(agent_age_secs))
+}
+
+/// Extract the session start time (epoch seconds) from the first timestamped
+/// entry in a Claude Code JSONL file.
+fn claude_session_start_secs(path: &Path) -> Option<u64> {
+    let file = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in std::io::BufRead::lines(reader)
+        .take(10)
+        .map_while(Result::ok)
+    {
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(ts) = json_str(&entry, &["timestamp"]) {
+            if let Some(secs) = parse_rfc3339_utc_secs(ts) {
+                return Some(secs);
+            }
+        }
+    }
+    // Fallback: file creation time
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.created().ok())
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
 /// Recursively collect all .jsonl files under a directory.
@@ -292,7 +566,28 @@ pub(crate) fn walk_jsonl(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn find_codex_jsonl_for_cwd(sessions_dir: &Path, cwd: &str) -> Option<PathBuf> {
+fn find_codex_jsonl_for_cwd(
+    sessions_dir: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    used_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    find_codex_jsonl_for_cwd_at(
+        sessions_dir,
+        cwd,
+        agent_age_secs,
+        used_paths,
+        unix_now_secs(),
+    )
+}
+
+fn find_codex_jsonl_for_cwd_at(
+    sessions_dir: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    used_paths: &[PathBuf],
+    now_secs: u64,
+) -> Option<PathBuf> {
     if !sessions_dir.is_dir() {
         return None;
     }
@@ -301,23 +596,46 @@ fn find_codex_jsonl_for_cwd(sessions_dir: &Path, cwd: &str) -> Option<PathBuf> {
     if all_files.is_empty() {
         return None;
     }
-    all_files.sort_by(|a, b| {
-        let mtime = |p: &Path| {
-            fs::metadata(p)
+
+    let available_files: Vec<PathBuf> = all_files
+        .into_iter()
+        .filter(|path| !used_paths.iter().any(|used| used == path))
+        .collect();
+    if available_files.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<(CodexMatchScore, PathBuf)> = Vec::new();
+    let mut unscorable: Vec<PathBuf> = Vec::new();
+    for path in available_files {
+        match codex_candidate(&path, cwd, agent_age_secs, now_secs) {
+            CodexCandidate::Scored(score) => candidates.push((score, path)),
+            CodexCandidate::Unscorable => unscorable.push(path),
+            CodexCandidate::CwdMismatch => {}
+        }
+    }
+
+    if candidates.is_empty() {
+        return most_recent_jsonl(&unscorable);
+    }
+
+    candidates.sort_by(compare_codex_candidates);
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
+fn most_recent_jsonl(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths
+        .iter()
+        .max_by_key(|path| {
+            fs::metadata(path)
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(SystemTime::UNIX_EPOCH)
-        };
-        mtime(b).cmp(&mtime(a))
-    });
-
-    for path in &all_files {
-        if read_codex_session_cwd(path).is_some_and(|s| s == cwd) {
-            return Some(path.clone());
-        }
-    }
-    Some(all_files.into_iter().next()?)
+        })
+        .cloned()
 }
+
+const CODEX_TOKEN_BIAS_SECS: u64 = 30;
 
 /// Parse the first line of a Codex JSONL file if it is a `session_meta` entry.
 fn parse_codex_session_meta(path: &Path) -> Option<Value> {
@@ -329,9 +647,180 @@ fn parse_codex_session_meta(path: &Path) -> Option<Value> {
     (json_str(&entry, &["type"]) == Some("session_meta")).then_some(entry)
 }
 
-fn read_codex_session_cwd(path: &Path) -> Option<String> {
-    let meta = parse_codex_session_meta(path)?;
-    json_str(&meta, &["payload", "cwd"]).map(|s| s.to_string())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexMatchScore {
+    age_mismatch_secs: u64,
+    has_token_count: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexCandidate {
+    Scored(CodexMatchScore),
+    Unscorable,
+    CwdMismatch,
+}
+
+fn compare_codex_candidates(
+    (lhs_score, lhs_path): &(CodexMatchScore, PathBuf),
+    (rhs_score, rhs_path): &(CodexMatchScore, PathBuf),
+) -> std::cmp::Ordering {
+    let within_bias_window = lhs_score
+        .age_mismatch_secs
+        .abs_diff(rhs_score.age_mismatch_secs)
+        <= CODEX_TOKEN_BIAS_SECS;
+    if within_bias_window && lhs_score.has_token_count != rhs_score.has_token_count {
+        return rhs_score.has_token_count.cmp(&lhs_score.has_token_count);
+    }
+
+    lhs_score
+        .age_mismatch_secs
+        .cmp(&rhs_score.age_mismatch_secs)
+        .then_with(|| rhs_score.has_token_count.cmp(&lhs_score.has_token_count))
+        .then_with(|| {
+            let lhs_mtime = fs::metadata(lhs_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let rhs_mtime = fs::metadata(rhs_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            rhs_mtime.cmp(&lhs_mtime)
+        })
+}
+
+fn codex_match_score(
+    path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+) -> Option<CodexMatchScore> {
+    match codex_candidate(path, cwd, agent_age_secs, now_secs) {
+        CodexCandidate::Scored(score) => Some(score),
+        CodexCandidate::Unscorable | CodexCandidate::CwdMismatch => None,
+    }
+}
+
+fn codex_candidate(path: &Path, cwd: &str, agent_age_secs: u64, now_secs: u64) -> CodexCandidate {
+    let Some(meta) = parse_codex_session_meta(path) else {
+        return CodexCandidate::Unscorable;
+    };
+    let Some(session_cwd) = json_str(&meta, &["payload", "cwd"]) else {
+        return CodexCandidate::Unscorable;
+    };
+    if !codex_cwds_match(cwd, session_cwd) {
+        return CodexCandidate::CwdMismatch;
+    }
+
+    let start_age = json_str(&meta, &["payload", "timestamp"])
+        .and_then(parse_rfc3339_utc_secs)
+        .and_then(|started| now_secs.checked_sub(started));
+    let Some(age_mismatch_secs) = start_age
+        .map(|age| age.abs_diff(agent_age_secs))
+        .or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| now_secs.saturating_sub(d.as_secs()).abs_diff(agent_age_secs))
+        })
+    else {
+        return CodexCandidate::Unscorable;
+    };
+
+    CodexCandidate::Scored(CodexMatchScore {
+        age_mismatch_secs,
+        has_token_count: codex_has_token_count(path),
+    })
+}
+
+fn codex_cwds_match(lhs: &str, rhs: &str) -> bool {
+    lhs == rhs
+        || canonicalize_if_exists(lhs)
+            .zip(canonicalize_if_exists(rhs))
+            .is_some_and(|(a, b)| a == b)
+        || normalized_path_equals(lhs, rhs)
+}
+
+fn canonicalize_if_exists(path: &str) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
+}
+
+fn normalized_path_equals(lhs: &str, rhs: &str) -> bool {
+    normalize_path(lhs) == normalize_path(rhs)
+}
+
+fn normalize_path(path: &str) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        normalized.push(component.as_os_str());
+    }
+    normalized
+}
+
+fn codex_has_token_count(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+        if !line.contains("\"token_count\"") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if json_str(&entry, &["type"]) == Some("event_msg")
+            && json_str(&entry, &["payload", "type"]) == Some("token_count")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_rfc3339_utc_secs(s: &str) -> Option<u64> {
+    if s.len() < 20
+        || &s[4..5] != "-"
+        || &s[7..8] != "-"
+        || &s[10..11] != "T"
+        || &s[13..14] != ":"
+        || &s[16..17] != ":"
+    {
+        return None;
+    }
+    let year = s[0..4].parse::<i32>().ok()?;
+    let month = s[5..7].parse::<u32>().ok()?;
+    let day = s[8..10].parse::<u32>().ok()?;
+    let hour = s[11..13].parse::<u32>().ok()?;
+    let minute = s[14..16].parse::<u32>().ok()?;
+    let second = s[17..19].parse::<u32>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+        || !s[19..].ends_with('Z')
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour as i64 * 3_600 + minute as i64 * 60 + second as i64)?;
+    u64::try_from(secs).ok()
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - (month <= 2) as i32;
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) as i64
 }
 
 fn read_jsonl(path: &Path, tail_bytes: Option<u64>) -> Vec<Value> {
@@ -353,7 +842,7 @@ fn read_jsonl(path: &Path, tail_bytes: Option<u64>) -> Vec<Value> {
 
 // --- State detection (fast tail read) ---
 
-fn detect_claude_state(path: &Path) -> AgentState {
+fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
     for entry in read_jsonl(path, Some(TAIL_BYTES)).iter().rev() {
         let Some(msg) = entry.get("message") else {
             continue;
@@ -403,7 +892,14 @@ fn detect_claude_state(path: &Path) -> AgentState {
                 {
                     return AgentState::Working;
                 }
-                return AgentState::Working;
+                // A plain user message usually means an in-flight turn. If it
+                // remains unchanged for an extremely long time, consider it
+                // stale instead of perpetually working.
+                return if file_age_secs < INFERRED_WORKING_STALE_SECS {
+                    AgentState::Working
+                } else {
+                    AgentState::Idle
+                };
             }
             _ => continue,
         }
@@ -411,13 +907,24 @@ fn detect_claude_state(path: &Path) -> AgentState {
     AgentState::Idle
 }
 
-fn detect_codex_state(path: &Path) -> AgentState {
+fn detect_codex_state(path: &Path, file_age_secs: u64) -> AgentState {
     for entry in read_jsonl(path, Some(TAIL_BYTES)).iter().rev() {
         match json_str(entry, &["type"]) {
             Some("event_msg") => {
                 if let Some(pt) = json_str(entry, &["payload", "type"]) {
                     match pt {
-                        "task_started" | "user_message" => return AgentState::Working,
+                        "task_started" | "user_message" => {
+                            return AgentState::Working;
+                        }
+                        // `exec_command_end` is still mid-turn; Codex often
+                        // emits follow-up events before completion.
+                        "exec_command_end" => {
+                            return if file_age_secs < INFERRED_WORKING_STALE_SECS {
+                                AgentState::Working
+                            } else {
+                                AgentState::Idle
+                            };
+                        }
                         "task_complete" | "turn_aborted" => return AgentState::Idle,
                         "agent_message" => {
                             return if json_str(entry, &["payload", "phase"]) == Some("final_answer")
@@ -433,13 +940,19 @@ fn detect_codex_state(path: &Path) -> AgentState {
             }
             Some("response_item") => {
                 if let Some(it) = json_str(entry, &["payload", "type"]) {
-                    if it == "function_call" {
-                        return AgentState::Working;
-                    }
-                    if it == "message"
-                        && json_str(entry, &["payload", "phase"]) == Some("final_answer")
-                    {
-                        return AgentState::Idle;
+                    match it {
+                        "function_call" | "function_call_output" | "reasoning" => {
+                            return AgentState::Working;
+                        }
+                        "message" => {
+                            return if json_str(entry, &["payload", "phase"]) == Some("final_answer")
+                            {
+                                AgentState::Idle
+                            } else {
+                                AgentState::Working
+                            };
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -561,7 +1074,10 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
     let effort = claude_effort_level();
     // Fallback session_id: filename stem (typically a UUID)
     if session_id.is_none() {
-        session_id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+        session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
     }
     ParsedTokens {
         input_tokens,
@@ -652,7 +1168,10 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
         .then(|| ((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8);
 
     if session_id.is_none() {
-        session_id = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+        session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
     }
     ParsedTokens {
         input_tokens,
@@ -781,6 +1300,631 @@ mod tests {
         assert_eq!(tokens.output_tokens, 20);
         assert_eq!(tokens.cache_read_tokens, 5);
         assert_eq!(tokens.cache_creation_tokens, 7);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_jsonl_selection_uses_process_age_and_excludes_used_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-select-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cwd = "/tmp/project";
+        let old_path = dir.join("old.jsonl");
+        let new_path = dir.join("new.jsonl");
+        let subagent_path = dir.join("subagent.jsonl");
+        fs::write(
+            &old_path,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"old","timestamp":"1970-01-01T00:01:40.000Z","cwd":"{cwd}","source":"cli"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &new_path,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"new","timestamp":"1970-01-01T00:15:00.000Z","cwd":"{cwd}","source":"cli"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &subagent_path,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"sub","timestamp":"1970-01-01T00:15:10.000Z","cwd":"{cwd}","source":{{"subagent":"review"}}}}}}
+{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":10}}}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let selected = find_codex_jsonl_for_cwd_at(&dir, cwd, 90, &[], 1000).unwrap();
+        assert_eq!(selected, subagent_path);
+
+        let selected =
+            find_codex_jsonl_for_cwd_at(&dir, cwd, 90, std::slice::from_ref(&subagent_path), 1000)
+                .unwrap();
+        assert_eq!(selected, new_path);
+
+        let selected =
+            find_codex_jsonl_for_cwd_at(&dir, cwd, 900, &[subagent_path, new_path], 1000).unwrap();
+        assert_eq!(selected, old_path);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_jsonl_selection_matches_normalized_cwd_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-cwd-normalize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let real_cwd = dir.join("project");
+        fs::create_dir_all(&real_cwd).unwrap();
+        let tmux_cwd = format!("{}/./", real_cwd.display());
+        let session_cwd = real_cwd.display().to_string();
+        let path = dir.join("session.jsonl");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"session","timestamp":"1970-01-01T00:15:00.000Z","cwd":"{session_cwd}","source":"cli"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let selected = find_codex_jsonl_for_cwd_at(&dir, &tmux_cwd, 100, &[], 1000).unwrap();
+        assert_eq!(selected, path);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_jsonl_selection_does_not_fallback_across_unmatched_cwds() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-no-cross-cwd-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let other_cwd = "/tmp/other-project";
+        let path = dir.join("other.jsonl");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"other","timestamp":"1970-01-01T00:15:00.000Z","cwd":"{other_cwd}","source":"cli"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        assert!(find_codex_jsonl_for_cwd_at(&dir, "/tmp/project", 10, &[], 1000).is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_jsonl_selection_falls_back_to_most_recent_when_unscorable() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-unscorable-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let older = dir.join("older.jsonl");
+        let newer = dir.join("newer.jsonl");
+        fs::write(
+            &older,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &newer,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        )
+        .unwrap();
+
+        let selected = find_codex_jsonl_for_cwd_at(&dir, "/tmp/project", 10, &[], unix_now_secs()).unwrap();
+        assert_eq!(selected, newer);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_jsonl_selection_prefers_scored_candidate_over_unscorable_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-scored-vs-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cwd = "/tmp/project";
+        let now = 1000;
+
+        let scored = dir.join("scored.jsonl");
+        let unscorable = dir.join("unscorable.jsonl");
+        fs::write(
+            &scored,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"scored","timestamp":"{}","cwd":"{cwd}","source":"cli"}}}}"#,
+                fmt_rfc3339(now - 10)
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &unscorable,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        )
+        .unwrap();
+
+        let selected = find_codex_jsonl_for_cwd_at(&dir, cwd, 10, &[], now).unwrap();
+        assert_eq!(selected, scored);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_jsonl_selection_uses_mtime_when_timestamp_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-missing-timestamp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cwd = "/tmp/project";
+
+        let older = dir.join("older.jsonl");
+        let newer = dir.join("newer.jsonl");
+        fs::write(
+            &older,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"older","cwd":"{cwd}","source":"cli"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &newer,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"newer","cwd":"{cwd}","source":"cli"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let selected = find_codex_jsonl_for_cwd_at(&dir, cwd, 10, &[], unix_now_secs()).unwrap();
+        assert_eq!(selected, newer);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_token_count_bias_applies_within_narrow_age_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-token-tiebreak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let cwd = "/tmp/project";
+        let now = 1000;
+        let ideal_started = now - 10;
+
+        let better_age_no_stats = dir.join("better-age-no-stats.jsonl");
+        let worse_age_with_stats = dir.join("worse-age-with-stats.jsonl");
+        let tied_age_no_stats = dir.join("tied-age-no-stats.jsonl");
+        let tied_age_with_stats = dir.join("tied-age-with-stats.jsonl");
+
+        fs::write(
+            &better_age_no_stats,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"better","timestamp":"{}","cwd":"{cwd}","source":"cli"}}}}"#,
+                fmt_rfc3339(ideal_started - 1)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &worse_age_with_stats,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"worse","timestamp":"{}","cwd":"{cwd}","source":"cli"}}}}
+{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":10}}}}}}}}
+"#,
+                fmt_rfc3339(ideal_started - 20)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &tied_age_no_stats,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"tie-no-stats","timestamp":"{}","cwd":"{cwd}","source":"cli"}}}}"#,
+                fmt_rfc3339(ideal_started)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &tied_age_with_stats,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"tie-with-stats","timestamp":"{}","cwd":"{cwd}","source":"cli"}}}}
+{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":100,"output_tokens":10}}}}}}}}
+"#,
+                fmt_rfc3339(ideal_started)
+            ),
+        )
+        .unwrap();
+
+        let selected = find_codex_jsonl_for_cwd_at(&dir, cwd, 10, &[], now).unwrap();
+        assert_eq!(selected, tied_age_with_stats);
+
+        let selected = find_codex_jsonl_for_cwd_at(
+            &dir,
+            cwd,
+            10,
+            &[tied_age_with_stats.clone(), tied_age_no_stats.clone()],
+            now,
+        )
+        .unwrap();
+        assert_eq!(selected, worse_age_with_stats);
+
+        let selected = find_codex_jsonl_for_cwd_at(
+            &dir,
+            cwd,
+            10,
+            &[
+                tied_age_with_stats.clone(),
+                tied_age_no_stats.clone(),
+                worse_age_with_stats.clone(),
+            ],
+            now,
+        )
+        .unwrap();
+        assert_eq!(selected, better_age_no_stats);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_jsonl_selection_falls_back_to_most_recent_when_unscorable() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-claude-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let older = dir.join("older.jsonl");
+        let newer = dir.join("newer.jsonl");
+        fs::write(
+            &older,
+            "{\"message\":{\"role\":\"user\",\"content\":\"older\"}}\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &newer,
+            "{\"message\":{\"role\":\"user\",\"content\":\"newer\"}}\n",
+        )
+        .unwrap();
+
+        let selected = find_claude_jsonl_for_cwd_at(&dir, 10, &[], unix_now_secs()).unwrap();
+        assert_eq!(selected, newer);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_jsonl_selection_does_not_fallback_when_only_stale_scored_candidates_exist() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-claude-no-stale-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let now = unix_now_secs();
+        let path = dir.join("stale.jsonl");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"{}","message":{{"role":"user","content":"old"}}}}"#,
+                fmt_rfc3339(now - 5000)
+            ),
+        )
+        .unwrap();
+
+        assert!(find_claude_jsonl_for_cwd_at(&dir, 10, &[], now).is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_plain_user_message_stays_working_without_followup() {
+        let path = write_temp_jsonl(
+            "claude-plain-user-idle",
+            r#"{"message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}
+{"message":{"role":"user","content":"try this again"}}
+"#,
+        );
+
+        assert_eq!(detect_claude_state(&path, 10), AgentState::Working);
+        assert_eq!(detect_claude_state(&path, 10_000), AgentState::Working);
+        assert_eq!(
+            detect_claude_state(&path, INFERRED_WORKING_STALE_SECS + 1),
+            AgentState::Idle
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_tool_result_keeps_session_working() {
+        let path = write_temp_jsonl(
+            "claude-tool-result-working",
+            r#"{"message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}
+{"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}
+"#,
+        );
+
+        assert_eq!(detect_claude_state(&path, 300), AgentState::Working);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_state_treats_in_turn_events_as_working() {
+        let path = write_temp_jsonl(
+            "codex-working-state",
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"response_item","payload":{"type":"function_call_output"}}
+"#,
+        );
+
+        assert_eq!(detect_codex_state(&path, 300), AgentState::Working);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_exec_command_end_stays_working_without_followup() {
+        let path = write_temp_jsonl(
+            "codex-exec-cmd-end",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"exec_command_end"}}
+"#,
+        );
+
+        assert_eq!(detect_codex_state(&path, 10), AgentState::Working);
+        assert_eq!(detect_codex_state(&path, 10_000), AgentState::Working);
+        assert_eq!(
+            detect_codex_state(&path, INFERRED_WORKING_STALE_SECS + 1),
+            AgentState::Idle
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_final_answer_is_idle() {
+        let path = write_temp_jsonl(
+            "codex-final-answer",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"response_item","payload":{"type":"message","phase":"final_answer"}}
+"#,
+        );
+
+        assert_eq!(detect_codex_state(&path, 300), AgentState::Idle);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_jsonl_selection_uses_process_age_and_excludes_used_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-claude-select-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Session started ~900s ago (timestamp = now - 900)
+        let now = unix_now_secs();
+        let old_ts = fmt_rfc3339(now - 900);
+        let new_ts = fmt_rfc3339(now - 100);
+
+        let old_path = dir.join("old-session.jsonl");
+        let new_path = dir.join("new-session.jsonl");
+        fs::write(
+            &old_path,
+            format!(
+                r#"{{"type":"user","sessionId":"old","timestamp":"{old_ts}","message":{{"role":"user","content":"hi"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &new_path,
+            format!(
+                r#"{{"type":"user","sessionId":"new","timestamp":"{new_ts}","message":{{"role":"user","content":"hi"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        // Agent running ~100s matches the newer session
+        let selected = find_claude_jsonl_for_cwd_at(&dir, 100, &[], now).unwrap();
+        assert_eq!(selected, new_path);
+
+        // Agent running ~900s matches the older session
+        let selected = find_claude_jsonl_for_cwd_at(&dir, 900, &[], now).unwrap();
+        assert_eq!(selected, old_path);
+
+        // Excluding the new session leaves only a stale scoreable candidate, so
+        // the selector should prefer returning no match over binding to a clearly
+        // wrong old session.
+        assert!(
+            find_claude_jsonl_for_cwd_at(&dir, 100, std::slice::from_ref(&new_path), now).is_none()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn fmt_rfc3339(epoch_secs: u64) -> String {
+        let s = epoch_secs;
+        let days = (s / 86_400) as i64;
+        let rem = s % 86_400;
+        let h = rem / 3_600;
+        let m = (rem % 3_600) / 60;
+        let sec = rem % 60;
+        // Convert days since epoch to y-m-d (inverse of days_from_civil)
+        let (y, mo, d) = civil_from_days(days);
+        format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{sec:02}.000Z")
+    }
+
+    fn civil_from_days(days: i64) -> (i32, u32, u32) {
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let y = if m <= 2 { y + 1 } else { y } as i32;
+        (y, m, d)
+    }
+
+    fn detected_agent(
+        kind: AgentKind,
+        pane_id: &str,
+        pid: u32,
+        cwd: &str,
+        elapsed_secs: u64,
+    ) -> DetectedAgent {
+        DetectedAgent {
+            kind,
+            pane_id: pane_id.to_string(),
+            cwd: cwd.to_string(),
+            window_id: "@1".to_string(),
+            window_index: 1,
+            agent_pid: pid,
+            elapsed_secs,
+        }
+    }
+
+    #[test]
+    fn session_cache_reuses_existing_binding_for_same_agent() {
+        let path = write_temp_jsonl(
+            "codex-binding-reuse",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        );
+        let agent = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 90);
+        let mut cache = SessionCache::new();
+
+        cache.bind_agent_path(&agent, path.clone(), Some("session-1".to_string()));
+
+        assert_eq!(
+            cache.bound_path_for_agent(&agent, extract_codex_session_id),
+            Some(path.clone())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_cache_keeps_binding_when_descendant_pid_changes() {
+        let path = write_temp_jsonl(
+            "codex-binding-pid-change",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        );
+        let original = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 90);
+        let same_pane_new_pid = detected_agent(AgentKind::Codex, "%1", 202, "/tmp/project", 91);
+        let mut cache = SessionCache::new();
+
+        cache.bind_agent_path(&original, path.clone(), Some("session-1".to_string()));
+
+        assert_eq!(
+            cache.bound_path_for_agent(&same_pane_new_pid, extract_codex_session_id),
+            Some(path.clone())
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_cache_drops_binding_when_agent_disappears() {
+        let path = write_temp_jsonl(
+            "claude-binding-drop",
+            r#"{"sessionId":"session-1","timestamp":"1970-01-01T00:01:40.000Z","message":{"role":"user","content":"hi"}}"#,
+        );
+        let agent = detected_agent(AgentKind::ClaudeCode, "%1", 202, "/tmp/project", 90);
+        let mut cache = SessionCache::new();
+
+        cache.bind_agent_path(&agent, path.clone(), Some("session-1".to_string()));
+        cache.retain_live_agents(&[]);
+
+        assert_eq!(
+            cache.bound_path_for_agent(&agent, extract_claude_session_id),
+            None
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_cache_prevents_double_claiming_same_jsonl_path() {
+        let path = write_temp_jsonl(
+            "codex-binding-owner",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        );
+        let owner = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 90);
+        let other = detected_agent(AgentKind::Codex, "%2", 102, "/tmp/project", 95);
+        let mut cache = SessionCache::new();
+
+        cache.bind_agent_path(&owner, path.clone(), Some("session-1".to_string()));
+        cache.bind_agent_path(&other, path.clone(), Some("session-1".to_string()));
+
+        assert_eq!(
+            cache.bound_path_for_agent(&owner, extract_codex_session_id),
+            Some(path.clone())
+        );
+        assert_eq!(
+            cache.bound_path_for_agent(&other, extract_codex_session_id),
+            None
+        );
 
         let _ = fs::remove_file(path);
     }

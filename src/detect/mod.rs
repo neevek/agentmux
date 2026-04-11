@@ -32,59 +32,101 @@ pub struct AgentInfo {
 /// Full scan: find all agent panes in the session and determine their state.
 pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     let panes = tmux::list_session_panes(session);
-    let detected = process::scan_panes_for_agents(&panes, crate::tmux::SIDEBAR_TITLE);
+    let mut detected = process::scan_panes_for_agents(&panes, crate::tmux::SIDEBAR_TITLE);
+    cache.retain_live_agents(&detected);
+    // Bind the most constrained / best-scoring agents first so an older pane
+    // cannot claim the only plausible JSONL for a newer same-cwd session.
+    detected.sort_by_key(|d| (state::binding_priority(d), d.elapsed_secs));
 
     let window_names = tmux::list_window_names(session);
 
-    let mut agents: Vec<AgentInfo> = detected
-        .into_iter()
-        .map(|d| {
-            let details = match d.kind {
-                AgentKind::ClaudeCode => {
-                    state::claude_code_details(&d.cwd, d.elapsed_secs, cache)
-                }
-                AgentKind::Codex => state::codex_details(&d.cwd, d.elapsed_secs, cache),
-            };
-            let window_name = window_names
-                .get(&d.window_id)
-                .cloned()
-                .unwrap_or_else(|| d.window_index.to_string());
-            let cost_usd = details
-                .model
-                .as_deref()
-                .map(|m| estimate_cost(
+    let mut agents = Vec::new();
+
+    for d in detected {
+        let details = match d.kind {
+            AgentKind::ClaudeCode => state::claude_code_details(&d, cache),
+            AgentKind::Codex => state::codex_details(&d, cache),
+        };
+
+        let window_name = window_names
+            .get(&d.window_id)
+            .cloned()
+            .unwrap_or_else(|| d.window_index.to_string());
+        let cost_usd = details
+            .model
+            .as_deref()
+            .map(|m| {
+                estimate_cost(
                     m,
                     details.input_tokens,
                     details.output_tokens,
                     details.cache_read_tokens,
                     details.cache_creation_tokens,
-                ))
-                .unwrap_or(0.0);
-            AgentInfo {
-                kind: d.kind,
-                pane_id: d.pane_id,
-                cwd: d.cwd,
-                window_id: d.window_id,
-                window_name,
-                state: details.state,
-                elapsed_secs: d.elapsed_secs,
-                input_tokens: details.input_tokens,
-                output_tokens: details.output_tokens,
-                last_activity: details.last_activity,
-                context_pct: details.context_pct,
-                model: details.model,
-                effort: details.effort,
-                cost_usd,
-                turn_count: details.turn_count,
-                session_id: details.session_id,
-                jsonl_path: details.jsonl_path,
-            }
-        })
-        .collect();
+                )
+            })
+            .unwrap_or(0.0);
+        agents.push(AgentInfo {
+            kind: d.kind,
+            pane_id: d.pane_id,
+            cwd: d.cwd,
+            window_id: d.window_id,
+            window_name,
+            state: details.state,
+            elapsed_secs: d.elapsed_secs,
+            input_tokens: details.input_tokens,
+            output_tokens: details.output_tokens,
+            last_activity: details.last_activity,
+            context_pct: details.context_pct,
+            model: details.model,
+            effort: details.effort,
+            cost_usd,
+            turn_count: details.turn_count,
+            session_id: details.session_id,
+            jsonl_path: details.jsonl_path,
+        });
+    }
 
     // Newest agents first (lowest elapsed_secs = most recently started)
     agents.sort_by_key(|a| a.elapsed_secs);
 
+    agents
+}
+
+/// Fast scan for startup: discovers active agent panes without JSONL/state lookup.
+/// This is intentionally lightweight so sidebar content appears immediately.
+pub fn scan_agents_fast(session: &str) -> Vec<AgentInfo> {
+    let panes = tmux::list_session_panes(session);
+    let detected = process::scan_panes_for_agents(&panes, crate::tmux::SIDEBAR_TITLE);
+    let window_names = tmux::list_window_names(session);
+
+    let mut agents = Vec::new();
+    for d in detected {
+        let window_name = window_names
+            .get(&d.window_id)
+            .cloned()
+            .unwrap_or_else(|| d.window_index.to_string());
+        agents.push(AgentInfo {
+            kind: d.kind,
+            pane_id: d.pane_id,
+            cwd: d.cwd,
+            window_id: d.window_id,
+            window_name,
+            state: state::AgentState::Working,
+            elapsed_secs: d.elapsed_secs,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: None,
+            jsonl_path: None,
+        });
+    }
+
+    agents.sort_by_key(|a| a.elapsed_secs);
     agents
 }
 
@@ -112,7 +154,9 @@ const MODEL_TABLE: &[(&str, &str, f64, f64)] = &[
 ];
 
 fn lookup_model(model: &str) -> Option<&'static (&'static str, &'static str, f64, f64)> {
-    MODEL_TABLE.iter().find(|(pattern, _, _, _)| model.contains(pattern))
+    MODEL_TABLE
+        .iter()
+        .find(|(pattern, _, _, _)| model.contains(pattern))
 }
 
 /// Estimate cost using per-type pricing.
