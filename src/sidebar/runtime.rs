@@ -11,6 +11,7 @@ use crate::detect::history::AggregatedStats;
 pub const POLL_INTERVAL_MS: u64 = 3_000;
 pub const LEASE_STALE_MS: u64 = POLL_INTERVAL_MS * 3;
 pub const SNAPSHOT_STALE_MS: u64 = LEASE_STALE_MS;
+pub const SNAPSHOT_ACTIVATION_MAX_AGE_MS: u64 = 60 * 60 * 1_000;
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_FILE_NAME: &str = "live_snapshot.json";
 const RUNTIME_DB_FILE_NAME: &str = "runtime.db";
@@ -73,6 +74,11 @@ impl RuntimeStore {
         try_claim_leader(db, std::process::id(), unix_now_ms())
     }
 
+    pub fn seize_leader(&self) -> Option<u64> {
+        let db = self.db.as_ref()?;
+        seize_leader(db, std::process::id(), unix_now_ms())
+    }
+
     pub fn read_lease(&self) -> LeaderLease {
         self.db.as_ref().map(read_leader_lease).unwrap_or_default()
     }
@@ -99,6 +105,21 @@ impl RuntimeStore {
         let metadata = snapshot_metadata(&self.snapshot_path)?;
         let snapshot = read_snapshot(&self.snapshot_path)?;
         if snapshot_matches_lease(&snapshot, lease) {
+            self.last_snapshot_meta = Some(metadata);
+            Some(snapshot)
+        } else {
+            None
+        }
+    }
+
+    pub fn load_snapshot_for_activation(&mut self) -> Option<LiveSnapshot> {
+        let metadata = snapshot_metadata(&self.snapshot_path)?;
+        let snapshot = read_snapshot(&self.snapshot_path)?;
+        if snapshot_is_valid(
+            snapshot.schema_version,
+            &snapshot,
+            SNAPSHOT_ACTIVATION_MAX_AGE_MS,
+        ) {
             self.last_snapshot_meta = Some(metadata);
             Some(snapshot)
         } else {
@@ -273,6 +294,24 @@ fn try_claim_leader(db: &sqlite::Connection, self_pid: u32, now_ms: u64) -> Opti
     Some(new_epoch)
 }
 
+fn seize_leader(db: &sqlite::Connection, self_pid: u32, now_ms: u64) -> Option<u64> {
+    ensure_runtime_state_table(db);
+    db.execute("BEGIN IMMEDIATE").ok()?;
+
+    let lease = read_leader_lease(db);
+    let new_epoch = if lease.pid == Some(self_pid) {
+        lease.epoch.max(1)
+    } else {
+        lease.epoch.saturating_add(1).max(1)
+    };
+
+    write_runtime_state(db, "leader_pid", &self_pid.to_string());
+    write_runtime_state(db, "leader_heartbeat_ms", &now_ms.to_string());
+    write_runtime_state(db, "leader_epoch", &new_epoch.to_string());
+    let _ = db.execute("COMMIT");
+    Some(new_epoch)
+}
+
 fn heartbeat_leader(db: &sqlite::Connection, self_pid: u32, epoch: u64, now_ms: u64) -> bool {
     ensure_runtime_state_table(db);
     if db.execute("BEGIN IMMEDIATE").is_err() {
@@ -336,16 +375,21 @@ fn write_snapshot(path: &Path, snapshot: &LiveSnapshot) -> std::io::Result<()> {
 }
 
 fn snapshot_matches_lease(snapshot: &LiveSnapshot, lease: &LeaderLease) -> bool {
-    if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
-        return false;
-    }
-    if unix_now_ms().saturating_sub(snapshot.written_at_ms) > SNAPSHOT_STALE_MS {
+    if !snapshot_is_valid(snapshot.schema_version, snapshot, SNAPSHOT_STALE_MS) {
         return false;
     }
     match lease.pid {
         Some(pid) => snapshot.leader_pid == pid && snapshot.leader_epoch == lease.epoch,
         None => true,
     }
+}
+
+fn snapshot_is_valid(schema_version: u32, snapshot: &LiveSnapshot, max_age_ms: u64) -> bool {
+    schema_version == SNAPSHOT_SCHEMA_VERSION && snapshot_is_recent(snapshot, max_age_ms)
+}
+
+fn snapshot_is_recent(snapshot: &LiveSnapshot, max_age_ms: u64) -> bool {
+    unix_now_ms().saturating_sub(snapshot.written_at_ms) <= max_age_ms
 }
 
 #[cfg(test)]
@@ -375,6 +419,25 @@ mod tests {
 
         assert_eq!(first, 1);
         assert_eq!(second, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn seize_leader_takes_over_even_when_existing_leader_is_alive() {
+        let dir = temp_dir("seize");
+        let db = open_db_at(&dir.join("stats.db")).unwrap();
+
+        write_runtime_state(&db, "leader_pid", &999_999.to_string());
+        write_runtime_state(&db, "leader_heartbeat_ms", "2");
+        write_runtime_state(&db, "leader_epoch", "7");
+
+        let epoch = seize_leader(&db, 10, 3).unwrap();
+        let lease = read_leader_lease(&db);
+
+        assert_eq!(epoch, 8);
+        assert_eq!(lease.pid, Some(10));
+        assert_eq!(lease.epoch, 8);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -497,6 +560,59 @@ mod tests {
                 })
                 .is_some()
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn activation_snapshot_accepts_recent_previous_leader_snapshot() {
+        let dir = temp_dir("activation-snapshot");
+        let snapshot_path = dir.join(SNAPSHOT_FILE_NAME);
+        let snapshot = LiveSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            leader_pid: 42,
+            leader_epoch: 7,
+            written_at_ms: unix_now_ms(),
+            agents: Vec::new(),
+            stats: AggregatedStats::default(),
+        };
+        let mut store = RuntimeStore {
+            db: None,
+            snapshot_path: snapshot_path.clone(),
+            last_snapshot_meta: None,
+            last_published: None,
+        };
+
+        write_snapshot(&snapshot_path, &snapshot).unwrap();
+
+        let loaded = store.load_snapshot_for_activation();
+        assert_eq!(loaded, Some(snapshot));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn activation_snapshot_rejects_hour_old_snapshot() {
+        let dir = temp_dir("activation-stale");
+        let snapshot_path = dir.join(SNAPSHOT_FILE_NAME);
+        let snapshot = LiveSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            leader_pid: 42,
+            leader_epoch: 7,
+            written_at_ms: unix_now_ms().saturating_sub(SNAPSHOT_ACTIVATION_MAX_AGE_MS + 1),
+            agents: Vec::new(),
+            stats: AggregatedStats::default(),
+        };
+        let mut store = RuntimeStore {
+            db: None,
+            snapshot_path: snapshot_path.clone(),
+            last_snapshot_meta: None,
+            last_published: None,
+        };
+
+        write_snapshot(&snapshot_path, &snapshot).unwrap();
+
+        assert!(store.load_snapshot_for_activation().is_none());
 
         let _ = fs::remove_dir_all(dir);
     }

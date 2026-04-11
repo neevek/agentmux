@@ -24,6 +24,7 @@ extern "C" fn winch_handler(_sig: libc::c_int) {}
 
 const IDLE_CHECK_MS: u64 = 1000;
 const WIDTH_SAVE_THROTTLE_MS: u64 = 50;
+const DISCOVERY_SWEEP_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderMode {
@@ -58,6 +59,88 @@ enum SidebarRole {
         epoch: u64,
         last_refresh: Instant,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneFingerprint {
+    pid: u32,
+    title: String,
+    current_command: String,
+    cwd: String,
+}
+
+fn pane_fingerprint(pane: &tmux::PaneInfo) -> PaneFingerprint {
+    PaneFingerprint {
+        pid: pane.pid,
+        title: pane.title.clone(),
+        current_command: pane.current_command.clone(),
+        cwd: pane.cwd.clone(),
+    }
+}
+
+fn suspect_pane_ids(
+    panes: &[tmux::PaneInfo],
+    previous: &HashMap<String, PaneFingerprint>,
+    tracked_panes: &HashSet<&str>,
+    force_sweep: bool,
+) -> HashSet<String> {
+    let mut suspect = HashSet::new();
+    for pane in panes {
+        if pane.title == tmux::SIDEBAR_TITLE {
+            continue;
+        }
+
+        let current = pane_fingerprint(pane);
+        if previous.get(&pane.id) != Some(&current) {
+            suspect.insert(pane.id.clone());
+            continue;
+        }
+
+        if force_sweep && !tracked_panes.contains(pane.id.as_str()) {
+            suspect.insert(pane.id.clone());
+        }
+    }
+    suspect
+}
+
+fn update_pane_fingerprints(
+    fingerprints: &mut HashMap<String, PaneFingerprint>,
+    panes: &[tmux::PaneInfo],
+) {
+    fingerprints.clear();
+    for pane in panes {
+        if pane.title != tmux::SIDEBAR_TITLE {
+            fingerprints.insert(pane.id.clone(), pane_fingerprint(pane));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(id: &str, pid: u32, title: &str, current_command: &str) -> tmux::PaneInfo {
+        tmux::PaneInfo {
+            id: id.to_string(),
+            window_id: "@1".to_string(),
+            window_index: 1,
+            pid,
+            cwd: "/tmp/project".to_string(),
+            title: title.to_string(),
+            current_command: current_command.to_string(),
+        }
+    }
+
+    #[test]
+    fn suspect_panes_include_tracked_pane_fingerprint_changes() {
+        let tracked = pane("%1", 100, "shell", "zsh");
+        let previous = HashMap::from([("%1".to_string(), pane_fingerprint(&tracked))]);
+        let changed = pane("%1", 101, "shell", "zsh");
+        let tracked_panes = HashSet::from(["%1"]);
+
+        let suspect = suspect_pane_ids(&[changed], &previous, &tracked_panes, false);
+        assert_eq!(suspect, HashSet::from(["%1".to_string()]));
+    }
 }
 
 fn load_header_config() -> HeaderConfig {
@@ -112,6 +195,9 @@ pub fn run() {
     let mut last_width_save = Instant::now();
     let mut needs_render = true;
     let mut just_activated = false;
+    let mut suppress_on_exit = false;
+    let mut pane_fingerprints: HashMap<String, PaneFingerprint> = HashMap::new();
+    let mut last_discovery_sweep = Instant::now() - Duration::from_millis(DISCOVERY_SWEEP_MS);
 
     let header_config = load_header_config();
     let mut header_expanded = header_config.start_mode == HeaderMode::Expanded;
@@ -127,10 +213,9 @@ pub fn run() {
         let is_active = tmux::is_pane_in_active_window();
         if is_active != last_active {
             if !is_active {
-                if let SidebarRole::Leader { epoch, .. } = role {
-                    runtime_store.release_leader(epoch);
+                if !matches!(role, SidebarRole::Leader { .. }) {
+                    role = SidebarRole::Inactive;
                 }
-                role = SidebarRole::Inactive;
             } else {
                 activate_sidebar(
                     &mut role,
@@ -154,7 +239,7 @@ pub fn run() {
             needs_render = true;
         }
 
-        if is_active && !just_activated {
+        if !just_activated {
             let mut promote_to_leader = None;
             match &mut role {
                 SidebarRole::Leader {
@@ -171,18 +256,26 @@ pub fn run() {
                         &mut current_stats,
                         &mut prev_states,
                         &mut unseen_done,
+                        &mut pane_fingerprints,
+                        &mut last_discovery_sweep,
                     ) {
                         *last_refresh = Instant::now();
                         needs_render = true;
                     } else {
-                        role = SidebarRole::Follower {
-                            last_poll: Instant::now()
-                                - Duration::from_millis(runtime::POLL_INTERVAL_MS),
+                        role = if is_active {
+                            SidebarRole::Follower {
+                                last_poll: Instant::now()
+                                    - Duration::from_millis(runtime::POLL_INTERVAL_MS),
+                            }
+                        } else {
+                            SidebarRole::Inactive
                         };
                     }
                 }
                 SidebarRole::Follower { last_poll }
-                    if last_poll.elapsed() >= Duration::from_millis(runtime::POLL_INTERVAL_MS) =>
+                    if is_active
+                        && last_poll.elapsed()
+                            >= Duration::from_millis(runtime::POLL_INTERVAL_MS) =>
                 {
                     let now = Instant::now();
                     let lease = runtime_store.read_lease();
@@ -202,6 +295,24 @@ pub fn run() {
                     }
                     *last_poll = now;
                 }
+                SidebarRole::Follower { last_poll }
+                    if !is_active
+                        && last_poll.elapsed()
+                            >= Duration::from_millis(runtime::POLL_INTERVAL_MS) =>
+                {
+                    let lease = runtime_store.read_lease();
+                    if let Some(snapshot) = runtime_store.load_snapshot_if_changed(&lease) {
+                        apply_snapshot(
+                            snapshot,
+                            &mut cached_agents,
+                            &mut current_stats,
+                            &mut prev_states,
+                            &mut unseen_done,
+                        );
+                        needs_render = true;
+                    }
+                    *last_poll = Instant::now();
+                }
                 _ => {}
             }
             if let Some((epoch, now)) = promote_to_leader {
@@ -215,6 +326,8 @@ pub fn run() {
                     &mut current_stats,
                     &mut prev_states,
                     &mut unseen_done,
+                    &mut pane_fingerprints,
+                    &mut last_discovery_sweep,
                 );
                 role = if refreshed {
                     SidebarRole::Leader {
@@ -376,7 +489,10 @@ pub fn run() {
                         needs_render = true;
                     }
                 }
-                input::InputEvent::KeyQuit => break,
+                input::InputEvent::KeyQuit => {
+                    suppress_on_exit = true;
+                    break;
+                }
                 input::InputEvent::Resize => {
                     needs_render = true;
                 }
@@ -385,6 +501,10 @@ pub fn run() {
         } else {
             let _ = input::poll_input(Duration::from_millis(IDLE_CHECK_MS));
         }
+    }
+
+    if suppress_on_exit && let Some(window_id) = tmux::current_window_id() {
+        tmux::suppress_window(&window_id);
     }
 
     if let SidebarRole::Leader { epoch, .. } = role {
@@ -403,7 +523,7 @@ fn activate_sidebar(
 ) {
     let mut snapshot_loaded = false;
     let lease = runtime_store.read_lease();
-    if let Some(snapshot) = runtime_store.load_snapshot(&lease) {
+    if let Some(snapshot) = runtime_store.load_snapshot_for_activation() {
         apply_snapshot(
             snapshot,
             cached_agents,
@@ -444,13 +564,63 @@ fn refresh_leader_state(
     current_stats: &mut AggregatedStats,
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
+    pane_fingerprints: &mut HashMap<String, PaneFingerprint>,
+    last_discovery_sweep: &mut Instant,
 ) -> bool {
     if !runtime_store.heartbeat_leader(epoch) {
         return false;
     }
 
     history.refresh_persistent_baseline();
-    let agents = detect::scan_agents(session, detect_cache);
+    let panes = tmux::list_session_panes(session);
+    let tracked_panes: HashSet<&str> = cached_agents
+        .iter()
+        .map(|agent| agent.pane_id.as_str())
+        .collect();
+    let force_sweep = last_discovery_sweep.elapsed() >= Duration::from_millis(DISCOVERY_SWEEP_MS);
+    let suspect_ids = suspect_pane_ids(&panes, pane_fingerprints, &tracked_panes, force_sweep);
+
+    let mut agents = if let Some(agents) =
+        detect::refresh_agents_incremental_from_panes(session, &panes, cached_agents, detect_cache)
+    {
+        agents
+    } else {
+        *last_discovery_sweep = Instant::now();
+        let agents = detect::scan_agents(session, detect_cache);
+        update_pane_fingerprints(pane_fingerprints, &panes);
+        let stats = history.aggregated_stats(&agents);
+        runtime_store.publish_snapshot(epoch, &agents, &stats);
+        apply_agents_update(prev_states, unseen_done, &agents);
+        *cached_agents = agents;
+        *current_stats = stats;
+        return true;
+    };
+
+    if !suspect_ids.is_empty() {
+        let suspect_panes: Vec<_> = panes
+            .iter()
+            .filter(|pane| suspect_ids.contains(&pane.id))
+            .cloned()
+            .collect();
+        let discovered = detect::discover_agents_in_panes(session, &suspect_panes, detect_cache);
+        if !discovered.is_empty() || force_sweep {
+            *last_discovery_sweep = Instant::now();
+        }
+        for discovered_agent in discovered {
+            if let Some(existing) = agents
+                .iter_mut()
+                .find(|agent| agent.pane_id == discovered_agent.pane_id)
+            {
+                *existing = discovered_agent;
+            } else {
+                agents.push(discovered_agent);
+            }
+        }
+        agents.sort_by_key(|agent| agent.elapsed_secs);
+    }
+
+    detect_cache.retain_agent_infos(&agents);
+    update_pane_fingerprints(pane_fingerprints, &panes);
     let stats = history.aggregated_stats(&agents);
     runtime_store.publish_snapshot(epoch, &agents, &stats);
     apply_agents_update(prev_states, unseen_done, &agents);

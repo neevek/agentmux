@@ -2,6 +2,7 @@ pub mod history;
 pub mod process;
 pub mod state;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,9 +11,19 @@ use crate::tmux;
 use process::AgentKind;
 pub use state::SessionCache;
 
+fn default_details_ready() -> bool {
+    true
+}
+
+fn default_resumed() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub kind: AgentKind,
+    #[serde(default)]
+    pub agent_pid: Option<u32>,
     pub pane_id: String,
     pub cwd: String,
     pub window_id: String,
@@ -29,6 +40,10 @@ pub struct AgentInfo {
     pub turn_count: u32,
     pub session_id: Option<String>,
     pub jsonl_path: Option<PathBuf>,
+    #[serde(default = "default_resumed")]
+    pub resumed: bool,
+    #[serde(default = "default_details_ready")]
+    pub details_ready: bool,
 }
 
 /// Full scan: find all agent panes in the session and determine their state.
@@ -36,63 +51,8 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     let panes = tmux::list_session_panes(session);
     let mut detected = process::scan_panes_for_agents(&panes, crate::tmux::SIDEBAR_TITLE);
     cache.retain_live_agents(&detected);
-    // Bind the most constrained / best-scoring agents first so a newer pane
-    // can claim its session before an older same-cwd pane attempts a rebind.
     detected.sort_by_key(scan_order_key);
-
-    let window_names = tmux::list_window_names(session);
-
-    let mut agents = Vec::new();
-
-    for d in detected {
-        let details = match d.kind {
-            AgentKind::ClaudeCode => state::claude_code_details(&d, cache),
-            AgentKind::Codex => state::codex_details(&d, cache),
-        };
-
-        let window_name = window_names
-            .get(&d.window_id)
-            .cloned()
-            .unwrap_or_else(|| d.window_index.to_string());
-        let cost_usd = details
-            .model
-            .as_deref()
-            .map(|m| {
-                estimate_cost(
-                    m,
-                    details.input_tokens,
-                    details.output_tokens,
-                    details.cache_read_tokens,
-                    details.cache_creation_tokens,
-                )
-            })
-            .unwrap_or(0.0);
-        let elapsed_secs = display_elapsed_secs(d.kind, d.elapsed_secs, &details);
-        agents.push(AgentInfo {
-            kind: d.kind,
-            pane_id: d.pane_id,
-            cwd: d.cwd,
-            window_id: d.window_id,
-            window_name,
-            state: details.state,
-            elapsed_secs,
-            input_tokens: details.input_tokens,
-            output_tokens: details.output_tokens,
-            last_activity: details.last_activity,
-            context_pct: details.context_pct,
-            model: details.model,
-            effort: details.effort,
-            cost_usd,
-            turn_count: details.turn_count,
-            session_id: details.session_id,
-            jsonl_path: details.jsonl_path,
-        });
-    }
-
-    // Newest agents first (lowest elapsed_secs = most recently started)
-    agents.sort_by_key(|a| a.elapsed_secs);
-
-    agents
+    agents_from_detected(session, detected, cache)
 }
 
 fn scan_order_key(agent: &process::DetectedAgent) -> (u64, u64) {
@@ -125,6 +85,7 @@ pub fn scan_agents_fast(session: &str) -> Vec<AgentInfo> {
             .unwrap_or_else(|| d.window_index.to_string());
         agents.push(AgentInfo {
             kind: d.kind,
+            agent_pid: Some(d.agent_pid),
             pane_id: d.pane_id,
             cwd: d.cwd,
             window_id: d.window_id,
@@ -141,6 +102,78 @@ pub fn scan_agents_fast(session: &str) -> Vec<AgentInfo> {
             turn_count: 0,
             session_id: None,
             jsonl_path: None,
+            resumed: d.resumed,
+            details_ready: false,
+        });
+    }
+
+    agents.sort_by_key(|a| a.elapsed_secs);
+    agents
+}
+
+pub fn discover_agents_in_panes(
+    session: &str,
+    panes: &[tmux::PaneInfo],
+    cache: &mut SessionCache,
+) -> Vec<AgentInfo> {
+    let mut detected = process::scan_panes_for_agents(panes, crate::tmux::SIDEBAR_TITLE);
+    detected.sort_by_key(scan_order_key);
+    agents_from_detected(session, detected, cache)
+}
+
+fn agents_from_detected(
+    session: &str,
+    detected: Vec<process::DetectedAgent>,
+    cache: &mut SessionCache,
+) -> Vec<AgentInfo> {
+    let window_names = tmux::list_window_names(session);
+    let mut agents = Vec::new();
+
+    for d in detected {
+        let details = match d.kind {
+            AgentKind::ClaudeCode => state::claude_code_details(&d, cache),
+            AgentKind::Codex => state::codex_details(&d, cache),
+        };
+
+        let window_name = window_names
+            .get(&d.window_id)
+            .cloned()
+            .unwrap_or_else(|| d.window_index.to_string());
+        let cost_usd = details
+            .model
+            .as_deref()
+            .map(|m| {
+                estimate_cost(
+                    m,
+                    details.input_tokens,
+                    details.output_tokens,
+                    details.cache_read_tokens,
+                    details.cache_creation_tokens,
+                )
+            })
+            .unwrap_or(0.0);
+        let elapsed_secs = display_elapsed_secs(d.kind, d.elapsed_secs, &details);
+        agents.push(AgentInfo {
+            kind: d.kind,
+            agent_pid: Some(d.agent_pid),
+            pane_id: d.pane_id,
+            cwd: d.cwd,
+            window_id: d.window_id,
+            window_name,
+            state: details.state,
+            elapsed_secs,
+            input_tokens: details.input_tokens,
+            output_tokens: details.output_tokens,
+            last_activity: details.last_activity,
+            context_pct: details.context_pct,
+            model: details.model,
+            effort: details.effort,
+            cost_usd,
+            turn_count: details.turn_count,
+            session_id: details.session_id,
+            jsonl_path: details.jsonl_path,
+            resumed: d.resumed,
+            details_ready: true,
         });
     }
 
@@ -221,6 +254,88 @@ pub(crate) fn short_model_name(model: &str) -> String {
     base_name.to_string()
 }
 
+pub fn refresh_agents_incremental_from_panes(
+    session: &str,
+    panes: &[tmux::PaneInfo],
+    known_agents: &[AgentInfo],
+    cache: &mut SessionCache,
+) -> Option<Vec<AgentInfo>> {
+    let pane_map: HashMap<&str, &tmux::PaneInfo> = panes
+        .iter()
+        .filter(|pane| pane.title != crate::tmux::SIDEBAR_TITLE)
+        .map(|pane| (pane.id.as_str(), pane))
+        .collect();
+
+    let window_names = tmux::list_window_names(session);
+    let known_pids: Vec<u32> = known_agents
+        .iter()
+        .filter_map(|agent| agent.agent_pid)
+        .collect();
+    let elapsed_by_pid = process::query_process_elapsed(&known_pids);
+    let mut refreshed = Vec::new();
+
+    for agent in known_agents {
+        let Some(pane) = pane_map.get(agent.pane_id.as_str()) else {
+            continue;
+        };
+        let Some(agent_pid) = agent.agent_pid else {
+            return None;
+        };
+        let Some(process_elapsed_secs) = elapsed_by_pid.get(&agent_pid).copied() else {
+            continue;
+        };
+
+            let details = state::refresh_tracked_details(agent, process_elapsed_secs, cache);
+        if details.jsonl_path.is_none() || details.session_id.is_none() {
+            return None;
+        }
+
+        let window_name = window_names
+            .get(&pane.window_id)
+            .cloned()
+            .unwrap_or_else(|| pane.window_index.to_string());
+        let cost_usd = details
+            .model
+            .as_deref()
+            .map(|m| {
+                estimate_cost(
+                    m,
+                    details.input_tokens,
+                    details.output_tokens,
+                    details.cache_read_tokens,
+                    details.cache_creation_tokens,
+                )
+            })
+            .unwrap_or(0.0);
+        let elapsed_secs = display_elapsed_secs(agent.kind, process_elapsed_secs, &details);
+        refreshed.push(AgentInfo {
+            kind: agent.kind,
+            agent_pid: Some(agent_pid),
+            pane_id: pane.id.clone(),
+            cwd: pane.cwd.clone(),
+            window_id: pane.window_id.clone(),
+            window_name,
+            state: details.state,
+            elapsed_secs,
+            input_tokens: details.input_tokens,
+            output_tokens: details.output_tokens,
+            last_activity: details.last_activity,
+            context_pct: details.context_pct,
+            model: details.model,
+            effort: details.effort,
+            cost_usd,
+            turn_count: details.turn_count,
+            session_id: details.session_id,
+            jsonl_path: details.jsonl_path,
+            resumed: agent.resumed,
+            details_ready: true,
+        });
+    }
+
+    refreshed.sort_by_key(|a| a.elapsed_secs);
+    Some(refreshed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +372,7 @@ mod tests {
             window_id: "@1".to_string(),
             window_index: 1,
             agent_pid: 101,
+            resumed: false,
             elapsed_secs: 900,
         };
         let newer = process::DetectedAgent {

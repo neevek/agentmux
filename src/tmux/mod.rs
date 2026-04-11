@@ -5,6 +5,7 @@ const DEFAULT_WIDTH: u32 = 50;
 pub const MIN_WIDTH: u32 = 50;
 const WIDTH_OPTION: &str = "@agentmux-width";
 const SELECTED_OPTION: &str = "@agentmux-selected";
+const SUPPRESSED_PREFIX: &str = "@agentmux-suppressed-window-";
 
 #[derive(Debug, Clone)]
 pub struct PaneInfo {
@@ -14,14 +15,14 @@ pub struct PaneInfo {
     pub pid: u32,
     pub cwd: String,
     pub title: String,
+    pub current_command: String,
 }
 
-const PANE_FORMAT: &str =
-    "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}";
+const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}\t#{pane_current_command}";
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() < 6 {
+    if parts.len() < 7 {
         return None;
     }
     Some(PaneInfo {
@@ -31,6 +32,7 @@ fn parse_pane_line(line: &str) -> Option<PaneInfo> {
         pid: parts[3].parse().unwrap_or(0),
         cwd: parts[4].to_string(),
         title: parts[5].to_string(),
+        current_command: parts[6].to_string(),
     })
 }
 
@@ -41,6 +43,31 @@ fn tmux_output(args: &[&str]) -> Option<String> {
     } else {
         None
     }
+}
+
+fn encode_option_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('_');
+                encoded.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+                encoded.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+            }
+        }
+    }
+    if encoded.is_empty() {
+        "default".to_string()
+    } else {
+        encoded
+    }
+}
+
+fn suppressed_option(window_id: &str) -> String {
+    format!("{SUPPRESSED_PREFIX}{}", encode_option_component(window_id))
 }
 
 pub fn get_sidebar_width() -> u32 {
@@ -89,6 +116,21 @@ pub fn get_selected_pane() -> String {
 
 pub fn set_selected_pane(pane_id: &str) {
     let _ = tmux_output(&["set-option", "-g", SELECTED_OPTION, pane_id]);
+}
+
+pub fn is_window_suppressed(window_id: &str) -> bool {
+    let option = suppressed_option(window_id);
+    tmux_output(&["show-option", "-gqv", &option]).is_some_and(|value| value == "1")
+}
+
+pub fn suppress_window(window_id: &str) {
+    let option = suppressed_option(window_id);
+    let _ = tmux_output(&["set-option", "-g", &option, "1"]);
+}
+
+pub fn clear_window_suppressed(window_id: &str) {
+    let option = suppressed_option(window_id);
+    let _ = tmux_output(&["set-option", "-gu", &option]);
 }
 
 pub fn sidebar_pid_in_window(window_id: &str) -> Option<u32> {
