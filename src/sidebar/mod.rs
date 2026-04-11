@@ -849,10 +849,15 @@ pub fn run() {
             },
             input::InputEvent::MouseClick { y } => {
                 let hrows = render::header_rows(header_expanded);
-                if y >= 4 && y <= hrows {
+                if y > 0 && y <= hrows {
                     header_expanded = !header_expanded;
                     header_user_toggled = true;
                     selection = Selection::Header;
+                    cached_focus_is_active = true;
+                    if !sidebar_pane_id.is_empty() {
+                        cached_active_pane_id = Some(sidebar_pane_id.clone());
+                        tmux::select_pane(&sidebar_pane_id);
+                    }
                     needs_render = true;
                 } else if let Some(agent) =
                     input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows)
