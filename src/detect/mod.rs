@@ -285,7 +285,7 @@ pub fn refresh_agents_incremental_from_panes(
             continue;
         };
 
-            let details = state::refresh_tracked_details(agent, process_elapsed_secs, cache);
+        let details = state::refresh_tracked_details(agent, process_elapsed_secs, cache);
         if details.jsonl_path.is_none() || details.session_id.is_none() {
             return None;
         }

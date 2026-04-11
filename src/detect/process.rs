@@ -240,7 +240,9 @@ fn process_args_indicate_resume(kind: AgentKind, args: Option<&str>) -> bool {
         return false;
     };
     match kind {
-        AgentKind::ClaudeCode => args.split_whitespace().any(|part| part == "-r" || part == "--resume"),
+        AgentKind::ClaudeCode => args
+            .split_whitespace()
+            .any(|part| part == "-r" || part == "--resume"),
         AgentKind::Codex => args.split_whitespace().any(|part| part == "resume"),
     }
 }

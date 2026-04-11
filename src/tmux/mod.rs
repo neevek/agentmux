@@ -4,7 +4,6 @@ pub const SIDEBAR_TITLE: &str = "agentmux-sidebar";
 const DEFAULT_WIDTH: u32 = 50;
 pub const MIN_WIDTH: u32 = 50;
 const WIDTH_OPTION: &str = "@agentmux-width";
-const SELECTED_OPTION: &str = "@agentmux-selected";
 const SUPPRESSED_PREFIX: &str = "@agentmux-suppressed-window-";
 
 #[derive(Debug, Clone)]
@@ -108,14 +107,6 @@ pub fn find_all_sidebar_panes(session: &str) -> Vec<(String, String)> {
         .filter(|p| p.title == SIDEBAR_TITLE)
         .map(|p| (p.id, p.window_id))
         .collect()
-}
-
-pub fn get_selected_pane() -> String {
-    tmux_output(&["show-option", "-gqv", SELECTED_OPTION]).unwrap_or_default()
-}
-
-pub fn set_selected_pane(pane_id: &str) {
-    let _ = tmux_output(&["set-option", "-g", SELECTED_OPTION, pane_id]);
 }
 
 pub fn is_window_suppressed(window_id: &str) -> bool {
@@ -300,6 +291,28 @@ pub fn current_session() -> Option<String> {
 
 pub fn current_window_id() -> Option<String> {
     tmux_output(&["display-message", "-p", "#{window_id}"])
+}
+
+pub fn pane_window_id(pane_id: &str) -> Option<String> {
+    tmux_output(&["display-message", "-t", pane_id, "-p", "#{window_id}"])
+}
+
+pub fn active_pane_in_window(window_id: &str) -> Option<String> {
+    let out = tmux_output(&[
+        "list-panes",
+        "-t",
+        window_id,
+        "-F",
+        "#{pane_id}\t#{pane_active}",
+    ])?;
+    out.lines().find_map(|line| {
+        let (pane_id, active) = line.split_once('\t')?;
+        if active == "1" {
+            Some(pane_id.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 pub fn set_hook(hook_name: &str, cmd: &str) {

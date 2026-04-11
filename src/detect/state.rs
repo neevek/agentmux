@@ -279,7 +279,12 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
         .bound_path_for_agent(agent, extract_claude_session_id)
         .or_else(|| {
             let claimed_paths = cache.claimed_paths_for_agent(agent);
-            find_claude_jsonl_for_cwd(&projects_dir, agent.elapsed_secs, agent.resumed, &claimed_paths)
+            find_claude_jsonl_for_cwd(
+                &projects_dir,
+                agent.elapsed_secs,
+                agent.resumed,
+                &claimed_paths,
+            )
         });
     let details = agent_details(
         jsonl_path.as_deref(),
@@ -693,7 +698,13 @@ fn find_claude_jsonl_for_cwd(
     resumed: bool,
     used_paths: &[PathBuf],
 ) -> Option<PathBuf> {
-    find_claude_jsonl_for_cwd_at(projects_dir, agent_age_secs, resumed, used_paths, unix_now_secs())
+    find_claude_jsonl_for_cwd_at(
+        projects_dir,
+        agent_age_secs,
+        resumed,
+        used_paths,
+        unix_now_secs(),
+    )
 }
 
 fn find_claude_jsonl_for_cwd_at(
@@ -1648,28 +1659,20 @@ mod tests {
         let selected = find_codex_jsonl_for_cwd_at(&dir, cwd, 90, false, &[], 1000).unwrap();
         assert_eq!(selected, subagent_path);
 
-        let selected =
-            find_codex_jsonl_for_cwd_at(
-                &dir,
-                cwd,
-                90,
-                false,
-                std::slice::from_ref(&subagent_path),
-                1000,
-            )
-                .unwrap();
+        let selected = find_codex_jsonl_for_cwd_at(
+            &dir,
+            cwd,
+            90,
+            false,
+            std::slice::from_ref(&subagent_path),
+            1000,
+        )
+        .unwrap();
         assert_eq!(selected, new_path);
 
         let selected =
-            find_codex_jsonl_for_cwd_at(
-                &dir,
-                cwd,
-                900,
-                false,
-                &[subagent_path, new_path],
-                1000,
-            )
-            .unwrap();
+            find_codex_jsonl_for_cwd_at(&dir, cwd, 900, false, &[subagent_path, new_path], 1000)
+                .unwrap();
         assert_eq!(selected, old_path);
 
         let _ = fs::remove_dir_all(dir);
@@ -2175,14 +2178,8 @@ mod tests {
         // the selector should prefer returning no match over binding to a clearly
         // wrong old session.
         assert!(
-            find_claude_jsonl_for_cwd_at(
-                &dir,
-                100,
-                false,
-                std::slice::from_ref(&new_path),
-                now,
-            )
-            .is_none()
+            find_claude_jsonl_for_cwd_at(&dir, 100, false, std::slice::from_ref(&new_path), now,)
+                .is_none()
         );
 
         let _ = fs::remove_dir_all(dir);
