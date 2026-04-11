@@ -385,38 +385,9 @@ pub fn refresh_tracked_details(
                 resumed: agent.resumed,
                 elapsed_secs: process_elapsed_secs,
             };
-            let details = refresh_bound_details(
-                AgentKind::Codex,
-                agent.jsonl_path.as_deref(),
-                agent.session_id.as_deref(),
-                process_elapsed_secs,
-                agent.resumed,
-                cache,
-            );
-            if details.jsonl_path.is_some() && details.session_id.is_some() {
-                update_binding(cache, &detected, &details);
-                return details;
-            }
-
-            let Some(sessions_dir) = codex_sessions_dir() else {
-                return SessionDetails::default();
-            };
-            let jsonl_path =
-                select_codex_jsonl_path(&sessions_dir, &detected, cache, unix_now_secs());
-            let mut details = agent_details(
-                jsonl_path.as_deref(),
-                process_elapsed_secs,
-                !agent.resumed,
-                cache,
-                detect_codex_state,
-                parse_codex_tokens,
-            );
-            details.display_elapsed_secs = details
-                .jsonl_path
-                .as_deref()
-                .and_then(|path| codex_session_elapsed_secs(path, unix_now_secs()));
-            update_binding(cache, &detected, &details);
-            details
+            // Re-run full Codex binding selection each refresh so /new and /clear
+            // can move the pane to a newer session file instead of pinning stale stats.
+            codex_details(&detected, cache)
         }
     }
 }
@@ -427,15 +398,6 @@ fn select_codex_jsonl_path(
     cache: &mut SessionCache,
     now_secs: u64,
 ) -> Option<PathBuf> {
-    let key = AgentBindingKey::from(agent);
-    if let Some(binding) = cache.bindings.get(&key).cloned()
-        && binding.jsonl_path.is_file()
-        && binding.session_id.as_deref() == extract_codex_session_id(&binding.jsonl_path).as_deref()
-        && codex_path_is_recent(&binding.jsonl_path, CODEX_BOUND_PATH_LIVE_SECS)
-    {
-        return Some(binding.jsonl_path);
-    }
-
     let current_path = cache.bound_path_for_agent(agent, extract_codex_session_id);
     let claimed_paths = cache.claimed_paths_for_agent(agent);
     let newer_replacement = current_path.as_deref().and_then(|current| {
@@ -2457,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_keeps_live_bound_path_over_newer_candidate() {
+    fn codex_switches_live_bound_path_to_newer_candidate() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "agentmux-codex-live-keep-{}-{}",
             std::process::id(),
@@ -2486,7 +2448,7 @@ mod tests {
         cache.bind_agent_path(&agent, current_path.clone(), Some("session-1".to_string()));
 
         let selected = select_codex_jsonl_path(&sessions_dir, &agent, &mut cache, 1000).unwrap();
-        assert_eq!(selected, current_path);
+        assert_eq!(selected, candidate_path);
 
         let _ = fs::remove_file(current_path);
         let _ = fs::remove_file(candidate_path);
@@ -2494,7 +2456,48 @@ mod tests {
     }
 
     #[test]
-    fn refresh_tracked_codex_details_prefers_existing_binding() {
+    fn codex_clear_style_reset_rebinds_before_new_token_count() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-clear-reset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let current_path = sessions_dir.join("current.jsonl");
+        let candidate_path = sessions_dir.join("candidate.jsonl");
+        fs::write(
+            &current_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:15:30.000Z","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"output_tokens":90},"last_token_usage":{"input_tokens":10},"model_context_window":200000}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+
+        let agent = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
+        let mut cache = SessionCache::new();
+        cache.bind_agent_path(&agent, current_path.clone(), Some("session-1".to_string()));
+
+        let selected = select_codex_jsonl_path(&sessions_dir, &agent, &mut cache, 1000).unwrap();
+        assert_eq!(selected, candidate_path);
+
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(sessions_dir);
+    }
+
+    #[test]
+    fn refresh_tracked_codex_details_uses_existing_bound_session_details() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "agentmux-codex-refresh-bound-{}-{}",
             std::process::id(),
@@ -2522,7 +2525,15 @@ mod tests {
         .unwrap();
         fs::write(
             &candidate_path,
-            r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.4","effort":"high"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3,"output_tokens":1},"last_token_usage":{"input_tokens":3},"model_context_window":200000}}}"#
+            ),
         )
         .unwrap();
 
