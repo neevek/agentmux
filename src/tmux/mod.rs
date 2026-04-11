@@ -137,14 +137,6 @@ pub fn sidebar_pid_in_window(window_id: &str) -> Option<u32> {
     })
 }
 
-pub fn is_pane_in_active_window() -> bool {
-    let Some(pane_id) = std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()) else {
-        return true;
-    };
-    tmux_output(&["display-message", "-t", &pane_id, "-p", "#{window_active}"])
-        .is_some_and(|s| s == "1")
-}
-
 pub fn list_window_names(session: &str) -> std::collections::HashMap<String, String> {
     let Some(out) = tmux_output(&[
         "list-windows",
@@ -297,22 +289,41 @@ pub fn pane_window_id(pane_id: &str) -> Option<String> {
     tmux_output(&["display-message", "-t", pane_id, "-p", "#{window_id}"])
 }
 
-pub fn active_pane_in_window(window_id: &str) -> Option<String> {
+pub fn window_focus(window_id: &str) -> (bool, Option<String>) {
     let out = tmux_output(&[
         "list-panes",
         "-t",
         window_id,
         "-F",
-        "#{pane_id}\t#{pane_active}",
-    ])?;
-    out.lines().find_map(|line| {
-        let (pane_id, active) = line.split_once('\t')?;
-        if active == "1" {
-            Some(pane_id.to_string())
-        } else {
-            None
+        "#{window_active}\t#{pane_id}\t#{pane_active}",
+    ]);
+
+    let Some(out) = out else {
+        return (true, None);
+    };
+
+    let mut is_active_window = false;
+    let mut active_pane_id = None;
+    for line in out.lines() {
+        let mut parts = line.split('\t');
+        let Some(window_active) = parts.next() else {
+            continue;
+        };
+        let Some(pane_id) = parts.next() else {
+            continue;
+        };
+        let Some(pane_active) = parts.next() else {
+            continue;
+        };
+        if window_active == "1" {
+            is_active_window = true;
         }
-    })
+        if pane_active == "1" {
+            active_pane_id = Some(pane_id.to_string());
+        }
+    }
+
+    (is_active_window, active_pane_id)
 }
 
 pub fn set_hook(hook_name: &str, cmd: &str) {

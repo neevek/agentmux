@@ -19,6 +19,10 @@ fn default_resumed() -> bool {
     false
 }
 
+fn default_process_elapsed_secs() -> u64 {
+    0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub kind: AgentKind,
@@ -30,6 +34,8 @@ pub struct AgentInfo {
     pub window_name: String,
     pub state: state::AgentState,
     pub elapsed_secs: u64,
+    #[serde(default = "default_process_elapsed_secs")]
+    pub process_elapsed_secs: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub last_activity: Option<String>,
@@ -108,6 +114,7 @@ pub fn scan_agents_fast(session: &str) -> Vec<AgentInfo> {
             window_name,
             state: state::AgentState::Working,
             elapsed_secs: d.elapsed_secs,
+            process_elapsed_secs: d.elapsed_secs,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,
@@ -178,6 +185,7 @@ fn agents_from_detected(
             window_name,
             state: details.state,
             elapsed_secs,
+            process_elapsed_secs: d.elapsed_secs,
             input_tokens: details.input_tokens,
             output_tokens: details.output_tokens,
             last_activity: details.last_activity,
@@ -271,10 +279,24 @@ pub(crate) fn short_model_name(model: &str) -> String {
 }
 
 pub fn refresh_agents_incremental_from_panes(
-    session: &str,
     panes: &[tmux::PaneInfo],
     known_agents: &[AgentInfo],
     cache: &mut SessionCache,
+) -> Option<Vec<AgentInfo>> {
+    let known_pids: Vec<u32> = known_agents
+        .iter()
+        .filter_map(|agent| agent.agent_pid)
+        .collect();
+    let elapsed_by_pid = process::query_process_elapsed(&known_pids);
+
+    refresh_agents_incremental_with_elapsed(panes, known_agents, cache, &elapsed_by_pid)
+}
+
+fn refresh_agents_incremental_with_elapsed(
+    panes: &[tmux::PaneInfo],
+    known_agents: &[AgentInfo],
+    cache: &mut SessionCache,
+    elapsed_by_pid: &HashMap<u32, u64>,
 ) -> Option<Vec<AgentInfo>> {
     let pane_map: HashMap<&str, &tmux::PaneInfo> = panes
         .iter()
@@ -282,21 +304,13 @@ pub fn refresh_agents_incremental_from_panes(
         .map(|pane| (pane.id.as_str(), pane))
         .collect();
 
-    let window_names = tmux::list_window_names(session);
-    let known_pids: Vec<u32> = known_agents
-        .iter()
-        .filter_map(|agent| agent.agent_pid)
-        .collect();
-    let elapsed_by_pid = process::query_process_elapsed(&known_pids);
     let mut refreshed = Vec::new();
 
     for agent in known_agents {
         let Some(pane) = pane_map.get(agent.pane_id.as_str()) else {
             continue;
         };
-        let Some(agent_pid) = agent.agent_pid else {
-            return None;
-        };
+        let agent_pid = agent.agent_pid?;
         let Some(process_elapsed_secs) = elapsed_by_pid.get(&agent_pid).copied() else {
             continue;
         };
@@ -306,10 +320,11 @@ pub fn refresh_agents_incremental_from_panes(
             return None;
         }
 
-        let window_name = window_names
-            .get(&pane.window_id)
-            .cloned()
-            .unwrap_or_else(|| pane.window_index.to_string());
+        let window_name = if agent.window_id == pane.window_id {
+            agent.window_name.clone()
+        } else {
+            pane.window_index.to_string()
+        };
         let cost_usd = details
             .model
             .as_deref()
@@ -333,6 +348,7 @@ pub fn refresh_agents_incremental_from_panes(
             window_name,
             state: details.state,
             elapsed_secs,
+            process_elapsed_secs,
             input_tokens: details.input_tokens,
             output_tokens: details.output_tokens,
             last_activity: details.last_activity,
@@ -412,6 +428,7 @@ mod tests {
             window_name: "main".to_string(),
             state: state::AgentState::Working,
             elapsed_secs: 10,
+            process_elapsed_secs: 10,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,
@@ -443,6 +460,7 @@ mod tests {
             window_name: "main".to_string(),
             state: state::AgentState::Idle,
             elapsed_secs: 10,
+            process_elapsed_secs: 10,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,
@@ -474,6 +492,7 @@ mod tests {
             window_name: "main".to_string(),
             state: state::AgentState::Working,
             elapsed_secs: 10,
+            process_elapsed_secs: 10,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,
@@ -492,5 +511,73 @@ mod tests {
             &agent,
             &state::SessionDetails::default()
         ));
+    }
+
+    fn tracked_agent(kind: AgentKind, pane_id: &str, pid: u32) -> AgentInfo {
+        AgentInfo {
+            kind,
+            agent_pid: Some(pid),
+            pane_id: pane_id.to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: state::AgentState::Working,
+            elapsed_secs: 10,
+            process_elapsed_secs: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: None,
+            jsonl_path: None,
+            resumed: false,
+            details_ready: true,
+        }
+    }
+
+    fn pane(pane_id: &str) -> tmux::PaneInfo {
+        tmux::PaneInfo {
+            id: pane_id.to_string(),
+            window_id: "@1".to_string(),
+            window_index: 1,
+            pid: 1,
+            cwd: "/tmp/project".to_string(),
+            title: "shell".to_string(),
+            current_command: "zsh".to_string(),
+        }
+    }
+
+    #[test]
+    fn incremental_refresh_drops_agent_when_tracked_pid_exits() {
+        let mut cache = SessionCache::new();
+        let refreshed = refresh_agents_incremental_with_elapsed(
+            &[pane("%1")],
+            &[tracked_agent(AgentKind::Codex, "%1", 101)],
+            &mut cache,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(refreshed.is_empty());
+    }
+
+    #[test]
+    fn incremental_refresh_uses_live_process_elapsed() {
+        let mut cache = SessionCache::new();
+        let refreshed = refresh_agents_incremental_with_elapsed(
+            &[pane("%1")],
+            &[tracked_agent(AgentKind::ClaudeCode, "%1", 101)],
+            &mut cache,
+            &HashMap::from([(101, 42)]),
+        )
+        .unwrap();
+
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].process_elapsed_secs, 42);
+        assert_eq!(refreshed[0].elapsed_secs, 42);
     }
 }

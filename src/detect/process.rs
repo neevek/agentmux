@@ -154,7 +154,8 @@ fn comm_matches(comm: &str, pattern: &str) -> bool {
     true
 }
 
-pub fn command_looks_like_agent(comm: &str) -> bool {
+#[cfg(test)]
+fn command_looks_like_agent(comm: &str) -> bool {
     let comm = comm.to_lowercase();
     ALL_AGENTS.iter().any(|agent| {
         agent

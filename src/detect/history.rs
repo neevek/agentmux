@@ -724,6 +724,7 @@ mod tests {
             window_name: "win".to_string(),
             state: AgentState::Working,
             elapsed_secs: 10,
+            process_elapsed_secs: 10,
             input_tokens: parsed.input_tokens,
             output_tokens: parsed.output_tokens,
             last_activity: parsed.last_activity,
