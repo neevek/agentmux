@@ -74,11 +74,6 @@ impl RuntimeStore {
         try_claim_leader(db, std::process::id(), unix_now_ms())
     }
 
-    pub fn seize_leader(&self) -> Option<u64> {
-        let db = self.db.as_ref()?;
-        seize_leader(db, std::process::id(), unix_now_ms())
-    }
-
     pub fn read_lease(&self) -> LeaderLease {
         self.db.as_ref().map(read_leader_lease).unwrap_or_default()
     }
@@ -99,17 +94,6 @@ impl RuntimeStore {
             return;
         };
         release_leader(db, std::process::id(), epoch);
-    }
-
-    pub fn load_snapshot(&mut self, lease: &LeaderLease) -> Option<LiveSnapshot> {
-        let metadata = snapshot_metadata(&self.snapshot_path)?;
-        let snapshot = read_snapshot(&self.snapshot_path)?;
-        if snapshot_matches_lease(&snapshot, lease) {
-            self.last_snapshot_meta = Some(metadata);
-            Some(snapshot)
-        } else {
-            None
-        }
     }
 
     pub fn load_snapshot_for_activation(&mut self) -> Option<LiveSnapshot> {
@@ -294,6 +278,7 @@ fn try_claim_leader(db: &sqlite::Connection, self_pid: u32, now_ms: u64) -> Opti
     Some(new_epoch)
 }
 
+#[cfg(test)]
 fn seize_leader(db: &sqlite::Connection, self_pid: u32, now_ms: u64) -> Option<u64> {
     ensure_runtime_state_table(db);
     db.execute("BEGIN IMMEDIATE").ok()?;

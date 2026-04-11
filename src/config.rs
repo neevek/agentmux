@@ -55,10 +55,10 @@ pub fn read_value(section: &str, key: &str) -> Option<String> {
         if !in_section {
             continue;
         }
-        if let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim() == key {
-                return Some(v.trim().trim_matches('"').to_string());
-            }
+        if let Some((k, v)) = trimmed.split_once('=')
+            && k.trim() == key
+        {
+            return Some(v.trim().trim_matches('"').to_string());
         }
     }
     None
@@ -91,15 +91,14 @@ pub fn write_value(section: &str, key: &str, value: &str) {
             result.push(line.to_string());
             continue;
         }
-        if in_target_section {
-            if let Some((k, _)) = trimmed.split_once('=') {
-                if k.trim() == key {
-                    // Replace existing key
-                    result.push(format!("{key} = {value}"));
-                    key_written = true;
-                    continue;
-                }
-            }
+        if in_target_section
+            && let Some((k, _)) = trimmed.split_once('=')
+            && k.trim() == key
+        {
+            // Replace existing key
+            result.push(format!("{key} = {value}"));
+            key_written = true;
+            continue;
         }
         result.push(line.to_string());
     }

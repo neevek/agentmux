@@ -206,16 +206,16 @@ impl SessionCache {
         session_id: Option<String>,
     ) {
         let key = AgentBindingKey::from(agent);
-        if let Some(owner) = self.path_owners.get(&jsonl_path) {
-            if owner != &key {
-                return;
-            }
+        if let Some(owner) = self.path_owners.get(&jsonl_path)
+            && owner != &key
+        {
+            return;
         }
 
-        if let Some(existing) = self.bindings.get(&key) {
-            if existing.jsonl_path != jsonl_path {
-                self.path_owners.remove(&existing.jsonl_path);
-            }
+        if let Some(existing) = self.bindings.get(&key)
+            && existing.jsonl_path != jsonl_path
+        {
+            self.path_owners.remove(&existing.jsonl_path);
         }
 
         self.path_owners.insert(jsonl_path.clone(), key.clone());
@@ -780,10 +780,10 @@ fn claude_session_start_secs(path: &Path) -> Option<u64> {
         let Ok(entry) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if let Some(ts) = json_str(&entry, &["timestamp"]) {
-            if let Some(secs) = parse_rfc3339_utc_secs(ts) {
-                return Some(secs);
-            }
+        if let Some(ts) = json_str(&entry, &["timestamp"])
+            && let Some(secs) = parse_rfc3339_utc_secs(ts)
+        {
+            return Some(secs);
         }
     }
     // Fallback: file creation time
@@ -963,12 +963,8 @@ fn codex_binding_age_mismatch_secs(
     agent_age_secs: u64,
     now_secs: u64,
 ) -> Option<u64> {
-    let Some(meta) = parse_codex_session_meta(path) else {
-        return None;
-    };
-    let Some(session_cwd) = json_str(&meta, &["payload", "cwd"]) else {
-        return None;
-    };
+    let meta = parse_codex_session_meta(path)?;
+    let session_cwd = json_str(&meta, &["payload", "cwd"])?;
     if !codex_cwds_match(cwd, session_cwd) {
         return None;
     }
@@ -1299,10 +1295,10 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
 
     for entry in &entries {
         // Extract sessionId from any entry that has it (typically the first)
-        if session_id.is_none() {
-            if let Some(sid) = json_str(entry, &["sessionId"]) {
-                session_id = Some(sid.to_string());
-            }
+        if session_id.is_none()
+            && let Some(sid) = json_str(entry, &["sessionId"])
+        {
+            session_id = Some(sid.to_string());
         }
         let Some(msg) = entry.get("message") else {
             continue;
@@ -1426,10 +1422,10 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
 
     for entry in &entries {
         // Extract session id from session_meta entry
-        if session_id.is_none() {
-            if json_str(entry, &["type"]) == Some("session_meta") {
-                session_id = json_str(entry, &["payload", "id"]).map(|s| s.to_string());
-            }
+        if session_id.is_none()
+            && json_str(entry, &["type"]) == Some("session_meta")
+        {
+            session_id = json_str(entry, &["payload", "id"]).map(|s| s.to_string());
         }
         match json_str(entry, &["type"]) {
             Some("turn_context") => {
@@ -1578,10 +1574,10 @@ pub(crate) fn extract_claude_session_id(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     for line in std::io::BufRead::lines(reader).take(10).flatten() {
-        if let Ok(val) = serde_json::from_str::<Value>(&line) {
-            if let Some(sid) = json_str(&val, &["sessionId"]) {
-                return Some(sid.to_string());
-            }
+        if let Ok(val) = serde_json::from_str::<Value>(&line)
+            && let Some(sid) = json_str(&val, &["sessionId"])
+        {
+            return Some(sid.to_string());
         }
     }
     // Fallback: filename stem (typically a UUID)
@@ -1589,10 +1585,10 @@ pub(crate) fn extract_claude_session_id(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn extract_codex_session_id(path: &Path) -> Option<String> {
-    if let Some(meta) = parse_codex_session_meta(path) {
-        if let Some(id) = json_str(&meta, &["payload", "id"]) {
-            return Some(id.to_string());
-        }
+    if let Some(meta) = parse_codex_session_meta(path)
+        && let Some(id) = json_str(&meta, &["payload", "id"])
+    {
+        return Some(id.to_string());
     }
     path.file_stem()?.to_str().map(|s| s.to_string())
 }
@@ -2280,6 +2276,7 @@ mod tests {
             window_name: "win".to_string(),
             state: AgentState::Working,
             elapsed_secs: 0,
+            process_elapsed_secs: 0,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,

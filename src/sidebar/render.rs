@@ -9,7 +9,7 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 
 // Colors
-const GREEN: &str = "\x1b[38;2;166;227;161m";
+const GREEN: &str = "\x1b[38;2;0;255;0m";
 const GRAY: &str = "\x1b[38;2;127;132;156m";
 const WHITE: &str = "\x1b[38;2;205;214;244m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
@@ -64,17 +64,28 @@ pub fn visible_item_count(
     count
 }
 
+pub struct RenderOptions<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub selected: Option<usize>,
+    pub scroll_offset: usize,
+    pub unseen_done: &'a HashSet<String>,
+    pub expanded: bool,
+    pub header_selected: bool,
+}
+
 pub fn render_sidebar(
     agents: &[AgentInfo],
-    width: u32,
-    height: u32,
-    selected: Option<usize>,
-    scroll_offset: usize,
-    unseen_done: &HashSet<String>,
     stats: &AggregatedStats,
-    expanded: bool,
-    header_selected: bool,
+    opts: RenderOptions<'_>,
 ) -> String {
+    let width = opts.width;
+    let height = opts.height;
+    let selected = opts.selected;
+    let scroll_offset = opts.scroll_offset;
+    let unseen_done = opts.unseen_done;
+    let expanded = opts.expanded;
+    let header_selected = opts.header_selected;
     let w = width as usize;
     let mut buf = String::new();
     let mut row: u32 = 1;
@@ -194,9 +205,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            &format!("{PEACH}{BOLD}Claude{RESET}"),
-            6,
-            "Daily",
+            StatsRowLabel {
+                name_colored: &format!("{PEACH}{BOLD}Claude{RESET}"),
+                name_plain_len: 6,
+                period: "Daily",
+            },
             &stats.claude.today,
         );
         emit_table(
@@ -212,9 +225,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            "",
-            0,
-            "Weekly",
+            StatsRowLabel {
+                name_colored: "",
+                name_plain_len: 0,
+                period: "Weekly",
+            },
             &stats.claude.seven_days,
         );
         emit_table(
@@ -230,9 +245,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            "",
-            0,
-            "Total",
+            StatsRowLabel {
+                name_colored: "",
+                name_plain_len: 0,
+                period: "Total",
+            },
             &stats.claude.total,
         );
         emit_table(
@@ -248,9 +265,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            &format!("{BLUE}{BOLD}Codex{RESET}"),
-            5,
-            "Daily",
+            StatsRowLabel {
+                name_colored: &format!("{BLUE}{BOLD}Codex{RESET}"),
+                name_plain_len: 5,
+                period: "Daily",
+            },
             &stats.codex.today,
         );
         emit_table(
@@ -266,9 +285,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            "",
-            0,
-            "Weekly",
+            StatsRowLabel {
+                name_colored: "",
+                name_plain_len: 0,
+                period: "Weekly",
+            },
             &stats.codex.seven_days,
         );
         emit_table(
@@ -284,9 +305,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            "",
-            0,
-            "Total",
+            StatsRowLabel {
+                name_colored: "",
+                name_plain_len: 0,
+                period: "Total",
+            },
             &stats.codex.total,
         );
     } else {
@@ -296,9 +319,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            &format!("{PEACH}{BOLD}Claude{RESET}"),
-            6,
-            "Daily",
+            StatsRowLabel {
+                name_colored: &format!("{PEACH}{BOLD}Claude{RESET}"),
+                name_plain_len: 6,
+                period: "Daily",
+            },
             &stats.claude.today,
         );
         emit_table(
@@ -314,9 +339,11 @@ pub fn render_sidebar(
             table_bg,
             emit_table,
             &cw,
-            &format!("{BLUE}{BOLD}Codex{RESET}"),
-            5,
-            "Daily",
+            StatsRowLabel {
+                name_colored: &format!("{BLUE}{BOLD}Codex{RESET}"),
+                name_plain_len: 5,
+                period: "Daily",
+            },
             &stats.codex.today,
         );
     }
@@ -464,15 +491,19 @@ pub fn render_sidebar(
     buf
 }
 
+struct StatsRowLabel<'a> {
+    name_colored: &'a str,
+    name_plain_len: usize,
+    period: &'a str,
+}
+
 fn emit_stats_row(
     buf: &mut String,
     row: u32,
     bg: &str,
     emit: fn(&mut String, u32, &str, &str),
     cw: &[usize; 6],
-    name_colored: &str,
-    name_plain_len: usize,
-    period: &str,
+    label: StatsRowLabel<'_>,
     totals: &AgentTotals,
 ) -> u32 {
     let cost_str = format_cost(totals.cost_usd);
@@ -484,16 +515,16 @@ fn emit_stats_row(
     let data_color = WHITE;
 
     // Col 0: name (left-aligned, 1 char padding)
-    let name_cell = if name_plain_len > 0 {
-        let pad = cw[0].saturating_sub(name_plain_len + 1);
-        format!(" {name_colored}{RESET}{bg}{}", " ".repeat(pad))
+    let name_cell = if label.name_plain_len > 0 {
+        let pad = cw[0].saturating_sub(label.name_plain_len + 1);
+        format!(" {}{RESET}{bg}{}", label.name_colored, " ".repeat(pad))
     } else {
         format!("{bg}{}", " ".repeat(cw[0]))
     };
 
     // Col 1: period (left-aligned, 1 char padding)
-    let period_pad = cw[1].saturating_sub(period.len() + 1);
-    let period_cell = format!(" {DIM}{period}{RESET}{bg}{}", " ".repeat(period_pad));
+    let period_pad = cw[1].saturating_sub(label.period.len() + 1);
+    let period_cell = format!(" {DIM}{}{RESET}{bg}{}", label.period, " ".repeat(period_pad));
 
     // Col 2: input tokens (left-aligned, 1 char padding)
     let in_pad = cw[2].saturating_sub(in_str.len() + 1);
@@ -644,6 +675,7 @@ mod tests {
             window_name: "main".to_string(),
             state: AgentState::Working,
             elapsed_secs: 61,
+            process_elapsed_secs: 61,
             input_tokens: 1_000,
             output_tokens: 200,
             last_activity: Some("exec_command cargo test".to_string()),
@@ -746,14 +778,16 @@ mod tests {
     fn render_orders_metadata_before_dir_and_prefixes_state_line() {
         let rendered = render_sidebar(
             &[sample_agent()],
-            100,
-            30,
-            Some(0),
-            0,
-            &HashSet::new(),
             &AggregatedStats::default(),
-            false,
-            false,
+            RenderOptions {
+                width: 100,
+                height: 30,
+                selected: Some(0),
+                scroll_offset: 0,
+                unseen_done: &HashSet::new(),
+                expanded: false,
+                header_selected: false,
+            },
         );
         let rows = rendered_rows(&rendered);
         let model_row = rows
@@ -790,14 +824,16 @@ mod tests {
 
         let rendered = render_sidebar(
             &[agent],
-            100,
-            30,
-            Some(0),
-            0,
-            &HashSet::new(),
             &AggregatedStats::default(),
-            false,
-            false,
+            RenderOptions {
+                width: 100,
+                height: 30,
+                selected: Some(0),
+                scroll_offset: 0,
+                unseen_done: &HashSet::new(),
+                expanded: false,
+                header_selected: false,
+            },
         );
         let rows = rendered_rows(&rendered);
         let dir_row = rows
@@ -827,14 +863,16 @@ mod tests {
 
         let rendered = render_sidebar(
             &[agent],
-            100,
-            30,
-            Some(0),
-            0,
-            &HashSet::new(),
             &AggregatedStats::default(),
-            false,
-            false,
+            RenderOptions {
+                width: 100,
+                height: 30,
+                selected: Some(0),
+                scroll_offset: 0,
+                unseen_done: &HashSet::new(),
+                expanded: false,
+                header_selected: false,
+            },
         );
 
         assert!(strip_ansi(&rendered).contains("●  idle"));
@@ -848,14 +886,16 @@ mod tests {
 
         let rendered = render_sidebar(
             &[agent],
-            100,
-            30,
-            Some(0),
-            0,
-            &HashSet::new(),
             &AggregatedStats::default(),
-            false,
-            false,
+            RenderOptions {
+                width: 100,
+                height: 30,
+                selected: Some(0),
+                scroll_offset: 0,
+                unseen_done: &HashSet::new(),
+                expanded: false,
+                header_selected: false,
+            },
         );
         let rows = rendered_rows(&rendered);
         let dir_row = rows
@@ -881,14 +921,16 @@ mod tests {
 
         let rendered = render_sidebar(
             &[agent],
-            100,
-            30,
-            Some(0),
-            0,
-            &HashSet::new(),
             &AggregatedStats::default(),
-            false,
-            false,
+            RenderOptions {
+                width: 100,
+                height: 30,
+                selected: Some(0),
+                scroll_offset: 0,
+                unseen_done: &HashSet::new(),
+                expanded: false,
+                header_selected: false,
+            },
         );
 
         assert!(!strip_ansi(&rendered).contains("effort: medium"));
@@ -898,14 +940,16 @@ mod tests {
     fn render_does_not_highlight_any_item_when_selection_is_none() {
         let rendered = render_sidebar(
             &[sample_agent()],
-            100,
-            30,
-            None,
-            0,
-            &HashSet::new(),
             &AggregatedStats::default(),
-            false,
-            false,
+            RenderOptions {
+                width: 100,
+                height: 30,
+                selected: None,
+                scroll_offset: 0,
+                unseen_done: &HashSet::new(),
+                expanded: false,
+                header_selected: false,
+            },
         );
 
         assert!(!rendered.contains(SEL_BG));

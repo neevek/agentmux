@@ -23,6 +23,7 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
 extern "C" fn winch_handler(_sig: libc::c_int) {}
 
 const INPUT_POLL_MS: u64 = 1000;
+const FOCUS_POLL_MS: u64 = 250;
 const WIDTH_SAVE_THROTTLE_MS: u64 = 50;
 const DISCOVERY_SWEEP_MS: u64 = 15_000;
 
@@ -64,7 +65,6 @@ enum SidebarRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneFingerprint {
     pid: u32,
-    title: String,
     current_command: String,
     cwd: String,
 }
@@ -80,7 +80,6 @@ enum Selection {
 fn pane_fingerprint(pane: &tmux::PaneInfo) -> PaneFingerprint {
     PaneFingerprint {
         pid: pane.pid,
-        title: pane.title.clone(),
         current_command: pane.current_command.clone(),
         cwd: pane.cwd.clone(),
     }
@@ -130,27 +129,58 @@ fn selection_index(selection: &Selection, agents: &[AgentInfo]) -> Option<usize>
     }
 }
 
+fn next_input_poll_timeout(focus_poll_elapsed: Duration) -> Duration {
+    let input_timeout = Duration::from_millis(INPUT_POLL_MS);
+    let focus_timeout = Duration::from_millis(FOCUS_POLL_MS);
+
+    if focus_poll_elapsed >= focus_timeout {
+        Duration::ZERO
+    } else {
+        (focus_timeout - focus_poll_elapsed).min(input_timeout)
+    }
+}
+
 fn sync_selection_from_focus(
     selection: &mut Selection,
+    last_focused_agent_pane_id: &mut Option<String>,
     is_active_window: bool,
     active_pane_id: Option<&str>,
     sidebar_pane_id: &str,
+    sidebar_window_id: &str,
     agents: &[AgentInfo],
 ) -> bool {
+    let last_focused_agent = last_focused_agent_pane_id
+        .as_deref()
+        .filter(|pane_id| agents.iter().any(|agent| agent.pane_id == **pane_id))
+        .map(str::to_string);
+    if last_focused_agent.is_none() {
+        *last_focused_agent_pane_id = None;
+    }
+    let sole_sidebar_window_agent = if last_focused_agent.is_none() {
+        let mut agents_in_window = agents
+            .iter()
+            .filter(|agent| agent.window_id == sidebar_window_id);
+        let first = agents_in_window.next();
+        if agents_in_window.next().is_none() {
+            first
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let next = if !is_active_window {
         Selection::None
     } else if let Some(pane_id) = active_pane_id {
         if agents.iter().any(|agent| agent.pane_id == pane_id) {
+            *last_focused_agent_pane_id = Some(pane_id.to_string());
             Selection::Agent(pane_id.to_string())
         } else if pane_id == sidebar_pane_id {
-            match selection {
-                Selection::Header => Selection::Header,
-                Selection::Agent(selected_pane)
-                    if agents.iter().any(|agent| agent.pane_id == *selected_pane) =>
-                {
-                    Selection::Agent(selected_pane.clone())
-                }
-                Selection::None | Selection::Agent(_) => Selection::None,
+            match (&*selection, last_focused_agent.as_deref(), sole_sidebar_window_agent) {
+                (Selection::Header, _, _) => Selection::Header,
+                (_, Some(pane_id), _) => Selection::Agent(pane_id.to_string()),
+                (_, None, Some(agent)) => Selection::Agent(agent.pane_id.clone()),
+                _ => Selection::None,
             }
         } else {
             Selection::None
@@ -220,6 +250,7 @@ fn activate_agent(agent: &AgentInfo, unseen_done: &mut HashSet<String>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::detect::process::AgentKind;
@@ -246,6 +277,7 @@ mod tests {
             window_name: "main".to_string(),
             state: AgentState::Working,
             elapsed_secs: 1,
+            process_elapsed_secs: 1,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,
@@ -273,24 +305,76 @@ mod tests {
     }
 
     #[test]
+    fn suspect_panes_ignore_title_only_changes() {
+        let tracked = pane("%1", 100, "shell", "zsh");
+        let previous = HashMap::from([("%1".to_string(), pane_fingerprint(&tracked))]);
+        let retitled = pane("%1", 100, "spinner update", "zsh");
+        let tracked_panes = HashSet::from(["%1"]);
+
+        let suspect = suspect_pane_ids(&[retitled], &previous, &tracked_panes, false);
+        assert!(suspect.is_empty());
+    }
+
+    #[test]
     fn sync_selection_tracks_focused_agent_pane() {
         let mut selection = Selection::None;
+        let mut last_focused_agent_pane_id = None;
         let agents = vec![agent("%2"), agent("%3")];
 
-        let changed =
-            sync_selection_from_focus(&mut selection, true, Some("%3"), "%sidebar", &agents);
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%3"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
 
         assert!(changed);
         assert_eq!(selection, Selection::Agent("%3".to_string()));
+        assert_eq!(last_focused_agent_pane_id.as_deref(), Some("%3"));
+    }
+
+    #[test]
+    fn next_input_poll_timeout_wakes_immediately_when_focus_refresh_is_due() {
+        assert_eq!(
+            next_input_poll_timeout(Duration::from_millis(FOCUS_POLL_MS)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            next_input_poll_timeout(Duration::from_millis(FOCUS_POLL_MS + 10)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn next_input_poll_timeout_caps_sleep_to_remaining_focus_deadline() {
+        assert_eq!(
+            next_input_poll_timeout(Duration::from_millis(0)),
+            Duration::from_millis(FOCUS_POLL_MS)
+        );
+        assert_eq!(
+            next_input_poll_timeout(Duration::from_millis(100)),
+            Duration::from_millis(FOCUS_POLL_MS - 100)
+        );
     }
 
     #[test]
     fn sync_selection_clears_when_focus_leaves_sidebar_and_agents() {
         let mut selection = Selection::Agent("%2".to_string());
+        let mut last_focused_agent_pane_id = Some("%2".to_string());
         let agents = vec![agent("%2"), agent("%3")];
 
-        let changed =
-            sync_selection_from_focus(&mut selection, true, Some("%9"), "%sidebar", &agents);
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%9"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
 
         assert!(changed);
         assert_eq!(selection, Selection::None);
@@ -299,24 +383,133 @@ mod tests {
     #[test]
     fn sync_selection_clears_header_when_sidebar_window_loses_focus() {
         let mut selection = Selection::Header;
+        let mut last_focused_agent_pane_id = None;
 
-        let changed =
-            sync_selection_from_focus(&mut selection, false, Some("%sidebar"), "%sidebar", &[]);
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            false,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &[],
+        );
 
         assert!(changed);
         assert_eq!(selection, Selection::None);
     }
 
     #[test]
-    fn sync_selection_preserves_sidebar_local_agent_selection() {
-        let mut selection = Selection::Agent("%2".to_string());
+    fn sync_selection_prefers_last_focused_when_sidebar_is_active() {
+        let mut selection = Selection::Agent("%3".to_string());
+        let mut last_focused_agent_pane_id = Some("%2".to_string());
+        let mut first = agent("%3");
+        first.state = AgentState::Working;
+        let mut second = agent("%2");
+        second.state = AgentState::Idle;
+        let agents = vec![first, second];
+
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
+
+        assert!(changed);
+        assert_eq!(selection, Selection::Agent("%2".to_string()));
+    }
+
+    #[test]
+    fn sync_selection_clears_stale_last_focused_agent_when_sidebar_is_active() {
+        let mut selection = Selection::Agent("%3".to_string());
+        let mut last_focused_agent_pane_id = Some("%9".to_string());
+        let mut idle = agent("%2");
+        idle.state = AgentState::Idle;
+        let mut second = agent("%3");
+        second.window_id = "@2".to_string();
+        let agents = vec![idle, second];
+
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
+
+        assert!(changed);
+        assert_eq!(selection, Selection::Agent("%2".to_string()));
+        assert_eq!(last_focused_agent_pane_id, None);
+    }
+
+    #[test]
+    fn sync_selection_uses_sole_sidebar_window_agent_without_focus_history() {
+        let mut selection = Selection::None;
+        let mut last_focused_agent_pane_id = None;
+        let agents = vec![agent("%2")];
+
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
+
+        assert!(changed);
+        assert_eq!(selection, Selection::Agent("%2".to_string()));
+    }
+
+    #[test]
+    fn sync_selection_falls_back_to_last_focused_when_no_working_agent_exists() {
+        let mut selection = Selection::Agent("%3".to_string());
+        let mut last_focused_agent_pane_id = Some("%2".to_string());
+        let mut first = agent("%2");
+        first.state = AgentState::Idle;
+        let mut second = agent("%3");
+        second.state = AgentState::Idle;
+        let agents = vec![first, second];
+
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
+
+        assert!(changed);
+        assert_eq!(selection, Selection::Agent("%2".to_string()));
+    }
+
+    #[test]
+    fn sync_selection_preserves_header_when_sidebar_is_active() {
+        let mut selection = Selection::Header;
+        let mut last_focused_agent_pane_id = Some("%2".to_string());
         let agents = vec![agent("%2"), agent("%3")];
 
-        let changed =
-            sync_selection_from_focus(&mut selection, true, Some("%sidebar"), "%sidebar", &agents);
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused_agent_pane_id,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
 
         assert!(!changed);
-        assert_eq!(selection, Selection::Agent("%2".to_string()));
+        assert_eq!(selection, Selection::Header);
     }
 }
 
@@ -370,6 +563,10 @@ pub fn run() {
         .or_else(tmux::current_window_id)
         .unwrap_or_default();
     let mut last_active = false;
+    let mut last_focus_poll = Instant::now() - Duration::from_millis(FOCUS_POLL_MS);
+    let mut cached_focus_is_active = true;
+    let mut cached_active_pane_id: Option<String> = None;
+    let mut last_focused_agent_pane_id = None;
     let mut selection = Selection::None;
     let mut scroll_offset = 0usize;
     let mut last_width = 0u32;
@@ -390,7 +587,17 @@ pub fn run() {
             break;
         }
 
-        let is_active = tmux::is_pane_in_active_window();
+        if sidebar_window_id.is_empty() {
+            cached_focus_is_active = true;
+            cached_active_pane_id = None;
+        } else if last_focus_poll.elapsed() >= Duration::from_millis(FOCUS_POLL_MS) {
+            let (is_active, active_pane_id) = tmux::window_focus(&sidebar_window_id);
+            cached_focus_is_active = is_active;
+            cached_active_pane_id = active_pane_id;
+            last_focus_poll = Instant::now();
+        }
+        let is_active = cached_focus_is_active;
+        let active_pane_id = cached_active_pane_id.as_deref();
         if is_active != last_active {
             if !is_active {
                 if !matches!(role, SidebarRole::Leader { .. }) {
@@ -411,17 +618,13 @@ pub fn run() {
             needs_render = true;
         }
 
-        let active_pane_id = if is_active && !sidebar_window_id.is_empty() {
-            tmux::active_pane_in_window(&sidebar_window_id)
-        } else {
-            None
-        };
-
         if sync_selection_from_focus(
             &mut selection,
+            &mut last_focused_agent_pane_id,
             is_active,
-            active_pane_id.as_deref(),
+            active_pane_id,
             &sidebar_pane_id,
+            &sidebar_window_id,
             &cached_agents,
         ) {
             needs_render = true;
@@ -575,21 +778,29 @@ pub fn run() {
                 "{}",
                 render::render_sidebar(
                     &cached_agents,
-                    width,
-                    height,
-                    selected_idx,
-                    scroll_offset,
-                    &unseen_done,
                     &current_stats,
-                    header_expanded,
-                    header_selected,
+                    render::RenderOptions {
+                        width,
+                        height,
+                        selected: selected_idx,
+                        scroll_offset,
+                        unseen_done: &unseen_done,
+                        expanded: header_expanded,
+                        header_selected,
+                    },
                 )
             );
             flush();
             needs_render = false;
         }
 
-        match input::poll_input(Duration::from_millis(INPUT_POLL_MS)) {
+        let input_timeout = if sidebar_window_id.is_empty() {
+            Duration::from_millis(INPUT_POLL_MS)
+        } else {
+            next_input_poll_timeout(last_focus_poll.elapsed())
+        };
+
+        match input::poll_input(input_timeout) {
             input::InputEvent::KeyUp if is_active => {
                 let next_selection = move_selection_up(&selection, &cached_agents);
                 if next_selection != selection {
@@ -746,14 +957,17 @@ fn refresh_leader_state(
     let force_sweep = last_discovery_sweep.elapsed() >= Duration::from_millis(DISCOVERY_SWEEP_MS);
     let suspect_ids = suspect_pane_ids(&panes, pane_fingerprints, &tracked_panes, force_sweep);
 
-    let mut agents = if let Some(agents) =
-        detect::refresh_agents_incremental_from_panes(session, &panes, cached_agents, detect_cache)
-    {
-        agents
-    } else {
-        *last_discovery_sweep = Instant::now();
-        let agents = detect::scan_agents(session, detect_cache);
-        update_pane_fingerprints(pane_fingerprints, &panes);
+    let mut agents =
+        if let Some(agents) = detect::refresh_agents_incremental_from_panes(
+            &panes,
+            cached_agents,
+            detect_cache,
+        ) {
+            agents
+        } else {
+            *last_discovery_sweep = Instant::now();
+            let agents = detect::scan_agents(session, detect_cache);
+            update_pane_fingerprints(pane_fingerprints, &panes);
         let stats = history.aggregated_stats(&agents);
         runtime_store.publish_snapshot(epoch, &agents, &stats);
         apply_agents_update(prev_states, unseen_done, &agents);

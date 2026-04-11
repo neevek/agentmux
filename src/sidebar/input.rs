@@ -154,6 +154,7 @@ mod tests {
             window_name: "main".to_string(),
             state: AgentState::Working,
             elapsed_secs: 1,
+            process_elapsed_secs: 1,
             input_tokens: 0,
             output_tokens: 0,
             last_activity: None,
