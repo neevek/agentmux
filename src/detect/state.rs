@@ -275,17 +275,7 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
     };
     let encoded = encode_project_dir(&agent.cwd);
     let projects_dir = home.join(".claude").join("projects").join(&encoded);
-    let jsonl_path = cache
-        .bound_path_for_agent(agent, extract_claude_session_id)
-        .or_else(|| {
-            let claimed_paths = cache.claimed_paths_for_agent(agent);
-            find_claude_jsonl_for_cwd(
-                &projects_dir,
-                agent.elapsed_secs,
-                agent.resumed,
-                &claimed_paths,
-            )
-        });
+    let jsonl_path = select_claude_jsonl_path(&projects_dir, agent, cache, unix_now_secs());
     let details = agent_details(
         jsonl_path.as_deref(),
         agent.elapsed_secs,
@@ -366,14 +356,21 @@ pub fn refresh_tracked_details(
     cache: &mut SessionCache,
 ) -> SessionDetails {
     match agent.kind {
-        AgentKind::ClaudeCode => refresh_bound_details(
-            AgentKind::ClaudeCode,
-            agent.jsonl_path.as_deref(),
-            agent.session_id.as_deref(),
-            process_elapsed_secs,
-            agent.resumed,
-            cache,
-        ),
+        AgentKind::ClaudeCode => {
+            let detected = DetectedAgent {
+                kind: AgentKind::ClaudeCode,
+                pane_id: agent.pane_id.clone(),
+                cwd: agent.cwd.clone(),
+                window_id: agent.window_id.clone(),
+                window_index: 0,
+                agent_pid: agent.agent_pid.unwrap_or_default(),
+                resumed: agent.resumed,
+                elapsed_secs: process_elapsed_secs,
+            };
+            // Re-run Claude binding selection each refresh so /clear-style resets
+            // can move the pane to a newer session file instead of pinning stale stats.
+            claude_code_details(&detected, cache)
+        }
         AgentKind::Codex => {
             let detected = DetectedAgent {
                 kind: AgentKind::Codex,
@@ -390,6 +387,24 @@ pub fn refresh_tracked_details(
             codex_details(&detected, cache)
         }
     }
+}
+
+fn select_claude_jsonl_path(
+    projects_dir: &Path,
+    agent: &DetectedAgent,
+    cache: &mut SessionCache,
+    now_secs: u64,
+) -> Option<PathBuf> {
+    let current_path = cache.bound_path_for_agent(agent, extract_claude_session_id);
+    let claimed_paths = cache.claimed_paths_for_agent(agent);
+    find_claude_jsonl_for_cwd_at(
+        projects_dir,
+        agent.elapsed_secs,
+        agent.resumed,
+        &claimed_paths,
+        now_secs,
+    )
+    .or(current_path)
 }
 
 fn select_codex_jsonl_path(
@@ -653,21 +668,6 @@ pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let p = home.join(".codex").join("sessions");
     if p.is_dir() { Some(p) } else { None }
-}
-
-fn find_claude_jsonl_for_cwd(
-    projects_dir: &Path,
-    agent_age_secs: u64,
-    resumed: bool,
-    used_paths: &[PathBuf],
-) -> Option<PathBuf> {
-    find_claude_jsonl_for_cwd_at(
-        projects_dir,
-        agent_age_secs,
-        resumed,
-        used_paths,
-        unix_now_secs(),
-    )
 }
 
 fn find_claude_jsonl_for_cwd_at(
@@ -2175,6 +2175,50 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_switches_live_bound_path_to_newer_candidate() {
+        let projects_dir = std::env::temp_dir().join(format!(
+            "agentmux-claude-live-switch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        let now = unix_now_secs();
+        let current_path = projects_dir.join("current.jsonl");
+        let candidate_path = projects_dir.join("candidate.jsonl");
+        fs::write(
+            &current_path,
+            format!(
+                r#"{{"type":"user","sessionId":"session-1","timestamp":"{}","message":{{"role":"user","content":"old"}}}}"#,
+                fmt_rfc3339(now - 200)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            format!(
+                r#"{{"type":"user","sessionId":"session-2","timestamp":"{}","message":{{"role":"user","content":"new"}}}}"#,
+                fmt_rfc3339(now - 120)
+            ),
+        )
+        .unwrap();
+
+        let agent = detected_agent(AgentKind::ClaudeCode, "%1", 101, "/tmp/project", 120);
+        let mut cache = SessionCache::new();
+        cache.bind_agent_path(&agent, current_path.clone(), Some("session-1".to_string()));
+
+        let selected = select_claude_jsonl_path(&projects_dir, &agent, &mut cache, now).unwrap();
+        assert_eq!(selected, candidate_path);
+
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(projects_dir);
     }
 
     fn fmt_rfc3339(epoch_secs: u64) -> String {
