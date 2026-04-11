@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::tmux::PaneInfo;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     ClaudeCode,
     Codex,
@@ -42,6 +42,7 @@ pub struct DetectedAgent {
     pub cwd: String,
     pub window_id: String,
     pub window_index: u32,
+    pub agent_pid: u32,
     /// Elapsed seconds of the matched agent process
     pub elapsed_secs: u64,
 }
@@ -147,12 +148,7 @@ fn comm_matches(comm: &str, pattern: &str) -> bool {
 
 /// Walk child processes up to 3 levels deep looking for agent patterns.
 /// Returns the matched child pid if found.
-fn match_process_tree(
-    pid: u32,
-    patterns: &[&str],
-    tree: &ProcessTree,
-    depth: u32,
-) -> Option<u32> {
+fn match_process_tree(pid: u32, patterns: &[&str], tree: &ProcessTree, depth: u32) -> Option<u32> {
     if depth > 4 {
         return None;
     }
@@ -192,6 +188,7 @@ pub fn scan_panes_for_agents(panes: &[PaneInfo], sidebar_title: &str) -> Vec<Det
                     cwd: pane.cwd.clone(),
                     window_id: pane.window_id.clone(),
                     window_index: pane.window_index,
+                    agent_pid: matched_pid,
                     elapsed_secs,
                 });
                 break;

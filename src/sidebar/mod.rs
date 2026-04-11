@@ -3,6 +3,8 @@ pub mod render;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::detect;
@@ -78,22 +80,31 @@ pub fn run() {
         libc::signal(libc::SIGTERM, exit_h);
         libc::signal(libc::SIGINT, exit_h);
         libc::signal(libc::SIGHUP, exit_h);
-        libc::signal(libc::SIGWINCH, winch_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGWINCH,
+            winch_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let _guard = terminal_setup();
 
     let mut prev_states: HashMap<String, AgentState> = HashMap::new();
     let mut unseen_done: HashSet<String> = HashSet::new();
-    let mut session_cache = detect::SessionCache::new();
-    let mut cached_agents: Vec<AgentInfo> = Vec::new();
+    let mut cached_agents: Vec<AgentInfo> = detect::scan_agents_fast(&session);
+    let scan_results: Arc<Mutex<Option<Vec<AgentInfo>>>> = Arc::new(Mutex::new(None));
+    let scan_results_bg = Arc::clone(&scan_results);
+    let session_bg = session.clone();
+    thread::spawn(move || {
+        let mut session_cache = detect::SessionCache::new();
+        while !SHOULD_EXIT.load(Ordering::Relaxed) {
+            let agents = detect::scan_agents(&session_bg, &mut session_cache);
+            *scan_results_bg.lock().unwrap() = Some(agents);
+            thread::sleep(Duration::from_millis(SCAN_INTERVAL_MS));
+        }
+    });
     let mut last_selected_pane = String::new();
     let mut scroll_offset: usize = 0;
     let mut last_width: u32 = 0;
-    let scan_interval = Duration::from_millis(SCAN_INTERVAL_MS);
-    let mut last_scan = Instant::now()
-        .checked_sub(scan_interval)
-        .unwrap_or_else(Instant::now);
     let mut last_width_save = Instant::now();
     let mut needs_render = true;
 
@@ -120,9 +131,7 @@ pub fn run() {
             needs_render = true;
         }
 
-        if is_active && last_scan.elapsed() >= scan_interval {
-            let agents = detect::scan_agents(&session, &mut session_cache);
-
+        if let Some(agents) = scan_results.lock().unwrap().take() {
             for agent in &agents {
                 if prev_states.get(&agent.pane_id).is_some_and(|&prev| {
                     prev == AgentState::Working && agent.state == AgentState::Idle
@@ -144,7 +153,6 @@ pub fn run() {
             }
 
             cached_agents = agents;
-            last_scan = Instant::now();
             needs_render = true;
         }
 
@@ -219,9 +227,7 @@ pub fn run() {
         }
 
         if is_active {
-            let elapsed_ms = last_scan.elapsed().as_millis() as u64;
-            let remaining = SCAN_INTERVAL_MS.saturating_sub(elapsed_ms).max(50);
-            match input::poll_input(Duration::from_millis(remaining)) {
+            match input::poll_input(Duration::from_millis(IDLE_CHECK_MS)) {
                 input::InputEvent::KeyUp => {
                     if header_selected {
                         // Already at top, no-op
@@ -274,8 +280,8 @@ pub fn run() {
                         needs_render = true;
                     } else if let Some(agent) = cached_agents.get(selected_idx) {
                         unseen_done.remove(&agent.pane_id);
-                        let in_current_window = tmux::current_window_id()
-                            .is_some_and(|cw| cw == agent.window_id);
+                        let in_current_window =
+                            tmux::current_window_id().is_some_and(|cw| cw == agent.window_id);
                         if !in_current_window {
                             tmux::select_window(&agent.window_id);
                             tmux::select_pane(&agent.pane_id);
@@ -297,8 +303,8 @@ pub fn run() {
                         header_selected = false;
                         tmux::set_selected_pane(&agent.pane_id);
                         unseen_done.remove(&agent.pane_id);
-                        let in_current_window = tmux::current_window_id()
-                            .is_some_and(|cw| cw == agent.window_id);
+                        let in_current_window =
+                            tmux::current_window_id().is_some_and(|cw| cw == agent.window_id);
                         if !in_current_window {
                             tmux::select_window(&agent.window_id);
                             tmux::select_pane(&agent.pane_id);

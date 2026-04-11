@@ -16,7 +16,8 @@ pub struct PaneInfo {
     pub title: String,
 }
 
-const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}";
+const PANE_FORMAT: &str =
+    "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}";
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let parts: Vec<&str> = line.split('\t').collect();
@@ -46,8 +47,7 @@ pub fn get_sidebar_width() -> u32 {
     crate::config::read_value("core", "width")
         .and_then(|v| v.parse().ok())
         .or_else(|| {
-            tmux_output(&["show-option", "-gqv", WIDTH_OPTION])
-                .and_then(|s| s.parse().ok())
+            tmux_output(&["show-option", "-gqv", WIDTH_OPTION]).and_then(|s| s.parse().ok())
         })
         .unwrap_or(DEFAULT_WIDTH)
 }
@@ -145,7 +145,9 @@ pub fn create_sidebar_in(window_id: &str, cmd: &str) -> Option<String> {
                 out.lines()
                     .filter_map(|line| {
                         let p: Vec<&str> = line.split('\t').collect();
-                        if p.len() < 3 { return None; }
+                        if p.len() < 3 {
+                            return None;
+                        }
                         let left: u32 = p[1].parse().ok()?;
                         if left > 0 {
                             Some((p[0].to_string(), p[2].to_string()))
@@ -204,11 +206,7 @@ fn find_split_target(window_id: &str) -> Option<(String, bool)> {
             if p.len() < 3 {
                 return None;
             }
-            Some((
-                p[0].to_string(),
-                p[1].parse().ok()?,
-                p[2].parse().ok()?,
-            ))
+            Some((p[0].to_string(), p[1].parse().ok()?, p[2].parse().ok()?))
         })
         .collect();
 
