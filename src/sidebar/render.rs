@@ -26,10 +26,9 @@ const FLAMINGO: &str = "\x1b[38;2;242;205;205m"; // flamingo #f2cdcd (msg count)
 const SEL_BG: &str = "\x1b[48;2;49;50;68m";
 const HEADER_BG: &str = "\x1b[48;2;30;30;46m";
 
-/// Number of header rows, depends on expanded/collapsed mode.
-/// Title: 3 rows. Table header: 2 rows. Collapsed data: 5 rows. Expanded data: 13 rows.
+/// Number of rendered rows occupied by the header before the first item begins.
 pub fn header_rows(expanded: bool) -> u32 {
-    if expanded { 18 } else { 10 }
+    if expanded { 15 } else { 8 }
 }
 
 /// Calculate the row count for a single agent item.
@@ -69,7 +68,7 @@ pub fn render_sidebar(
     agents: &[AgentInfo],
     width: u32,
     height: u32,
-    selected: usize,
+    selected: Option<usize>,
     scroll_offset: usize,
     unseen_done: &HashSet<String>,
     stats: &AggregatedStats,
@@ -347,7 +346,7 @@ pub fn render_sidebar(
 
         for (vi, agent) in agents[scroll_offset..end].iter().enumerate() {
             let i = scroll_offset + vi;
-            let is_selected = !header_selected && i == selected;
+            let is_selected = !header_selected && selected == Some(i);
             let color = match agent.kind {
                 AgentKind::ClaudeCode => PEACH,
                 AgentKind::Codex => BLUE,
@@ -749,7 +748,7 @@ mod tests {
             &[sample_agent()],
             100,
             30,
-            0,
+            Some(0),
             0,
             &HashSet::new(),
             &AggregatedStats::default(),
@@ -793,7 +792,7 @@ mod tests {
             &[agent],
             100,
             30,
-            0,
+            Some(0),
             0,
             &HashSet::new(),
             &AggregatedStats::default(),
@@ -830,7 +829,7 @@ mod tests {
             &[agent],
             100,
             30,
-            0,
+            Some(0),
             0,
             &HashSet::new(),
             &AggregatedStats::default(),
@@ -851,7 +850,7 @@ mod tests {
             &[agent],
             100,
             30,
-            0,
+            Some(0),
             0,
             &HashSet::new(),
             &AggregatedStats::default(),
@@ -884,7 +883,7 @@ mod tests {
             &[agent],
             100,
             30,
-            0,
+            Some(0),
             0,
             &HashSet::new(),
             &AggregatedStats::default(),
@@ -893,5 +892,28 @@ mod tests {
         );
 
         assert!(!strip_ansi(&rendered).contains("effort: medium"));
+    }
+
+    #[test]
+    fn render_does_not_highlight_any_item_when_selection_is_none() {
+        let rendered = render_sidebar(
+            &[sample_agent()],
+            100,
+            30,
+            None,
+            0,
+            &HashSet::new(),
+            &AggregatedStats::default(),
+            false,
+            false,
+        );
+
+        assert!(!rendered.contains(SEL_BG));
+    }
+
+    #[test]
+    fn header_rows_match_rendered_layout() {
+        assert_eq!(header_rows(false), 8);
+        assert_eq!(header_rows(true), 15);
     }
 }

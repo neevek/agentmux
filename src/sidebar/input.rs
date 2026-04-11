@@ -25,7 +25,6 @@ pub fn disable_mouse() {
 
 pub fn poll_input(timeout: Duration) -> InputEvent {
     let fd = libc::STDIN_FILENO;
-
     let ready = unsafe {
         let mut pfd = libc::pollfd {
             fd,
@@ -136,4 +135,67 @@ pub fn click_to_agent_index(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::AgentInfo;
+    use crate::detect::process::AgentKind;
+    use crate::detect::state::AgentState;
+
+    fn agent(pane_id: &str) -> AgentInfo {
+        AgentInfo {
+            kind: AgentKind::Codex,
+            agent_pid: Some(1),
+            pane_id: pane_id.to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: AgentState::Working,
+            elapsed_secs: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: None,
+            jsonl_path: None,
+            resumed: false,
+            details_ready: true,
+        }
+    }
+
+    #[test]
+    fn clicks_map_to_items_immediately_after_expanded_header() {
+        let agents = vec![agent("%1"), agent("%2")];
+        let header_rows = crate::sidebar::render::header_rows(true);
+
+        assert_eq!(
+            click_to_agent_index(header_rows + 1, &agents, 0, header_rows),
+            Some(0)
+        );
+        assert_eq!(
+            click_to_agent_index(header_rows + 5, &agents, 0, header_rows),
+            Some(0)
+        );
+        assert_eq!(
+            click_to_agent_index(header_rows + 6, &agents, 0, header_rows),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn clicks_on_header_boundary_do_not_select_first_item() {
+        let agents = vec![agent("%1")];
+        let header_rows = crate::sidebar::render::header_rows(true);
+
+        assert_eq!(
+            click_to_agent_index(header_rows, &agents, 0, header_rows),
+            None
+        );
+    }
 }

@@ -22,7 +22,7 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
 
 extern "C" fn winch_handler(_sig: libc::c_int) {}
 
-const IDLE_CHECK_MS: u64 = 1000;
+const INPUT_POLL_MS: u64 = 1000;
 const WIDTH_SAVE_THROTTLE_MS: u64 = 50;
 const DISCOVERY_SWEEP_MS: u64 = 15_000;
 
@@ -67,6 +67,14 @@ struct PaneFingerprint {
     title: String,
     current_command: String,
     cwd: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Selection {
+    #[default]
+    None,
+    Header,
+    Agent(String),
 }
 
 fn pane_fingerprint(pane: &tmux::PaneInfo) -> PaneFingerprint {
@@ -115,9 +123,106 @@ fn update_pane_fingerprints(
     }
 }
 
+fn selection_index(selection: &Selection, agents: &[AgentInfo]) -> Option<usize> {
+    match selection {
+        Selection::Agent(pane_id) => agents.iter().position(|agent| agent.pane_id == *pane_id),
+        Selection::None | Selection::Header => None,
+    }
+}
+
+fn sync_selection_from_focus(
+    selection: &mut Selection,
+    is_active_window: bool,
+    active_pane_id: Option<&str>,
+    sidebar_pane_id: &str,
+    agents: &[AgentInfo],
+) -> bool {
+    let next = if !is_active_window {
+        Selection::None
+    } else if let Some(pane_id) = active_pane_id {
+        if agents.iter().any(|agent| agent.pane_id == pane_id) {
+            Selection::Agent(pane_id.to_string())
+        } else if pane_id == sidebar_pane_id {
+            match selection {
+                Selection::Header => Selection::Header,
+                Selection::Agent(selected_pane)
+                    if agents.iter().any(|agent| agent.pane_id == *selected_pane) =>
+                {
+                    Selection::Agent(selected_pane.clone())
+                }
+                Selection::None | Selection::Agent(_) => Selection::None,
+            }
+        } else {
+            Selection::None
+        }
+    } else {
+        Selection::None
+    };
+
+    if *selection != next {
+        *selection = next;
+        true
+    } else {
+        false
+    }
+}
+
+fn select_agent(agents: &[AgentInfo], idx: usize) -> Selection {
+    agents
+        .get(idx)
+        .map(|agent| Selection::Agent(agent.pane_id.clone()))
+        .unwrap_or(Selection::None)
+}
+
+fn move_selection_up(selection: &Selection, agents: &[AgentInfo]) -> Selection {
+    match selection {
+        Selection::Header => Selection::Header,
+        Selection::Agent(pane_id) => {
+            match agents.iter().position(|agent| agent.pane_id == *pane_id) {
+                Some(0) => Selection::Header,
+                Some(idx) => select_agent(agents, idx.saturating_sub(1)),
+                None => {
+                    if agents.is_empty() {
+                        Selection::Header
+                    } else {
+                        select_agent(agents, agents.len() - 1)
+                    }
+                }
+            }
+        }
+        Selection::None => Selection::Header,
+    }
+}
+
+fn move_selection_down(selection: &Selection, agents: &[AgentInfo]) -> Selection {
+    match selection {
+        Selection::Header | Selection::None => select_agent(agents, 0),
+        Selection::Agent(pane_id) => {
+            match agents.iter().position(|agent| agent.pane_id == *pane_id) {
+                Some(idx) => {
+                    let max = agents.len().saturating_sub(1);
+                    let next_idx = if idx < max { idx + 1 } else { max };
+                    select_agent(agents, next_idx)
+                }
+                None => select_agent(agents, 0),
+            }
+        }
+    }
+}
+
+fn activate_agent(agent: &AgentInfo, unseen_done: &mut HashSet<String>) {
+    unseen_done.remove(&agent.pane_id);
+    let in_current_window = tmux::current_window_id().is_some_and(|cw| cw == agent.window_id);
+    if !in_current_window {
+        tmux::select_window(&agent.window_id);
+    }
+    tmux::select_pane(&agent.pane_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detect::process::AgentKind;
 
     fn pane(id: &str, pid: u32, title: &str, current_command: &str) -> tmux::PaneInfo {
         tmux::PaneInfo {
@@ -131,6 +236,31 @@ mod tests {
         }
     }
 
+    fn agent(pane_id: &str) -> AgentInfo {
+        AgentInfo {
+            kind: AgentKind::Codex,
+            agent_pid: Some(1),
+            pane_id: pane_id.to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: AgentState::Working,
+            elapsed_secs: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: None,
+            jsonl_path: None,
+            resumed: false,
+            details_ready: true,
+        }
+    }
+
     #[test]
     fn suspect_panes_include_tracked_pane_fingerprint_changes() {
         let tracked = pane("%1", 100, "shell", "zsh");
@@ -140,6 +270,53 @@ mod tests {
 
         let suspect = suspect_pane_ids(&[changed], &previous, &tracked_panes, false);
         assert_eq!(suspect, HashSet::from(["%1".to_string()]));
+    }
+
+    #[test]
+    fn sync_selection_tracks_focused_agent_pane() {
+        let mut selection = Selection::None;
+        let agents = vec![agent("%2"), agent("%3")];
+
+        let changed =
+            sync_selection_from_focus(&mut selection, true, Some("%3"), "%sidebar", &agents);
+
+        assert!(changed);
+        assert_eq!(selection, Selection::Agent("%3".to_string()));
+    }
+
+    #[test]
+    fn sync_selection_clears_when_focus_leaves_sidebar_and_agents() {
+        let mut selection = Selection::Agent("%2".to_string());
+        let agents = vec![agent("%2"), agent("%3")];
+
+        let changed =
+            sync_selection_from_focus(&mut selection, true, Some("%9"), "%sidebar", &agents);
+
+        assert!(changed);
+        assert_eq!(selection, Selection::None);
+    }
+
+    #[test]
+    fn sync_selection_clears_header_when_sidebar_window_loses_focus() {
+        let mut selection = Selection::Header;
+
+        let changed =
+            sync_selection_from_focus(&mut selection, false, Some("%sidebar"), "%sidebar", &[]);
+
+        assert!(changed);
+        assert_eq!(selection, Selection::None);
+    }
+
+    #[test]
+    fn sync_selection_preserves_sidebar_local_agent_selection() {
+        let mut selection = Selection::Agent("%2".to_string());
+        let agents = vec![agent("%2"), agent("%3")];
+
+        let changed =
+            sync_selection_from_focus(&mut selection, true, Some("%sidebar"), "%sidebar", &agents);
+
+        assert!(!changed);
+        assert_eq!(selection, Selection::Agent("%2".to_string()));
     }
 }
 
@@ -188,8 +365,12 @@ pub fn run() {
     let mut runtime_store = RuntimeStore::new(&session);
     let mut history = HistoryStore::start();
     let mut detect_cache = detect::SessionCache::new();
+    let sidebar_pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
+    let sidebar_window_id = tmux::pane_window_id(&sidebar_pane_id)
+        .or_else(tmux::current_window_id)
+        .unwrap_or_default();
     let mut last_active = false;
-    let mut last_selected_pane = String::new();
+    let mut selection = Selection::None;
     let mut scroll_offset = 0usize;
     let mut last_width = 0u32;
     let mut last_width_save = Instant::now();
@@ -202,7 +383,6 @@ pub fn run() {
     let header_config = load_header_config();
     let mut header_expanded = header_config.start_mode == HeaderMode::Expanded;
     let mut header_user_toggled = false;
-    let mut header_selected = false;
     let start_time = Instant::now();
 
     loop {
@@ -231,11 +411,19 @@ pub fn run() {
             needs_render = true;
         }
 
-        let selected_pane = tmux::get_selected_pane();
-        let selection_changed = selected_pane != last_selected_pane;
-        last_selected_pane.clone_from(&selected_pane);
-        if selection_changed {
-            header_selected = false;
+        let active_pane_id = if is_active && !sidebar_window_id.is_empty() {
+            tmux::active_pane_in_window(&sidebar_window_id)
+        } else {
+            None
+        };
+
+        if sync_selection_from_focus(
+            &mut selection,
+            is_active,
+            active_pane_id.as_deref(),
+            &sidebar_pane_id,
+            &cached_agents,
+        ) {
             needs_render = true;
         }
 
@@ -353,17 +541,11 @@ pub fn run() {
             needs_render = true;
         }
 
-        let selected_idx = if header_selected {
-            0
-        } else {
-            cached_agents
-                .iter()
-                .position(|agent| agent.pane_id == selected_pane)
-                .unwrap_or(0)
-        };
+        let header_selected = matches!(selection, Selection::Header);
+        let selected_idx = selection_index(&selection, &cached_agents);
 
         let (_, height) = terminal_size();
-        if !header_selected {
+        if let Some(selected_idx) = selected_idx {
             let visible =
                 render::visible_item_count(height, &cached_agents, scroll_offset, header_expanded);
             if visible > 0 {
@@ -407,99 +589,83 @@ pub fn run() {
             needs_render = false;
         }
 
-        if is_active {
-            match input::poll_input(Duration::from_millis(IDLE_CHECK_MS)) {
-                input::InputEvent::KeyUp => {
-                    if header_selected {
-                    } else if selected_idx == 0 {
-                        header_selected = true;
-                    } else {
-                        let new_sel = selected_idx.saturating_sub(1);
-                        set_selection(&cached_agents, new_sel);
-                    }
+        match input::poll_input(Duration::from_millis(INPUT_POLL_MS)) {
+            input::InputEvent::KeyUp if is_active => {
+                let next_selection = move_selection_up(&selection, &cached_agents);
+                if next_selection != selection {
+                    selection = next_selection;
                     needs_render = true;
                 }
-                input::InputEvent::KeyDown => {
-                    if header_selected {
-                        header_selected = false;
-                        set_selection(&cached_agents, 0);
-                    } else {
-                        let max = cached_agents.len().saturating_sub(1);
-                        let new_sel = if selected_idx < max {
-                            selected_idx + 1
-                        } else {
-                            max
-                        };
-                        set_selection(&cached_agents, new_sel);
-                    }
-                    needs_render = true;
-                }
-                input::InputEvent::MouseScrollUp => {
-                    scroll_offset = scroll_offset.saturating_sub(1);
-                    needs_render = true;
-                }
-                input::InputEvent::MouseScrollDown => {
-                    let max_offset = cached_agents.len().saturating_sub(
-                        render::visible_item_count(
-                            height,
-                            &cached_agents,
-                            scroll_offset,
-                            header_expanded,
-                        )
-                        .max(1),
-                    );
-                    scroll_offset = (scroll_offset + 1).min(max_offset);
-                    needs_render = true;
-                }
-                input::InputEvent::KeyEnter => {
-                    if header_selected {
-                        header_expanded = !header_expanded;
-                        header_user_toggled = true;
-                        needs_render = true;
-                    } else if let Some(agent) = cached_agents.get(selected_idx) {
-                        unseen_done.remove(&agent.pane_id);
-                        let in_current_window =
-                            tmux::current_window_id().is_some_and(|cw| cw == agent.window_id);
-                        if !in_current_window {
-                            tmux::select_window(&agent.window_id);
-                            tmux::select_pane(&agent.pane_id);
-                        }
-                    }
-                }
-                input::InputEvent::MouseClick { y } => {
-                    let hrows = render::header_rows(header_expanded);
-                    if y >= 4 && y <= hrows {
-                        header_expanded = !header_expanded;
-                        header_user_toggled = true;
-                        header_selected = true;
-                        needs_render = true;
-                    } else if let Some(agent) =
-                        input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows)
-                            .and_then(|idx| cached_agents.get(idx))
-                    {
-                        header_selected = false;
-                        tmux::set_selected_pane(&agent.pane_id);
-                        unseen_done.remove(&agent.pane_id);
-                        let in_current_window =
-                            tmux::current_window_id().is_some_and(|cw| cw == agent.window_id);
-                        if !in_current_window {
-                            tmux::select_window(&agent.window_id);
-                            tmux::select_pane(&agent.pane_id);
-                        }
-                        needs_render = true;
-                    }
-                }
-                input::InputEvent::KeyQuit => {
-                    suppress_on_exit = true;
-                    break;
-                }
-                input::InputEvent::Resize => {
-                    needs_render = true;
-                }
-                input::InputEvent::None => {}
             }
-        } else {
-            let _ = input::poll_input(Duration::from_millis(IDLE_CHECK_MS));
+            input::InputEvent::KeyDown if is_active => {
+                let next_selection = move_selection_down(&selection, &cached_agents);
+                if next_selection != selection {
+                    selection = next_selection;
+                    needs_render = true;
+                }
+            }
+            input::InputEvent::MouseScrollUp if is_active => {
+                scroll_offset = scroll_offset.saturating_sub(1);
+                needs_render = true;
+            }
+            input::InputEvent::MouseScrollDown if is_active => {
+                let max_offset = cached_agents.len().saturating_sub(
+                    render::visible_item_count(
+                        height,
+                        &cached_agents,
+                        scroll_offset,
+                        header_expanded,
+                    )
+                    .max(1),
+                );
+                scroll_offset = (scroll_offset + 1).min(max_offset);
+                needs_render = true;
+            }
+            input::InputEvent::KeyEnter if is_active => match &selection {
+                Selection::Header => {
+                    header_expanded = !header_expanded;
+                    header_user_toggled = true;
+                    needs_render = true;
+                }
+                Selection::Agent(pane_id) => {
+                    if let Some(agent) =
+                        cached_agents.iter().find(|agent| agent.pane_id == *pane_id)
+                    {
+                        activate_agent(agent, &mut unseen_done);
+                    }
+                }
+                Selection::None => {}
+            },
+            input::InputEvent::MouseClick { y } => {
+                let hrows = render::header_rows(header_expanded);
+                if y >= 4 && y <= hrows {
+                    header_expanded = !header_expanded;
+                    header_user_toggled = true;
+                    selection = Selection::Header;
+                    needs_render = true;
+                } else if let Some(agent) =
+                    input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows)
+                        .and_then(|idx| cached_agents.get(idx))
+                {
+                    selection = Selection::Agent(agent.pane_id.clone());
+                    activate_agent(agent, &mut unseen_done);
+                    needs_render = true;
+                }
+            }
+            input::InputEvent::KeyQuit if is_active => {
+                suppress_on_exit = true;
+                break;
+            }
+            input::InputEvent::Resize => {
+                needs_render = true;
+            }
+            input::InputEvent::KeyUp
+            | input::InputEvent::KeyDown
+            | input::InputEvent::KeyEnter
+            | input::InputEvent::KeyQuit
+            | input::InputEvent::MouseScrollUp
+            | input::InputEvent::MouseScrollDown
+            | input::InputEvent::None => {}
         }
     }
 
@@ -666,12 +832,6 @@ fn apply_agents_update(
                 unseen_done.remove(&agent.pane_id);
             }
         }
-    }
-}
-
-fn set_selection(agents: &[AgentInfo], idx: usize) {
-    if let Some(agent) = agents.get(idx) {
-        tmux::set_selected_pane(&agent.pane_id);
     }
 }
 
