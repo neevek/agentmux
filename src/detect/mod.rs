@@ -59,6 +59,22 @@ fn scan_order_key(agent: &process::DetectedAgent) -> (u64, u64) {
     (state::binding_priority(agent), agent.elapsed_secs)
 }
 
+fn has_bound_session(agent: &AgentInfo) -> bool {
+    agent.jsonl_path.is_some() && agent.session_id.is_some()
+}
+
+fn details_have_bound_session(details: &state::SessionDetails) -> bool {
+    details.jsonl_path.is_some() && details.session_id.is_some()
+}
+
+fn should_force_full_rescan(agent: &AgentInfo, details: &state::SessionDetails) -> bool {
+    if !agent.details_ready {
+        return true;
+    }
+
+    has_bound_session(agent) && !details_have_bound_session(details)
+}
+
 fn display_elapsed_secs(
     kind: AgentKind,
     process_elapsed_secs: u64,
@@ -286,7 +302,7 @@ pub fn refresh_agents_incremental_from_panes(
         };
 
         let details = state::refresh_tracked_details(agent, process_elapsed_secs, cache);
-        if details.jsonl_path.is_none() || details.session_id.is_none() {
+        if should_force_full_rescan(agent, &details) {
             return None;
         }
 
@@ -383,5 +399,98 @@ mod tests {
         };
 
         assert!(scan_order_key(&newer) < scan_order_key(&older));
+    }
+
+    #[test]
+    fn provisional_agents_still_force_full_rescan() {
+        let agent = AgentInfo {
+            kind: AgentKind::Codex,
+            agent_pid: Some(101),
+            pane_id: "%1".to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: state::AgentState::Working,
+            elapsed_secs: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: None,
+            jsonl_path: None,
+            resumed: false,
+            details_ready: false,
+        };
+
+        assert!(should_force_full_rescan(
+            &agent,
+            &state::SessionDetails::default()
+        ));
+    }
+
+    #[test]
+    fn metadata_less_tracked_agents_do_not_force_full_rescan() {
+        let agent = AgentInfo {
+            kind: AgentKind::Codex,
+            agent_pid: Some(101),
+            pane_id: "%1".to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: state::AgentState::Idle,
+            elapsed_secs: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: None,
+            jsonl_path: None,
+            resumed: false,
+            details_ready: true,
+        };
+
+        assert!(!should_force_full_rescan(
+            &agent,
+            &state::SessionDetails::default()
+        ));
+    }
+
+    #[test]
+    fn losing_a_bound_session_forces_full_rescan() {
+        let agent = AgentInfo {
+            kind: AgentKind::ClaudeCode,
+            agent_pid: Some(101),
+            pane_id: "%1".to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_name: "main".to_string(),
+            state: state::AgentState::Working,
+            elapsed_secs: 10,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_activity: None,
+            context_pct: None,
+            model: None,
+            effort: None,
+            cost_usd: 0.0,
+            turn_count: 0,
+            session_id: Some("session-1".to_string()),
+            jsonl_path: Some(std::path::PathBuf::from("/tmp/session-1.jsonl")),
+            resumed: false,
+            details_ready: true,
+        };
+
+        assert!(should_force_full_rescan(
+            &agent,
+            &state::SessionDetails::default()
+        ));
     }
 }

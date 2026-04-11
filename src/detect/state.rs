@@ -554,8 +554,9 @@ fn codex_binding_priority(agent: &DetectedAgent) -> u64 {
     let now = unix_now_secs();
     files
         .into_iter()
-        .filter_map(|path| codex_match_score(&path, &agent.cwd, agent.elapsed_secs, now))
-        .map(|score| score.age_mismatch_secs)
+        .filter_map(|path| {
+            codex_binding_age_mismatch_secs(&path, &agent.cwd, agent.elapsed_secs, now)
+        })
         .min()
         .unwrap_or(u64::MAX)
 }
@@ -954,6 +955,39 @@ fn codex_match_score(
         CodexCandidate::Scored(score) => Some(score),
         CodexCandidate::Unscorable | CodexCandidate::CwdMismatch => None,
     }
+}
+
+fn codex_binding_age_mismatch_secs(
+    path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+) -> Option<u64> {
+    let Some(meta) = parse_codex_session_meta(path) else {
+        return None;
+    };
+    let Some(session_cwd) = json_str(&meta, &["payload", "cwd"]) else {
+        return None;
+    };
+    if !codex_cwds_match(cwd, session_cwd) {
+        return None;
+    }
+
+    json_str(&meta, &["payload", "timestamp"])
+        .and_then(parse_rfc3339_utc_secs)
+        .and_then(|started| now_secs.checked_sub(started))
+        .map(|age| age.abs_diff(agent_age_secs))
+        .or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| {
+                    now_secs
+                        .saturating_sub(d.as_secs())
+                        .abs_diff(agent_age_secs)
+                })
+        })
 }
 
 fn codex_candidate(path: &Path, cwd: &str, agent_age_secs: u64, now_secs: u64) -> CodexCandidate {
