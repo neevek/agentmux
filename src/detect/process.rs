@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::tmux::PaneInfo;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     ClaudeCode,
     Codex,
