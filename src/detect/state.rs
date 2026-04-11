@@ -78,6 +78,8 @@ struct SessionBinding {
     jsonl_path: PathBuf,
     session_id: Option<String>,
     last_agent_pid: u32,
+    rebind_probe_due_at: u64,
+    rebind_probe_backoff_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +220,18 @@ impl SessionCache {
             self.path_owners.remove(&existing.jsonl_path);
         }
 
+        let (rebind_probe_due_at, rebind_probe_backoff_secs) = self
+            .bindings
+            .get(&key)
+            .map(|existing| {
+                if existing.jsonl_path == jsonl_path {
+                    (existing.rebind_probe_due_at, existing.rebind_probe_backoff_secs)
+                } else {
+                    (0, MIN_REBIND_PROBE_SECS)
+                }
+            })
+            .unwrap_or((0, MIN_REBIND_PROBE_SECS));
+
         self.path_owners.insert(jsonl_path.clone(), key.clone());
         self.bindings.insert(
             key,
@@ -225,6 +239,8 @@ impl SessionCache {
                 jsonl_path,
                 session_id,
                 last_agent_pid: agent.agent_pid,
+                rebind_probe_due_at,
+                rebind_probe_backoff_secs,
             },
         );
     }
@@ -234,6 +250,36 @@ impl SessionCache {
         if let Some(binding) = self.bindings.remove(&key) {
             self.path_owners.remove(&binding.jsonl_path);
         }
+    }
+
+    fn should_probe_rebind(&self, agent: &DetectedAgent, now_secs: u64) -> bool {
+        let key = AgentBindingKey::from(agent);
+        self.bindings
+            .get(&key)
+            .is_none_or(|binding| now_secs >= binding.rebind_probe_due_at)
+    }
+
+    fn record_rebind_probe_result(
+        &mut self,
+        agent: &DetectedAgent,
+        now_secs: u64,
+        switched: bool,
+    ) {
+        let key = AgentBindingKey::from(agent);
+        let Some(binding) = self.bindings.get_mut(&key) else {
+            return;
+        };
+
+        binding.rebind_probe_backoff_secs = if switched {
+            MIN_REBIND_PROBE_SECS
+        } else {
+            binding
+                .rebind_probe_backoff_secs
+                .max(MIN_REBIND_PROBE_SECS)
+                .saturating_mul(2)
+                .min(MAX_REBIND_PROBE_SECS)
+        };
+        binding.rebind_probe_due_at = now_secs.saturating_add(binding.rebind_probe_backoff_secs);
     }
 }
 
@@ -256,7 +302,9 @@ impl From<&AgentInfo> for AgentBindingKey {
 }
 
 const ACTIVE_WRITE_THRESHOLD: Duration = Duration::from_secs(3);
-const CODEX_BOUND_PATH_LIVE_SECS: u64 = 15;
+const BOUND_PATH_LIVE_SECS: u64 = 15;
+const MIN_REBIND_PROBE_SECS: u64 = 30;
+const MAX_REBIND_PROBE_SECS: u64 = 300;
 const TAIL_BYTES: u64 = 32768;
 /// Ambiguous in-turn events (plain user prompt, exec_command_end) should stay
 /// working for a long time, but eventually settle to idle for stalled/crashed
@@ -355,38 +403,51 @@ pub fn refresh_tracked_details(
     process_elapsed_secs: u64,
     cache: &mut SessionCache,
 ) -> SessionDetails {
-    match agent.kind {
-        AgentKind::ClaudeCode => {
-            let detected = DetectedAgent {
-                kind: AgentKind::ClaudeCode,
-                pane_id: agent.pane_id.clone(),
-                cwd: agent.cwd.clone(),
-                window_id: agent.window_id.clone(),
-                window_index: 0,
-                agent_pid: agent.agent_pid.unwrap_or_default(),
-                resumed: agent.resumed,
-                elapsed_secs: process_elapsed_secs,
-            };
-            // Re-run Claude binding selection each refresh so /clear-style resets
-            // can move the pane to a newer session file instead of pinning stale stats.
-            claude_code_details(&detected, cache)
-        }
-        AgentKind::Codex => {
-            let detected = DetectedAgent {
-                kind: AgentKind::Codex,
-                pane_id: agent.pane_id.clone(),
-                cwd: agent.cwd.clone(),
-                window_id: agent.window_id.clone(),
-                window_index: 0,
-                agent_pid: agent.agent_pid.unwrap_or_default(),
-                resumed: agent.resumed,
-                elapsed_secs: process_elapsed_secs,
-            };
-            // Re-run full Codex binding selection each refresh so /new and /clear
-            // can move the pane to a newer session file instead of pinning stale stats.
-            codex_details(&detected, cache)
-        }
+    let now_secs = unix_now_secs();
+    let detected = DetectedAgent {
+        kind: agent.kind,
+        pane_id: agent.pane_id.clone(),
+        cwd: agent.cwd.clone(),
+        window_id: agent.window_id.clone(),
+        window_index: 0,
+        agent_pid: agent.agent_pid.unwrap_or_default(),
+        resumed: agent.resumed,
+        elapsed_secs: process_elapsed_secs,
+    };
+
+    if agent.kind == AgentKind::ClaudeCode {
+        // Keep Claude on eager rebind selection so /new and /clear-style resets
+        // are reflected immediately in the sidebar session item.
+        return claude_code_details(&detected, cache);
     }
+
+    let details = refresh_bound_details(
+        agent.kind,
+        agent.jsonl_path.as_deref(),
+        agent.session_id.as_deref(),
+        process_elapsed_secs,
+        agent.resumed,
+        cache,
+    );
+    let has_existing_binding = details.session_id.is_some() && details.jsonl_path.is_some();
+    let needs_rebind_probe = details
+        .jsonl_path
+        .as_deref()
+        .is_some_and(|path| !agent.resumed && !bound_path_is_recent(path, BOUND_PATH_LIVE_SECS));
+    if has_existing_binding && (!needs_rebind_probe || !cache.should_probe_rebind(&detected, now_secs)) {
+        update_binding(cache, &detected, &details);
+        return details;
+    }
+
+    let rebound = match agent.kind {
+        AgentKind::ClaudeCode => claude_code_details(&detected, cache),
+        AgentKind::Codex => codex_details(&detected, cache),
+    };
+    if needs_rebind_probe {
+        let switched = rebound.jsonl_path != details.jsonl_path || rebound.session_id != details.session_id;
+        cache.record_rebind_probe_result(&detected, now_secs, switched);
+    }
+    rebound
 }
 
 fn select_claude_jsonl_path(
@@ -449,14 +510,14 @@ fn select_codex_jsonl_path(
         };
 
         return replacement
-            .filter(|path| codex_path_is_recent(path, CODEX_BOUND_PATH_LIVE_SECS))
+            .filter(|path| bound_path_is_recent(path, BOUND_PATH_LIVE_SECS))
             .or(current_path);
     }
 
     candidate_path
 }
 
-fn codex_path_is_recent(path: &Path, max_age_secs: u64) -> bool {
+fn bound_path_is_recent(path: &Path, max_age_secs: u64) -> bool {
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
@@ -2267,6 +2328,7 @@ mod tests {
     }
 
     fn tracked_agent_info(
+        kind: AgentKind,
         pane_id: &str,
         pid: u32,
         cwd: &str,
@@ -2274,7 +2336,7 @@ mod tests {
         session_id: &str,
     ) -> AgentInfo {
         AgentInfo {
-            kind: AgentKind::Codex,
+            kind,
             agent_pid: Some(pid),
             pane_id: pane_id.to_string(),
             cwd: cwd.to_string(),
@@ -2589,7 +2651,86 @@ mod tests {
             Some("session-1".to_string()),
         );
 
-        let agent = tracked_agent_info("%1", 101, "/tmp/project", &current_path, "session-1");
+        let agent = tracked_agent_info(
+            AgentKind::Codex,
+            "%1",
+            101,
+            "/tmp/project",
+            &current_path,
+            "session-1",
+        );
+        let details = refresh_tracked_details(&agent, 120, &mut cache);
+
+        assert_eq!(details.session_id.as_deref(), Some("session-1"));
+        assert_eq!(details.jsonl_path.as_deref(), Some(current_path.as_path()));
+        assert_eq!(details.input_tokens, 12);
+        assert_eq!(details.output_tokens, 4);
+
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(sessions_dir);
+    }
+
+    #[test]
+    fn refresh_tracked_codex_details_throttles_stale_rebind_probe() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-refresh-throttle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let current_path = sessions_dir.join("current.jsonl");
+        let candidate_path = sessions_dir.join("candidate.jsonl");
+        fs::write(
+            &current_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:15:30.000Z","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":4},"last_token_usage":{"input_tokens":12},"model_context_window":200000}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3,"output_tokens":1},"last_token_usage":{"input_tokens":3},"model_context_window":200000}}}"#
+            ),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        set_file_mtime_secs(&current_path, now - 30);
+        set_file_mtime_secs(&candidate_path, now - 30);
+
+        let mut cache = SessionCache::new();
+        let detected = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
+        cache.bind_agent_path(
+            &detected,
+            current_path.clone(),
+            Some("session-1".to_string()),
+        );
+
+        let key = AgentBindingKey::from(&detected);
+        let binding = cache.bindings.get_mut(&key).unwrap();
+        binding.rebind_probe_due_at = u64::MAX;
+        binding.rebind_probe_backoff_secs = MIN_REBIND_PROBE_SECS;
+
+        let agent = tracked_agent_info(
+            AgentKind::Codex,
+            "%1",
+            101,
+            "/tmp/project",
+            &current_path,
+            "session-1",
+        );
         let details = refresh_tracked_details(&agent, 120, &mut cache);
 
         assert_eq!(details.session_id.as_deref(), Some("session-1"));

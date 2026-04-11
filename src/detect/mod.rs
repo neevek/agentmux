@@ -312,7 +312,9 @@ fn refresh_agents_incremental_with_elapsed(
         };
         let agent_pid = agent.agent_pid?;
         let Some(process_elapsed_secs) = elapsed_by_pid.get(&agent_pid).copied() else {
-            continue;
+            // The tracked PID disappeared while the pane still exists.
+            // Fall back to a full rescan to rediscover the live agent process.
+            return None;
         };
 
         let details = state::refresh_tracked_details(agent, process_elapsed_secs, cache);
@@ -552,17 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn incremental_refresh_drops_agent_when_tracked_pid_exits() {
+    fn incremental_refresh_requests_full_rescan_when_tracked_pid_exits() {
         let mut cache = SessionCache::new();
         let refreshed = refresh_agents_incremental_with_elapsed(
             &[pane("%1")],
-            &[tracked_agent(AgentKind::Codex, "%1", 101)],
+            &[tracked_agent(AgentKind::ClaudeCode, "%1", 101)],
             &mut cache,
             &HashMap::new(),
-        )
-        .unwrap();
+        );
 
-        assert!(refreshed.is_empty());
+        assert!(refreshed.is_none());
     }
 
     #[test]
