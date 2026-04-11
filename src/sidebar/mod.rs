@@ -1,17 +1,18 @@
 pub mod input;
 pub mod render;
+mod runtime;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::detect;
 use crate::detect::AgentInfo;
-use crate::detect::history::HistoryStore;
+use crate::detect::history::{AggregatedStats, HistoryStore};
 use crate::detect::state::AgentState;
 use crate::tmux;
+
+use self::runtime::{LiveSnapshot, RuntimeStore};
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
@@ -19,15 +20,10 @@ extern "C" fn exit_handler(_sig: libc::c_int) {
     SHOULD_EXIT.store(true, Ordering::Relaxed);
 }
 
-// No-op handler: installing it causes poll() to return EINTR on SIGWINCH,
-// which triggers immediate re-render on resize.
 extern "C" fn winch_handler(_sig: libc::c_int) {}
 
-const SCAN_INTERVAL_MS: u64 = 3000;
 const IDLE_CHECK_MS: u64 = 1000;
 const WIDTH_SAVE_THROTTLE_MS: u64 = 50;
-
-// --- Header config ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderMode {
@@ -49,6 +45,19 @@ impl Default for HeaderConfig {
             start_mode: HeaderMode::Expanded,
         }
     }
+}
+
+#[derive(Default)]
+enum SidebarRole {
+    #[default]
+    Inactive,
+    Follower {
+        last_poll: Instant,
+    },
+    Leader {
+        epoch: u64,
+        last_refresh: Instant,
+    },
 }
 
 fn load_header_config() -> HeaderConfig {
@@ -90,32 +99,25 @@ pub fn run() {
 
     let mut prev_states: HashMap<String, AgentState> = HashMap::new();
     let mut unseen_done: HashSet<String> = HashSet::new();
-    let mut cached_agents: Vec<AgentInfo> = detect::scan_agents_fast(&session);
-    let scan_results: Arc<Mutex<Option<Vec<AgentInfo>>>> = Arc::new(Mutex::new(None));
-    let scan_results_bg = Arc::clone(&scan_results);
-    let session_bg = session.clone();
-    thread::spawn(move || {
-        let mut session_cache = detect::SessionCache::new();
-        while !SHOULD_EXIT.load(Ordering::Relaxed) {
-            let agents = detect::scan_agents(&session_bg, &mut session_cache);
-            *scan_results_bg.lock().unwrap() = Some(agents);
-            thread::sleep(Duration::from_millis(SCAN_INTERVAL_MS));
-        }
-    });
+    let mut cached_agents = detect::scan_agents_fast(&session);
+    let mut current_stats = AggregatedStats::default();
+    let mut role = SidebarRole::Inactive;
+    let mut runtime_store = RuntimeStore::new(&session);
+    let mut history = HistoryStore::start();
+    let mut detect_cache = detect::SessionCache::new();
+    let mut last_active = false;
     let mut last_selected_pane = String::new();
-    let mut scroll_offset: usize = 0;
-    let mut last_width: u32 = 0;
+    let mut scroll_offset = 0usize;
+    let mut last_width = 0u32;
     let mut last_width_save = Instant::now();
     let mut needs_render = true;
+    let mut just_activated = false;
 
-    // Header expand/collapse state
     let header_config = load_header_config();
     let mut header_expanded = header_config.start_mode == HeaderMode::Expanded;
     let mut header_user_toggled = false;
     let mut header_selected = false;
     let start_time = Instant::now();
-
-    let history = HistoryStore::start();
 
     loop {
         if SHOULD_EXIT.load(Ordering::Relaxed) {
@@ -123,6 +125,27 @@ pub fn run() {
         }
 
         let is_active = tmux::is_pane_in_active_window();
+        if is_active != last_active {
+            if !is_active {
+                if let SidebarRole::Leader { epoch, .. } = role {
+                    runtime_store.release_leader(epoch);
+                }
+                role = SidebarRole::Inactive;
+            } else {
+                activate_sidebar(
+                    &mut role,
+                    &mut runtime_store,
+                    &mut cached_agents,
+                    &mut current_stats,
+                    &mut prev_states,
+                    &mut unseen_done,
+                );
+                just_activated = true;
+            }
+            last_active = is_active;
+            needs_render = true;
+        }
+
         let selected_pane = tmux::get_selected_pane();
         let selection_changed = selected_pane != last_selected_pane;
         last_selected_pane.clone_from(&selected_pane);
@@ -131,32 +154,81 @@ pub fn run() {
             needs_render = true;
         }
 
-        if let Some(agents) = scan_results.lock().unwrap().take() {
-            for agent in &agents {
-                if prev_states.get(&agent.pane_id).is_some_and(|&prev| {
-                    prev == AgentState::Working && agent.state == AgentState::Idle
-                }) {
-                    unseen_done.insert(agent.pane_id.clone());
-                }
-                prev_states.insert(agent.pane_id.clone(), agent.state);
-            }
-            let current_ids: HashSet<&str> = agents.iter().map(|a| a.pane_id.as_str()).collect();
-            prev_states.retain(|k, _| current_ids.contains(k.as_str()));
-            unseen_done.retain(|k| current_ids.contains(k.as_str()));
-
-            if let Some(current_window) = tmux::current_window_id() {
-                for agent in &agents {
-                    if agent.window_id == current_window {
-                        unseen_done.remove(&agent.pane_id);
+        if is_active && !just_activated {
+            let mut promote_to_leader = None;
+            match &mut role {
+                SidebarRole::Leader {
+                    epoch,
+                    last_refresh,
+                } if last_refresh.elapsed() >= Duration::from_millis(runtime::POLL_INTERVAL_MS) => {
+                    if refresh_leader_state(
+                        &session,
+                        *epoch,
+                        &mut runtime_store,
+                        &mut history,
+                        &mut detect_cache,
+                        &mut cached_agents,
+                        &mut current_stats,
+                        &mut prev_states,
+                        &mut unseen_done,
+                    ) {
+                        *last_refresh = Instant::now();
+                        needs_render = true;
+                    } else {
+                        role = SidebarRole::Follower {
+                            last_poll: Instant::now()
+                                - Duration::from_millis(runtime::POLL_INTERVAL_MS),
+                        };
                     }
                 }
+                SidebarRole::Follower { last_poll }
+                    if last_poll.elapsed() >= Duration::from_millis(runtime::POLL_INTERVAL_MS) =>
+                {
+                    let now = Instant::now();
+                    let lease = runtime_store.read_lease();
+                    if runtime_store.lease_is_stale(&lease) {
+                        if let Some(epoch) = runtime_store.try_claim_leader() {
+                            promote_to_leader = Some((epoch, now));
+                        }
+                    } else if let Some(snapshot) = runtime_store.load_snapshot_if_changed(&lease) {
+                        apply_snapshot(
+                            snapshot,
+                            &mut cached_agents,
+                            &mut current_stats,
+                            &mut prev_states,
+                            &mut unseen_done,
+                        );
+                        needs_render = true;
+                    }
+                    *last_poll = now;
+                }
+                _ => {}
             }
-
-            cached_agents = agents;
-            needs_render = true;
+            if let Some((epoch, now)) = promote_to_leader {
+                let refreshed = refresh_leader_state(
+                    &session,
+                    epoch,
+                    &mut runtime_store,
+                    &mut history,
+                    &mut detect_cache,
+                    &mut cached_agents,
+                    &mut current_stats,
+                    &mut prev_states,
+                    &mut unseen_done,
+                );
+                role = if refreshed {
+                    SidebarRole::Leader {
+                        epoch,
+                        last_refresh: now,
+                    }
+                } else {
+                    SidebarRole::Follower { last_poll: now }
+                };
+                needs_render = true;
+            }
         }
+        just_activated = false;
 
-        // Auto-collapse timer
         if !header_user_toggled
             && header_expanded
             && header_config.start_mode == HeaderMode::Expanded
@@ -169,15 +241,14 @@ pub fn run() {
         }
 
         let selected_idx = if header_selected {
-            0 // doesn't matter for agent selection when header is focused
+            0
         } else {
             cached_agents
                 .iter()
-                .position(|a| a.pane_id == selected_pane)
+                .position(|agent| agent.pane_id == selected_pane)
                 .unwrap_or(0)
         };
 
-        // Auto-scroll to keep selection visible
         let (_, height) = terminal_size();
         if !header_selected {
             let visible =
@@ -193,12 +264,10 @@ pub fn run() {
 
         if needs_render {
             let (mut width, height) = terminal_size();
-            // Enforce minimum width
             if width < tmux::MIN_WIDTH {
                 tmux::resize_pane_width(tmux::MIN_WIDTH);
                 width = tmux::MIN_WIDTH;
             }
-            // Detect manual resize and sync to all sidebars (throttled)
             if last_width != 0
                 && width != last_width
                 && last_width_save.elapsed() >= Duration::from_millis(WIDTH_SAVE_THROTTLE_MS)
@@ -207,7 +276,6 @@ pub fn run() {
                 last_width_save = Instant::now();
             }
             last_width = width;
-            let stats = history.aggregated_stats(&cached_agents);
             print!(
                 "{}",
                 render::render_sidebar(
@@ -217,7 +285,7 @@ pub fn run() {
                     selected_idx,
                     scroll_offset,
                     &unseen_done,
-                    &stats,
+                    &current_stats,
                     header_expanded,
                     header_selected,
                 )
@@ -230,9 +298,7 @@ pub fn run() {
             match input::poll_input(Duration::from_millis(IDLE_CHECK_MS)) {
                 input::InputEvent::KeyUp => {
                     if header_selected {
-                        // Already at top, no-op
                     } else if selected_idx == 0 {
-                        // Move from first agent to header
                         header_selected = true;
                     } else {
                         let new_sel = selected_idx.saturating_sub(1);
@@ -242,7 +308,6 @@ pub fn run() {
                 }
                 input::InputEvent::KeyDown => {
                     if header_selected {
-                        // Move from header to first agent
                         header_selected = false;
                         set_selection(&cached_agents, 0);
                     } else {
@@ -291,7 +356,6 @@ pub fn run() {
                 input::InputEvent::MouseClick { y } => {
                     let hrows = render::header_rows(header_expanded);
                     if y >= 4 && y <= hrows {
-                        // Click on header stats area (rows 4..=hrows are the table)
                         header_expanded = !header_expanded;
                         header_user_toggled = true;
                         header_selected = true;
@@ -319,8 +383,118 @@ pub fn run() {
                 input::InputEvent::None => {}
             }
         } else {
-            let timeout = Duration::from_millis(IDLE_CHECK_MS);
-            let _ = input::poll_input(timeout);
+            let _ = input::poll_input(Duration::from_millis(IDLE_CHECK_MS));
+        }
+    }
+
+    if let SidebarRole::Leader { epoch, .. } = role {
+        runtime_store.release_leader(epoch);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_sidebar(
+    role: &mut SidebarRole,
+    runtime_store: &mut RuntimeStore,
+    cached_agents: &mut Vec<AgentInfo>,
+    current_stats: &mut AggregatedStats,
+    prev_states: &mut HashMap<String, AgentState>,
+    unseen_done: &mut HashSet<String>,
+) {
+    let mut snapshot_loaded = false;
+    let lease = runtime_store.read_lease();
+    if let Some(snapshot) = runtime_store.load_snapshot(&lease) {
+        apply_snapshot(
+            snapshot,
+            cached_agents,
+            current_stats,
+            prev_states,
+            unseen_done,
+        );
+        snapshot_loaded = true;
+    }
+
+    if runtime_store.lease_is_stale(&lease)
+        && let Some(epoch) = runtime_store.try_claim_leader()
+    {
+        *role = SidebarRole::Leader {
+            epoch,
+            last_refresh: Instant::now() - Duration::from_millis(runtime::POLL_INTERVAL_MS),
+        };
+        return;
+    }
+
+    *role = SidebarRole::Follower {
+        last_poll: if snapshot_loaded {
+            Instant::now()
+        } else {
+            Instant::now() - Duration::from_millis(runtime::POLL_INTERVAL_MS)
+        },
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_leader_state(
+    session: &str,
+    epoch: u64,
+    runtime_store: &mut RuntimeStore,
+    history: &mut HistoryStore,
+    detect_cache: &mut detect::SessionCache,
+    cached_agents: &mut Vec<AgentInfo>,
+    current_stats: &mut AggregatedStats,
+    prev_states: &mut HashMap<String, AgentState>,
+    unseen_done: &mut HashSet<String>,
+) -> bool {
+    if !runtime_store.heartbeat_leader(epoch) {
+        return false;
+    }
+
+    history.refresh_persistent_baseline();
+    let agents = detect::scan_agents(session, detect_cache);
+    let stats = history.aggregated_stats(&agents);
+    runtime_store.publish_snapshot(epoch, &agents, &stats);
+    apply_agents_update(prev_states, unseen_done, &agents);
+    *cached_agents = agents;
+    *current_stats = stats;
+    true
+}
+
+fn apply_snapshot(
+    snapshot: LiveSnapshot,
+    cached_agents: &mut Vec<AgentInfo>,
+    current_stats: &mut AggregatedStats,
+    prev_states: &mut HashMap<String, AgentState>,
+    unseen_done: &mut HashSet<String>,
+) {
+    apply_agents_update(prev_states, unseen_done, &snapshot.agents);
+    *cached_agents = snapshot.agents;
+    *current_stats = snapshot.stats;
+}
+
+fn apply_agents_update(
+    prev_states: &mut HashMap<String, AgentState>,
+    unseen_done: &mut HashSet<String>,
+    agents: &[AgentInfo],
+) {
+    for agent in agents {
+        if prev_states
+            .get(&agent.pane_id)
+            .is_some_and(|&prev| prev == AgentState::Working && agent.state == AgentState::Idle)
+        {
+            unseen_done.insert(agent.pane_id.clone());
+        }
+        prev_states.insert(agent.pane_id.clone(), agent.state);
+    }
+
+    let current_ids: HashSet<&str> = agents.iter().map(|agent| agent.pane_id.as_str()).collect();
+    prev_states.retain(|pane_id, _| current_ids.contains(pane_id.as_str()));
+    unseen_done.retain(|pane_id| current_ids.contains(pane_id.as_str()));
+
+    if let Some(current_window) = tmux::current_window_id() {
+        for agent in agents {
+            if agent.window_id == current_window {
+                unseen_done.remove(&agent.pane_id);
+            }
         }
     }
 }

@@ -5,9 +5,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use super::process::{AgentKind, DetectedAgent};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentState {
     Working,
     Idle,
@@ -116,6 +118,10 @@ impl SessionCache {
         });
         self.path_owners
             .retain(|_, owner| live_keys.contains(owner));
+    }
+
+    pub fn has_binding(&self, agent: &DetectedAgent) -> bool {
+        self.bindings.contains_key(&AgentBindingKey::from(agent))
     }
 
     fn get_or_update_with_metadata(
@@ -722,7 +728,11 @@ fn codex_candidate(path: &Path, cwd: &str, agent_age_secs: u64, now_secs: u64) -
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| now_secs.saturating_sub(d.as_secs()).abs_diff(agent_age_secs))
+                .map(|d| {
+                    now_secs
+                        .saturating_sub(d.as_secs())
+                        .abs_diff(agent_age_secs)
+                })
         })
     else {
         return CodexCandidate::Unscorable;
@@ -1157,7 +1167,7 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
                 if json_str(entry, &["payload", "type"]) == Some("function_call") =>
             {
                 if let Some(name) = json_str(entry, &["payload", "name"]) {
-                    last_activity = Some(name.to_string());
+                    last_activity = Some(extract_codex_tool_detail(name, entry));
                 }
             }
             _ => {}
@@ -1224,6 +1234,42 @@ fn extract_tool_detail(name: &str, item: &Value) -> String {
             format!("{name} {pat}")
         }
         _ => name.to_string(),
+    }
+}
+
+fn extract_codex_tool_detail(name: &str, entry: &Value) -> String {
+    let payload = entry.get("payload");
+    match name {
+        "exec_command" => {
+            let cmd = payload
+                .and_then(|value| value.get("arguments"))
+                .and_then(|value| value.as_str())
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|arguments| {
+                    arguments
+                        .get("cmd")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string())
+                });
+            match cmd {
+                Some(cmd) if !cmd.trim().is_empty() => truncate_activity(&cmd, 48),
+                _ => name.to_string(),
+            }
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn truncate_activity(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        let prefix = normalized
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>();
+        format!("{prefix}...")
     }
 }
 
@@ -1442,7 +1488,8 @@ mod tests {
         )
         .unwrap();
 
-        let selected = find_codex_jsonl_for_cwd_at(&dir, "/tmp/project", 10, &[], unix_now_secs()).unwrap();
+        let selected =
+            find_codex_jsonl_for_cwd_at(&dir, "/tmp/project", 10, &[], unix_now_secs()).unwrap();
         assert_eq!(selected, newer);
 
         let _ = fs::remove_dir_all(dir);
@@ -1745,6 +1792,25 @@ mod tests {
         );
 
         assert_eq!(detect_codex_state(&path, 300), AgentState::Idle);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_last_activity_shows_exec_command_text() {
+        let path = write_temp_jsonl(
+            "codex-last-activity-command",
+            r#"{"type":"session_meta","payload":{"id":"session-1"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"rtk git diff -- src/sidebar/runtime.rs\",\"workdir\":\"/tmp/demo\"}"}}
+"#,
+        );
+
+        let parsed = parse_codex_tokens(&path);
+
+        assert_eq!(
+            parsed.last_activity.as_deref(),
+            Some("rtk git diff -- src/sidebar/runtime.rs")
+        );
 
         let _ = fs::remove_file(path);
     }

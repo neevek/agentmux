@@ -4,11 +4,13 @@ pub mod state;
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::tmux;
 use process::AgentKind;
 pub use state::SessionCache;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub kind: AgentKind,
     pub pane_id: String,
@@ -36,7 +38,14 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     cache.retain_live_agents(&detected);
     // Bind the most constrained / best-scoring agents first so an older pane
     // cannot claim the only plausible JSONL for a newer same-cwd session.
-    detected.sort_by_key(|d| (state::binding_priority(d), d.elapsed_secs));
+    detected.sort_by_key(|d| {
+        let priority = if cache.has_binding(d) {
+            0
+        } else {
+            state::binding_priority(d)
+        };
+        (priority, d.elapsed_secs)
+    });
 
     let window_names = tmux::list_window_names(session);
 
