@@ -36,16 +36,9 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     let panes = tmux::list_session_panes(session);
     let mut detected = process::scan_panes_for_agents(&panes, crate::tmux::SIDEBAR_TITLE);
     cache.retain_live_agents(&detected);
-    // Bind the most constrained / best-scoring agents first so an older pane
-    // cannot claim the only plausible JSONL for a newer same-cwd session.
-    detected.sort_by_key(|d| {
-        let priority = if cache.has_binding(d) {
-            0
-        } else {
-            state::binding_priority(d)
-        };
-        (priority, d.elapsed_secs)
-    });
+    // Bind the most constrained / best-scoring agents first so a newer pane
+    // can claim its session before an older same-cwd pane attempts a rebind.
+    detected.sort_by_key(scan_order_key);
 
     let window_names = tmux::list_window_names(session);
 
@@ -74,6 +67,7 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
                 )
             })
             .unwrap_or(0.0);
+        let elapsed_secs = display_elapsed_secs(d.kind, d.elapsed_secs, &details);
         agents.push(AgentInfo {
             kind: d.kind,
             pane_id: d.pane_id,
@@ -81,7 +75,7 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
             window_id: d.window_id,
             window_name,
             state: details.state,
-            elapsed_secs: d.elapsed_secs,
+            elapsed_secs,
             input_tokens: details.input_tokens,
             output_tokens: details.output_tokens,
             last_activity: details.last_activity,
@@ -99,6 +93,21 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     agents.sort_by_key(|a| a.elapsed_secs);
 
     agents
+}
+
+fn scan_order_key(agent: &process::DetectedAgent) -> (u64, u64) {
+    (state::binding_priority(agent), agent.elapsed_secs)
+}
+
+fn display_elapsed_secs(
+    kind: AgentKind,
+    process_elapsed_secs: u64,
+    details: &state::SessionDetails,
+) -> u64 {
+    match kind {
+        AgentKind::Codex => details.display_elapsed_secs.unwrap_or(process_elapsed_secs),
+        AgentKind::ClaudeCode => process_elapsed_secs,
+    }
 }
 
 /// Fast scan for startup: discovers active agent panes without JSONL/state lookup.
@@ -210,4 +219,53 @@ pub(crate) fn short_model_name(model: &str) -> String {
         }
     }
     base_name.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_prefers_session_elapsed_over_process_elapsed() {
+        let details = state::SessionDetails {
+            display_elapsed_secs: Some(12),
+            ..Default::default()
+        };
+
+        assert_eq!(display_elapsed_secs(AgentKind::Codex, 3600, &details), 12);
+    }
+
+    #[test]
+    fn claude_keeps_process_elapsed() {
+        let details = state::SessionDetails {
+            display_elapsed_secs: Some(12),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            display_elapsed_secs(AgentKind::ClaudeCode, 3600, &details),
+            3600
+        );
+    }
+
+    #[test]
+    fn newer_agent_wins_scan_order_when_priority_ties() {
+        let older = process::DetectedAgent {
+            kind: AgentKind::Codex,
+            pane_id: "%1".to_string(),
+            cwd: "/tmp/project".to_string(),
+            window_id: "@1".to_string(),
+            window_index: 1,
+            agent_pid: 101,
+            elapsed_secs: 900,
+        };
+        let newer = process::DetectedAgent {
+            pane_id: "%2".to_string(),
+            agent_pid: 202,
+            elapsed_secs: 90,
+            ..older.clone()
+        };
+
+        assert!(scan_order_key(&newer) < scan_order_key(&older));
+    }
 }

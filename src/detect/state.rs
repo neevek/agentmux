@@ -31,6 +31,7 @@ pub struct SessionDetails {
     pub turn_count: u32,
     pub session_id: Option<String>,
     pub jsonl_path: Option<PathBuf>,
+    pub display_elapsed_secs: Option<u64>,
 }
 
 impl Default for SessionDetails {
@@ -48,6 +49,7 @@ impl Default for SessionDetails {
             turn_count: 0,
             session_id: None,
             jsonl_path: None,
+            display_elapsed_secs: None,
         }
     }
 }
@@ -118,10 +120,6 @@ impl SessionCache {
         });
         self.path_owners
             .retain(|_, owner| live_keys.contains(owner));
-    }
-
-    pub fn has_binding(&self, agent: &DetectedAgent) -> bool {
-        self.bindings.contains_key(&AgentBindingKey::from(agent))
     }
 
     fn get_or_update_with_metadata(
@@ -275,23 +273,90 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
 
 pub fn codex_details(agent: &DetectedAgent, cache: &mut SessionCache) -> SessionDetails {
     let sessions_dir = codex_sessions_dir();
-    let jsonl_path = cache
-        .bound_path_for_agent(agent, extract_codex_session_id)
-        .or_else(|| {
-            let claimed_paths = cache.claimed_paths_for_agent(agent);
-            sessions_dir.as_ref().and_then(|d| {
-                find_codex_jsonl_for_cwd(d, &agent.cwd, agent.elapsed_secs, &claimed_paths)
-            })
-        });
-    let details = agent_details(
+    let jsonl_path = sessions_dir
+        .as_ref()
+        .and_then(|dir| select_codex_jsonl_path(dir, agent, cache, unix_now_secs()));
+    let mut details = agent_details(
         jsonl_path.as_deref(),
         agent.elapsed_secs,
         cache,
         detect_codex_state,
         parse_codex_tokens,
     );
+    details.display_elapsed_secs = details
+        .jsonl_path
+        .as_deref()
+        .and_then(|path| codex_session_elapsed_secs(path, unix_now_secs()));
     update_binding(cache, agent, &details);
     details
+}
+
+fn select_codex_jsonl_path(
+    sessions_dir: &Path,
+    agent: &DetectedAgent,
+    cache: &mut SessionCache,
+    now_secs: u64,
+) -> Option<PathBuf> {
+    let current_path = cache.bound_path_for_agent(agent, extract_codex_session_id);
+    let claimed_paths = cache.claimed_paths_for_agent(agent);
+    let newer_replacement = current_path.as_deref().and_then(|current| {
+        find_newer_codex_session_replacement(sessions_dir, current, &agent.cwd, &claimed_paths)
+    });
+    let candidate_path = find_codex_jsonl_for_cwd_at(
+        sessions_dir,
+        &agent.cwd,
+        agent.elapsed_secs,
+        &claimed_paths,
+        now_secs,
+    );
+
+    if newer_replacement.is_some() {
+        return newer_replacement;
+    }
+
+    match (current_path, candidate_path) {
+        (Some(current), Some(candidate))
+            if current != candidate
+                && should_replace_codex_binding(
+                    &current,
+                    &candidate,
+                    &agent.cwd,
+                    agent.elapsed_secs,
+                    now_secs,
+                ) =>
+        {
+            Some(candidate)
+        }
+        (Some(current), _) => Some(current),
+        (None, candidate) => candidate,
+    }
+}
+
+fn find_newer_codex_session_replacement(
+    sessions_dir: &Path,
+    current_path: &Path,
+    cwd: &str,
+    used_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    let current_start = codex_session_start_secs(current_path)?;
+    let mut files = Vec::new();
+    walk_jsonl(sessions_dir, &mut files);
+
+    files
+        .into_iter()
+        .filter(|path| path != current_path)
+        .filter(|path| !used_paths.iter().any(|used| used == path))
+        .filter_map(|path| {
+            let meta = parse_codex_session_meta(&path)?;
+            let session_cwd = json_str(&meta, &["payload", "cwd"])?;
+            if !codex_cwds_match(cwd, session_cwd) {
+                return None;
+            }
+            let started = codex_session_start_secs(&path)?;
+            (started > current_start).then_some((started, path))
+        })
+        .max_by_key(|(started, _)| *started)
+        .map(|(_, path)| path)
 }
 
 pub(crate) fn binding_priority(agent: &DetectedAgent) -> u64 {
@@ -392,6 +457,7 @@ fn agent_details(
         turn_count: cached.turn_count,
         session_id: cached.session_id.clone(),
         jsonl_path: Some(path.to_path_buf()),
+        display_elapsed_secs: None,
     }
 }
 
@@ -572,21 +638,6 @@ pub(crate) fn walk_jsonl(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn find_codex_jsonl_for_cwd(
-    sessions_dir: &Path,
-    cwd: &str,
-    agent_age_secs: u64,
-    used_paths: &[PathBuf],
-) -> Option<PathBuf> {
-    find_codex_jsonl_for_cwd_at(
-        sessions_dir,
-        cwd,
-        agent_age_secs,
-        used_paths,
-        unix_now_secs(),
-    )
-}
-
 fn find_codex_jsonl_for_cwd_at(
     sessions_dir: &Path,
     cwd: &str,
@@ -695,6 +746,27 @@ fn compare_codex_candidates(
         })
 }
 
+fn should_replace_codex_binding(
+    current_path: &Path,
+    candidate_path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+) -> bool {
+    let current_score = codex_match_score(current_path, cwd, agent_age_secs, now_secs);
+    let candidate_score = codex_match_score(candidate_path, cwd, agent_age_secs, now_secs);
+
+    match (current_score, candidate_score) {
+        (Some(current), Some(candidate)) => compare_codex_candidates(
+            &(candidate, candidate_path.to_path_buf()),
+            &(current, current_path.to_path_buf()),
+        )
+        .is_lt(),
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 fn codex_match_score(
     path: &Path,
     cwd: &str,
@@ -787,6 +859,24 @@ fn codex_has_token_count(path: &Path) -> bool {
         }
     }
     false
+}
+
+fn codex_session_elapsed_secs(path: &Path, now_secs: u64) -> Option<u64> {
+    Some(now_secs.saturating_sub(codex_session_start_secs(path)?))
+}
+
+fn codex_session_start_secs(path: &Path) -> Option<u64> {
+    parse_codex_session_meta(path)
+        .and_then(|meta| {
+            json_str(&meta, &["payload", "timestamp"]).and_then(parse_rfc3339_utc_secs)
+        })
+        .or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+        })
 }
 
 fn parse_rfc3339_utc_secs(s: &str) -> Option<u64> {
@@ -1971,6 +2061,30 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_drops_codex_binding_when_session_id_changes() {
+        let path = write_temp_jsonl(
+            "codex-binding-session-id-change",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        );
+        let agent = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 90);
+        let mut cache = SessionCache::new();
+
+        cache.bind_agent_path(&agent, path.clone(), Some("session-1".to_string()));
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:03:20.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.bound_path_for_agent(&agent, extract_codex_session_id),
+            None
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn session_cache_prevents_double_claiming_same_jsonl_path() {
         let path = write_temp_jsonl(
             "codex-binding-owner",
@@ -1991,6 +2105,92 @@ mod tests {
             cache.bound_path_for_agent(&other, extract_codex_session_id),
             None
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_selects_fresher_candidate_over_stale_bound_path() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-select-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let current_path = sessions_dir.join("current.jsonl");
+        let candidate_path = sessions_dir.join("candidate.jsonl");
+        fs::write(
+            &current_path,
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+
+        let agent = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 900);
+        let mut cache = SessionCache::new();
+        cache.bind_agent_path(&agent, current_path.clone(), Some("session-1".to_string()));
+
+        let selected = select_codex_jsonl_path(&sessions_dir, &agent, &mut cache, 1000).unwrap();
+        assert_eq!(selected, candidate_path);
+
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(sessions_dir);
+    }
+
+    #[test]
+    fn codex_keeps_scored_bound_path_over_unscorable_candidate() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let current_path = sessions_dir.join("current.jsonl");
+        let candidate_path = sessions_dir.join("candidate.jsonl");
+        fs::write(
+            &current_path,
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:15:30.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            r#"{"type":"event_msg","payload":{"type":"user_message"}}"#,
+        )
+        .unwrap();
+
+        let agent = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 70);
+        let mut cache = SessionCache::new();
+        cache.bind_agent_path(&agent, current_path.clone(), Some("session-1".to_string()));
+
+        let selected = select_codex_jsonl_path(&sessions_dir, &agent, &mut cache, 1000).unwrap();
+        assert_eq!(selected, current_path);
+
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(sessions_dir);
+    }
+
+    #[test]
+    fn codex_session_elapsed_uses_session_meta_timestamp() {
+        let path = write_temp_jsonl(
+            "codex-session-elapsed",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        );
+
+        assert_eq!(codex_session_elapsed_secs(&path, 160), Some(60));
 
         let _ = fs::remove_file(path);
     }
