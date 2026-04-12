@@ -180,6 +180,40 @@ impl SessionCache {
         &self.entries[path].tokens
     }
 
+    fn get_or_update_codex_with_metadata(
+        &mut self,
+        path: &Path,
+        current_metadata: FileMetadata,
+    ) -> &ParsedTokens {
+        let cached = self.entries.get(path).cloned();
+        let needs_update = cached
+            .as_ref()
+            .is_none_or(|entry| entry.metadata != current_metadata);
+
+        if needs_update {
+            let tokens = cached
+                .as_ref()
+                .and_then(|entry| {
+                    parse_codex_tokens_incremental(
+                        path,
+                        entry.metadata,
+                        current_metadata,
+                        &entry.tokens,
+                    )
+                })
+                .unwrap_or_else(|| parse_codex_tokens(path));
+            self.entries.insert(
+                path.to_path_buf(),
+                CachedData {
+                    metadata: current_metadata,
+                    tokens,
+                },
+            );
+        }
+
+        &self.entries[path].tokens
+    }
+
     fn claimed_paths_for_agent(&self, agent: &DetectedAgent) -> Vec<PathBuf> {
         let key = AgentBindingKey::from(agent);
         self.path_owners
@@ -301,7 +335,7 @@ impl SessionCache {
     }
 
     fn codex_files(&mut self, sessions_dir: &Path, now_secs: u64) -> Vec<PathBuf> {
-        self.refresh_codex_index(sessions_dir, now_secs);
+        self.refresh_codex_file_index(sessions_dir, now_secs);
         self.codex_index
             .as_ref()
             .map(|index| index.files.clone())
@@ -312,14 +346,39 @@ impl SessionCache {
         &mut self,
         sessions_dir: &Path,
         path: &Path,
-        now_secs: u64,
+        _now_secs: u64,
     ) -> Option<CodexSessionMeta> {
-        self.refresh_codex_index(sessions_dir, now_secs);
-        self.codex_index.as_ref()?.entries.get(path).cloned()
+        if !sessions_dir.is_dir() || !path.is_file() {
+            return None;
+        }
+
+        let metadata = file_metadata(path);
+        let index = self
+            .codex_index
+            .get_or_insert_with(CodexSessionIndex::default);
+        if index.root != sessions_dir {
+            *index = CodexSessionIndex {
+                root: sessions_dir.to_path_buf(),
+                ..CodexSessionIndex::default()
+            };
+        }
+
+        let needs_update = index
+            .entries
+            .get(path)
+            .is_none_or(|entry| entry.metadata != metadata);
+        if needs_update {
+            index.entries.insert(
+                path.to_path_buf(),
+                parse_codex_session_meta_cached(path, metadata),
+            );
+        }
+
+        index.entries.get(path).cloned()
     }
 
     fn codex_has_token_count(&mut self, sessions_dir: &Path, path: &Path, now_secs: u64) -> bool {
-        self.refresh_codex_index(sessions_dir, now_secs);
+        self.refresh_codex_file_index(sessions_dir, now_secs);
         let Some(index) = self.codex_index.as_mut() else {
             return false;
         };
@@ -335,7 +394,7 @@ impl SessionCache {
         has_token_count
     }
 
-    fn refresh_codex_index(&mut self, sessions_dir: &Path, now_secs: u64) {
+    fn refresh_codex_file_index(&mut self, sessions_dir: &Path, now_secs: u64) {
         if !sessions_dir.is_dir() {
             self.codex_index = None;
             return;
@@ -433,12 +492,12 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
     let projects_dir = home.join(".claude").join("projects").join(&encoded);
     let jsonl_path = select_claude_jsonl_path(&projects_dir, agent, cache, unix_now_secs());
     let details = agent_details(
+        AgentKind::ClaudeCode,
         jsonl_path.as_deref(),
         agent.elapsed_secs,
         !agent.resumed,
         cache,
         detect_claude_state,
-        parse_claude_tokens,
     );
     update_binding(cache, agent, &details);
     details
@@ -451,12 +510,12 @@ pub fn codex_details(agent: &DetectedAgent, cache: &mut SessionCache) -> Session
         .as_ref()
         .and_then(|dir| select_codex_jsonl_path(dir, agent, cache, now_secs));
     let mut details = agent_details(
+        AgentKind::Codex,
         jsonl_path.as_deref(),
         agent.elapsed_secs,
         !agent.resumed,
         cache,
         detect_codex_state,
-        parse_codex_tokens,
     );
     details.display_elapsed_secs = details.jsonl_path.as_deref().and_then(|path| {
         sessions_dir
@@ -478,23 +537,23 @@ pub fn refresh_bound_details(
 ) -> SessionDetails {
     let mut details = match kind {
         AgentKind::ClaudeCode => agent_details(
+            AgentKind::ClaudeCode,
             jsonl_path,
             agent_age_secs,
             !resumed,
             cache,
             detect_claude_state,
-            parse_claude_tokens,
         ),
         AgentKind::Codex => {
             let now_secs = unix_now_secs();
             let sessions_dir = codex_sessions_dir();
             let mut details = agent_details(
+                AgentKind::Codex,
                 jsonl_path,
                 agent_age_secs,
                 !resumed,
                 cache,
                 detect_codex_state,
-                parse_codex_tokens,
             );
             details.display_elapsed_secs = details.jsonl_path.as_deref().and_then(|path| {
                 sessions_dir
@@ -551,6 +610,7 @@ pub fn refresh_tracked_details(
         .is_some_and(|path| !agent.resumed && !bound_path_is_recent(path, BOUND_PATH_LIVE_SECS));
     let should_probe_now = should_probe_bound_session(
         &detected,
+        agent.state,
         details.state,
         needs_rebind_probe,
         cache,
@@ -575,12 +635,15 @@ pub fn refresh_tracked_details(
 
 fn should_probe_bound_session(
     agent: &DetectedAgent,
+    previous_state: AgentState,
     state: AgentState,
     needs_rebind_probe: bool,
     cache: &mut SessionCache,
     now_secs: u64,
 ) -> bool {
-    needs_rebind_probe && (state == AgentState::Idle || cache.should_probe_rebind(agent, now_secs))
+    needs_rebind_probe
+        && ((previous_state == AgentState::Working && state == AgentState::Idle)
+            || cache.should_probe_rebind(agent, now_secs))
 }
 
 fn select_claude_jsonl_path(
@@ -609,47 +672,51 @@ fn select_codex_jsonl_path(
 ) -> Option<PathBuf> {
     let current_path = cache.bound_path_for_agent(agent, extract_codex_session_id);
     let claimed_paths = cache.claimed_paths_for_agent(agent);
-    let newer_replacement = current_path.as_deref().and_then(|current| {
-        find_newer_codex_session_replacement_cached(
+
+    if let Some(current) = &current_path {
+        if let Some(replacement) = find_newer_codex_session_replacement_cached(
             sessions_dir,
             current,
             &agent.cwd,
             &claimed_paths,
             cache,
             now_secs,
-        )
-    });
-    let candidate_path = find_codex_jsonl_for_cwd_at_cached(
-        sessions_dir,
-        &agent.cwd,
-        agent.elapsed_secs,
-        agent.resumed,
-        &claimed_paths,
-        now_secs,
-        cache,
-    );
+        ) {
+            return if bound_path_is_recent(&replacement, BOUND_PATH_LIVE_SECS) {
+                Some(replacement)
+            } else {
+                current_path
+            };
+        }
 
-    if let Some(current) = &current_path {
-        let replacement = if newer_replacement.is_some() {
-            newer_replacement
-        } else {
-            match candidate_path {
+        if bound_path_is_recent(current, BOUND_PATH_LIVE_SECS) {
+            return current_path;
+        }
+
+        let replacement = match find_codex_jsonl_for_cwd_at_cached(
+            sessions_dir,
+            &agent.cwd,
+            agent.elapsed_secs,
+            agent.resumed,
+            &claimed_paths,
+            now_secs,
+            cache,
+        ) {
+            Some(candidate)
+                if current != &candidate
+                    && should_replace_codex_binding_cached(
+                        sessions_dir,
+                        current,
+                        &candidate,
+                        &agent.cwd,
+                        agent.elapsed_secs,
+                        now_secs,
+                        cache,
+                    ) =>
+            {
                 Some(candidate)
-                    if current != &candidate
-                        && should_replace_codex_binding_cached(
-                            sessions_dir,
-                            current,
-                            &candidate,
-                            &agent.cwd,
-                            agent.elapsed_secs,
-                            now_secs,
-                            cache,
-                        ) =>
-                {
-                    Some(candidate)
-                }
-                _ => None,
             }
+            _ => None,
         };
 
         return replacement
@@ -657,7 +724,15 @@ fn select_codex_jsonl_path(
             .or(current_path);
     }
 
-    candidate_path
+    find_codex_jsonl_for_cwd_at_cached(
+        sessions_dir,
+        &agent.cwd,
+        agent.elapsed_secs,
+        agent.resumed,
+        &claimed_paths,
+        now_secs,
+        cache,
+    )
 }
 
 fn bound_path_is_recent(path: &Path, max_age_secs: u64) -> bool {
@@ -779,12 +854,12 @@ fn update_binding(cache: &mut SessionCache, agent: &DetectedAgent, details: &Ses
 }
 
 fn agent_details(
+    kind: AgentKind,
     jsonl_path: Option<&Path>,
     agent_age_secs: u64,
     enforce_file_age_match: bool,
     cache: &mut SessionCache,
     detect_state: fn(&Path, u64) -> AgentState,
-    parse_tokens: fn(&Path) -> ParsedTokens,
 ) -> SessionDetails {
     let Some(path) = jsonl_path else {
         return SessionDetails::default();
@@ -814,7 +889,12 @@ fn agent_details(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     };
-    let cached = cache.get_or_update_with_metadata(path, parse_tokens, metadata);
+    let cached = match kind {
+        AgentKind::ClaudeCode => {
+            cache.get_or_update_with_metadata(path, parse_claude_tokens, metadata)
+        }
+        AgentKind::Codex => cache.get_or_update_codex_with_metadata(path, metadata),
+    };
     SessionDetails {
         state,
         input_tokens: cached.input_tokens,
@@ -1777,86 +1857,129 @@ fn claude_effort_level() -> Option<String> {
 }
 
 pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
-    let entries = read_jsonl(path, None);
-    let mut input_tokens: u64 = 0;
-    let mut output_tokens: u64 = 0;
-    let mut last_activity: Option<String> = None;
-    let mut context_window: u64 = 0;
-    let mut last_turn_input: u64 = 0;
-    let mut model: Option<String> = None;
-    let mut effort: Option<String> = None;
-    let mut turn_count: u32 = 0;
-    let mut session_id: Option<String> = None;
+    let mut parsed = ParsedTokens {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        last_activity: None,
+        context_pct: None,
+        model: None,
+        effort: None,
+        turn_count: 0,
+        session_id: None,
+    };
 
-    for entry in &entries {
-        // Extract session id from session_meta entry
-        if session_id.is_none() && json_str(entry, &["type"]) == Some("session_meta") {
-            session_id = json_str(entry, &["payload", "id"]).map(|s| s.to_string());
-        }
-        match json_str(entry, &["type"]) {
-            Some("turn_context") => {
-                // Primary source for model name and effort level
-                if let Some(m) = json_str(entry, &["payload", "model"]) {
-                    model = Some(m.to_string());
-                }
-                if let Some(e) = json_str(entry, &["payload", "effort"]) {
-                    effort = Some(e.to_string());
-                }
-            }
-            Some("event_msg") => match json_str(entry, &["payload", "type"]) {
-                Some("token_count") => {
-                    if let Some(info) = entry.get("payload").and_then(|p| p.get("info")) {
-                        let get_from = |section: &str, field: &str| {
-                            info.get(section)
-                                .and_then(|s| s.get(field))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                        };
-                        input_tokens = get_from("total_token_usage", "input_tokens");
-                        output_tokens = get_from("total_token_usage", "output_tokens");
-                        last_turn_input = get_from("last_token_usage", "input_tokens");
-                        context_window = info
-                            .get("model_context_window")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(context_window);
-                    }
-                }
-                Some("user_message") => {
-                    turn_count += 1;
-                }
-                _ => {}
-            },
-            Some("response_item")
-                if json_str(entry, &["payload", "type"]) == Some("function_call") =>
-            {
-                if let Some(name) = json_str(entry, &["payload", "name"]) {
-                    last_activity = Some(extract_codex_tool_detail(name, entry));
-                }
-            }
-            _ => {}
-        }
+    for entry in read_jsonl(path, None) {
+        apply_codex_entry(&entry, &mut parsed);
     }
 
-    let context_pct = (context_window > 0 && last_turn_input > 0)
-        .then(|| ((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8);
+    fill_codex_session_id_fallback(path, &mut parsed);
+    parsed
+}
 
-    if session_id.is_none() {
-        session_id = path
+fn parse_codex_tokens_incremental(
+    path: &Path,
+    previous_metadata: FileMetadata,
+    current_metadata: FileMetadata,
+    previous_tokens: &ParsedTokens,
+) -> Option<ParsedTokens> {
+    if current_metadata.size <= previous_metadata.size {
+        return None;
+    }
+    if !file_ends_with_newline(path, previous_metadata.size) {
+        return None;
+    }
+
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(previous_metadata.size)).ok()?;
+
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    let mut parsed = previous_tokens.clone();
+    for line in buf.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        apply_codex_entry(&entry, &mut parsed);
+    }
+
+    fill_codex_session_id_fallback(path, &mut parsed);
+    Some(parsed)
+}
+
+fn fill_codex_session_id_fallback(path: &Path, parsed: &mut ParsedTokens) {
+    if parsed.session_id.is_none() {
+        parsed.session_id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.to_string());
     }
-    ParsedTokens {
-        input_tokens,
-        output_tokens,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-        last_activity,
-        context_pct,
-        model,
-        effort,
-        turn_count,
-        session_id,
+}
+
+fn file_ends_with_newline(path: &Path, size: u64) -> bool {
+    if size == 0 {
+        return true;
+    }
+
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(size.saturating_sub(1))).is_err() {
+        return false;
+    }
+
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
+}
+
+fn apply_codex_entry(entry: &Value, parsed: &mut ParsedTokens) {
+    if parsed.session_id.is_none() && json_str(entry, &["type"]) == Some("session_meta") {
+        parsed.session_id = json_str(entry, &["payload", "id"]).map(|s| s.to_string());
+    }
+
+    match json_str(entry, &["type"]) {
+        Some("turn_context") => {
+            if let Some(model) = json_str(entry, &["payload", "model"]) {
+                parsed.model = Some(model.to_string());
+            }
+            if let Some(effort) = json_str(entry, &["payload", "effort"]) {
+                parsed.effort = Some(effort.to_string());
+            }
+        }
+        Some("event_msg") => match json_str(entry, &["payload", "type"]) {
+            Some("token_count") => {
+                if let Some(info) = entry.get("payload").and_then(|p| p.get("info")) {
+                    let get_from = |section: &str, field: &str| {
+                        info.get(section)
+                            .and_then(|s| s.get(field))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                    };
+                    parsed.input_tokens = get_from("total_token_usage", "input_tokens");
+                    parsed.output_tokens = get_from("total_token_usage", "output_tokens");
+                    let last_turn_input = get_from("last_token_usage", "input_tokens");
+                    let context_window = info
+                        .get("model_context_window")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    parsed.context_pct = (context_window > 0 && last_turn_input > 0).then(|| {
+                        ((last_turn_input as f64 / context_window as f64) * 100.0).min(100.0) as u8
+                    });
+                }
+            }
+            Some("user_message") => {
+                parsed.turn_count += 1;
+            }
+            _ => {}
+        },
+        Some("response_item") if json_str(entry, &["payload", "type"]) == Some("function_call") => {
+            if let Some(name) = json_str(entry, &["payload", "name"]) {
+                parsed.last_activity = Some(extract_codex_tool_detail(name, entry));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2529,6 +2652,109 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_incrementally_updates_codex_tokens_on_append() {
+        let path = write_temp_jsonl(
+            "codex-incremental-cache",
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.4","effort":"high"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"rtk rg foo\",\"workdir\":\"/tmp/project\"}"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":4},"last_token_usage":{"input_tokens":12},"model_context_window":200000}}}"#,
+                "\n"
+            ),
+        );
+        let mut cache = SessionCache::new();
+
+        let initial = cache
+            .get_or_update_codex_with_metadata(&path, file_metadata(&path))
+            .clone();
+        assert_eq!(initial.input_tokens, 12);
+        assert_eq!(initial.output_tokens, 4);
+        assert_eq!(initial.turn_count, 1);
+        assert_eq!(initial.session_id.as_deref(), Some("session-1"));
+        assert_eq!(initial.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(initial.effort.as_deref(), Some("high"));
+        assert_eq!(initial.last_activity.as_deref(), Some("rtk rg foo"));
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                concat!(
+                    r#"{"type":"event_msg","payload":{"type":"user_message"}}"#,
+                    "\n",
+                    r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"rtk cargo test\",\"workdir\":\"/tmp/project\"}"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":21,"output_tokens":9},"last_token_usage":{"input_tokens":9},"model_context_window":200000}}}"#,
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let updated = cache
+            .get_or_update_codex_with_metadata(&path, file_metadata(&path))
+            .clone();
+        assert_eq!(updated.input_tokens, 21);
+        assert_eq!(updated.output_tokens, 9);
+        assert_eq!(updated.turn_count, 2);
+        assert_eq!(updated.session_id.as_deref(), Some("session-1"));
+        assert_eq!(updated.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(updated.effort.as_deref(), Some("high"));
+        assert_eq!(updated.last_activity.as_deref(), Some("rtk cargo test"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_cache_falls_back_to_full_codex_parse_when_previous_snapshot_had_no_newline() {
+        let path = write_temp_jsonl(
+            "codex-incremental-fallback",
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message"}}"#
+            ),
+        );
+        let mut cache = SessionCache::new();
+
+        let initial = cache
+            .get_or_update_codex_with_metadata(&path, file_metadata(&path))
+            .clone();
+        assert_eq!(initial.turn_count, 1);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                concat!(
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"user_message"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":8,"output_tokens":3},"last_token_usage":{"input_tokens":4},"model_context_window":200000}}}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let updated = cache
+            .get_or_update_codex_with_metadata(&path, file_metadata(&path))
+            .clone();
+        assert_eq!(updated.turn_count, 2);
+        assert_eq!(updated.input_tokens, 8);
+        assert_eq!(updated.output_tokens, 3);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn claude_jsonl_selection_uses_process_age_and_excludes_used_paths() {
         let dir = std::env::temp_dir().join(format!(
             "agentmux-claude-select-{}-{}",
@@ -2946,6 +3172,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_does_not_switch_stale_bound_path_to_stale_candidate() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "agentmux-codex-stale-candidate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let current_path = sessions_dir.join("current.jsonl");
+        let candidate_path = sessions_dir.join("candidate.jsonl");
+        fs::write(
+            &current_path,
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
+        )
+        .unwrap();
+        set_file_mtime_secs(&current_path, 0);
+        set_file_mtime_secs(&candidate_path, 0);
+
+        let agent = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
+        let mut cache = SessionCache::new();
+        cache.bind_agent_path(&agent, current_path.clone(), Some("session-1".to_string()));
+
+        let selected = select_codex_jsonl_path(&sessions_dir, &agent, &mut cache, 1000).unwrap();
+        assert_eq!(selected, current_path);
+
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(sessions_dir);
+    }
+
+    #[test]
     fn refresh_tracked_codex_details_uses_existing_bound_session_details() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "agentmux-codex-refresh-bound-{}-{}",
@@ -3015,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_idle_binding_bypasses_rebind_backoff() {
+    fn stale_idle_binding_after_working_state_bypasses_rebind_backoff() {
         let mut cache = SessionCache::new();
         let detected = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
         cache.bind_agent_path(
@@ -3031,6 +3296,32 @@ mod tests {
 
         assert!(should_probe_bound_session(
             &detected,
+            AgentState::Working,
+            AgentState::Idle,
+            true,
+            &mut cache,
+            120,
+        ));
+    }
+
+    #[test]
+    fn stale_idle_binding_after_idle_state_respects_rebind_backoff() {
+        let mut cache = SessionCache::new();
+        let detected = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
+        cache.bind_agent_path(
+            &detected,
+            PathBuf::from("/tmp/session-1.jsonl"),
+            Some("session-1".to_string()),
+        );
+
+        let key = AgentBindingKey::from(&detected);
+        let binding = cache.bindings.get_mut(&key).unwrap();
+        binding.rebind_probe_due_at = u64::MAX;
+        binding.rebind_probe_backoff_secs = MIN_REBIND_PROBE_SECS;
+
+        assert!(!should_probe_bound_session(
+            &detected,
+            AgentState::Idle,
             AgentState::Idle,
             true,
             &mut cache,
@@ -3055,6 +3346,7 @@ mod tests {
 
         assert!(!should_probe_bound_session(
             &detected,
+            AgentState::Working,
             AgentState::Working,
             true,
             &mut cache,
