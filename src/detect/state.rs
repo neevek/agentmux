@@ -82,6 +82,9 @@ struct SessionBinding {
     last_agent_pid: u32,
     rebind_probe_due_at: u64,
     rebind_probe_backoff_secs: u64,
+    /// Cached session start time (epoch seconds) parsed once from the JSONL
+    /// header.  Immutable for the lifetime of a file, so never needs refresh.
+    session_start_secs: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -289,6 +292,13 @@ impl SessionCache {
             })
             .unwrap_or((0, MIN_REBIND_PROBE_SECS));
 
+        // Reuse cached session start if the path hasn't changed.
+        let session_start_secs = self
+            .bindings
+            .get(&key)
+            .filter(|b| b.jsonl_path == jsonl_path)
+            .and_then(|b| b.session_start_secs);
+
         self.path_owners.insert(jsonl_path.clone(), key.clone());
         self.bindings.insert(
             key,
@@ -298,8 +308,24 @@ impl SessionCache {
                 last_agent_pid: agent.agent_pid,
                 rebind_probe_due_at,
                 rebind_probe_backoff_secs,
+                session_start_secs,
             },
         );
+    }
+
+    /// Return the cached session start time for this agent's binding, parsing
+    /// the JSONL header on first access.  Subsequent calls are free.
+    fn claude_session_start_secs_cached(&mut self, agent: &DetectedAgent) -> Option<u64> {
+        let key = AgentBindingKey::from(agent);
+        let binding = self.bindings.get(&key)?;
+        if binding.session_start_secs.is_some() {
+            return binding.session_start_secs;
+        }
+        let start = claude_session_start_secs(&binding.jsonl_path);
+        if let Some(b) = self.bindings.get_mut(&key) {
+            b.session_start_secs = start;
+        }
+        start
     }
 
     fn unbind_agent(&mut self, agent: &DetectedAgent) {
@@ -481,6 +507,12 @@ const INFERRED_WORKING_STALE_SECS: u64 = 24 * 60 * 60;
 /// and the agent process age for the file to be considered a match.  Prevents
 /// a freshly-started process from claiming a session that began hours earlier.
 const MAX_CLAUDE_AGE_MISMATCH_SECS: u64 = 300;
+/// When a bound Claude file is stale, an unclaimed file must have been modified
+/// within this many seconds to be considered a live replacement.  Also used as
+/// the staleness threshold before an existing Claude binding will consider
+/// switching — generous enough to survive normal conversation pauses, tight
+/// enough to detect /new or /clear resets within a couple of minutes.
+const CLAUDE_REPLACEMENT_LIVE_SECS: u64 = 120;
 
 // --- Public API ---
 
@@ -490,8 +522,9 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
     };
     let encoded = encode_project_dir(&agent.cwd);
     let projects_dir = home.join(".claude").join("projects").join(&encoded);
-    let jsonl_path = select_claude_jsonl_path(&projects_dir, agent, cache, unix_now_secs());
-    let details = agent_details(
+    let now_secs = unix_now_secs();
+    let jsonl_path = select_claude_jsonl_path(&projects_dir, agent, cache, now_secs);
+    let mut details = agent_details(
         AgentKind::ClaudeCode,
         jsonl_path.as_deref(),
         agent.elapsed_secs,
@@ -500,6 +533,9 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
         detect_claude_state,
     );
     update_binding(cache, agent, &details);
+    details.display_elapsed_secs = cache
+        .claude_session_start_secs_cached(agent)
+        .and_then(|start| now_secs.checked_sub(start));
     details
 }
 
@@ -654,14 +690,51 @@ fn select_claude_jsonl_path(
 ) -> Option<PathBuf> {
     let current_path = cache.bound_path_for_agent(agent, extract_claude_session_id);
     let claimed_paths = cache.claimed_paths_for_agent(agent);
-    find_claude_jsonl_for_cwd_at(
+
+    if let Some(current) = &current_path {
+        // Already bound.  Use a short staleness threshold when this is the only
+        // Claude pane for this project dir (no stealing risk, fast /new detection).
+        // Use the longer threshold when other Claude panes compete for the same
+        // files — prevents stealing during normal conversation pauses.
+        let staleness = if claimed_paths.is_empty() {
+            BOUND_PATH_LIVE_SECS
+        } else {
+            CLAUDE_REPLACEMENT_LIVE_SECS
+        };
+        if bound_path_is_recent(current, staleness) {
+            return current_path;
+        }
+        if let Some(replacement) =
+            find_newer_claude_session_replacement(projects_dir, current, &claimed_paths)
+        {
+            return Some(replacement);
+        }
+        return current_path;
+    }
+
+    // No existing binding — use age matching with a live-file override so that
+    // a stale age-match (e.g. an old session whose start age coincidentally
+    // matches the process age) loses to a live file the process is writing to.
+    let selected = find_claude_jsonl_for_cwd_at(
         projects_dir,
         agent.elapsed_secs,
         agent.resumed,
         &claimed_paths,
         now_secs,
-    )
-    .or(current_path)
+    );
+
+    // Use the short threshold (BOUND_PATH_LIVE_SECS = 15s) here — unlike the
+    // existing-binding branch (120s), we have no prior claim to protect, so a
+    // quick override is safe and gets the initial binding right faster.
+    if let Some(path) = &selected
+        && !bound_path_is_recent(path, BOUND_PATH_LIVE_SECS)
+        && let Some(replacement) =
+            find_newer_claude_session_replacement(projects_dir, path, &claimed_paths)
+    {
+        return Some(replacement);
+    }
+
+    selected
 }
 
 fn select_codex_jsonl_path(
@@ -746,6 +819,40 @@ fn bound_path_is_recent(path: &Path, max_age_secs: u64) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(u64::MAX);
     file_age <= max_age_secs
+}
+
+/// Find a live unclaimed JSONL file in `projects_dir` that was modified more
+/// recently than `current_path`.  Returns the most-recently-modified candidate,
+/// which is the file the Claude process is currently writing to after a /new or
+/// /clear reset.
+fn find_newer_claude_session_replacement(
+    projects_dir: &Path,
+    current_path: &Path,
+    used_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    let current_mtime = fs::metadata(current_path).ok()?.modified().ok()?;
+
+    std::fs::read_dir(projects_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter(|p| p != current_path)
+        .filter(|p| !used_paths.iter().any(|used| used == p))
+        .filter_map(|path| {
+            let mtime = fs::metadata(&path).ok()?.modified().ok()?;
+            // Must be more recently modified than the stale binding AND still
+            // live enough to be the active session file.
+            if mtime > current_mtime
+                && bound_path_is_recent(&path, CLAUDE_REPLACEMENT_LIVE_SECS)
+            {
+                Some((mtime, path))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(mtime, _)| *mtime)
+        .map(|(_, path)| path)
 }
 
 #[cfg(test)]
@@ -2808,7 +2915,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_switches_live_bound_path_to_newer_candidate() {
+    fn claude_switches_stale_bound_path_to_live_candidate() {
+        // When the current binding has been idle longer than
+        // CLAUDE_REPLACEMENT_LIVE_SECS and a live candidate exists, the
+        // replacement check should switch to the live file.
         let projects_dir = std::env::temp_dir().join(format!(
             "agentmux-claude-live-switch-{}-{}",
             std::process::id(),
@@ -2834,10 +2944,14 @@ mod tests {
             &candidate_path,
             format!(
                 r#"{{"type":"user","sessionId":"session-2","timestamp":"{}","message":{{"role":"user","content":"new"}}}}"#,
-                fmt_rfc3339(now - 120)
+                fmt_rfc3339(now - 60)
             ),
         )
         .unwrap();
+
+        // Current file has been idle for longer than CLAUDE_REPLACEMENT_LIVE_SECS.
+        set_file_mtime_secs(&current_path, (now - 200) as i64);
+        // Candidate is live (fs::write set its mtime to ~now, within 120s).
 
         let agent = detected_agent(AgentKind::ClaudeCode, "%1", 101, "/tmp/project", 120);
         let mut cache = SessionCache::new();
@@ -2848,6 +2962,59 @@ mod tests {
 
         let _ = fs::remove_file(current_path);
         let _ = fs::remove_file(candidate_path);
+        let _ = fs::remove_dir(projects_dir);
+    }
+
+    #[test]
+    fn claude_stale_binding_kept_when_no_live_replacement() {
+        // When the binding is stale but no unclaimed live file exists,
+        // the fallback keeps the current binding rather than unbinding.
+        let projects_dir = std::env::temp_dir().join(format!(
+            "agentmux-claude-stale-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&projects_dir).unwrap();
+
+        let now = unix_now_secs();
+        let bound_path = projects_dir.join("bound.jsonl");
+        let other_path = projects_dir.join("other.jsonl");
+        fs::write(
+            &bound_path,
+            format!(
+                r#"{{"type":"user","sessionId":"bound-sess","timestamp":"{}","message":{{"role":"user","content":"x"}}}}"#,
+                fmt_rfc3339(now - 300)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &other_path,
+            format!(
+                r#"{{"type":"user","sessionId":"other-sess","timestamp":"{}","message":{{"role":"user","content":"x"}}}}"#,
+                fmt_rfc3339(now - 200)
+            ),
+        )
+        .unwrap();
+
+        // Both files are deeply stale — no live replacement available.
+        set_file_mtime_secs(&bound_path, (now - 200) as i64);
+        set_file_mtime_secs(&other_path, (now - 180) as i64);
+
+        let agent = detected_agent(AgentKind::ClaudeCode, "%1", 101, "/tmp/project", 300);
+        let mut cache = SessionCache::new();
+        cache.bind_agent_path(&agent, bound_path.clone(), Some("bound-sess".to_string()));
+
+        let selected = select_claude_jsonl_path(&projects_dir, &agent, &mut cache, now).unwrap();
+        assert_eq!(
+            selected, bound_path,
+            "stale binding should be kept when no live replacement exists"
+        );
+
+        let _ = fs::remove_file(bound_path);
+        let _ = fs::remove_file(other_path);
         let _ = fs::remove_dir(projects_dir);
     }
 
