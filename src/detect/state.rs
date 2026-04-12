@@ -59,6 +59,8 @@ pub struct SessionCache {
     entries: HashMap<PathBuf, CachedData>,
     bindings: HashMap<AgentBindingKey, SessionBinding>,
     path_owners: HashMap<PathBuf, AgentBindingKey>,
+    codex_index: Option<CodexSessionIndex>,
+    canonical_paths: HashMap<String, Option<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -80,6 +82,22 @@ struct SessionBinding {
     last_agent_pid: u32,
     rebind_probe_due_at: u64,
     rebind_probe_backoff_secs: u64,
+}
+
+#[derive(Clone, Default)]
+struct CodexSessionIndex {
+    root: PathBuf,
+    scanned_at_secs: u64,
+    files: Vec<PathBuf>,
+    entries: HashMap<PathBuf, CodexSessionMeta>,
+}
+
+#[derive(Clone)]
+struct CodexSessionMeta {
+    metadata: FileMetadata,
+    cwd: Option<String>,
+    started_at_secs: Option<u64>,
+    has_token_count: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +126,8 @@ impl SessionCache {
             entries: HashMap::new(),
             bindings: HashMap::new(),
             path_owners: HashMap::new(),
+            codex_index: None,
+            canonical_paths: HashMap::new(),
         }
     }
 
@@ -225,7 +245,10 @@ impl SessionCache {
             .get(&key)
             .map(|existing| {
                 if existing.jsonl_path == jsonl_path {
-                    (existing.rebind_probe_due_at, existing.rebind_probe_backoff_secs)
+                    (
+                        existing.rebind_probe_due_at,
+                        existing.rebind_probe_backoff_secs,
+                    )
                 } else {
                     (0, MIN_REBIND_PROBE_SECS)
                 }
@@ -259,12 +282,7 @@ impl SessionCache {
             .is_none_or(|binding| now_secs >= binding.rebind_probe_due_at)
     }
 
-    fn record_rebind_probe_result(
-        &mut self,
-        agent: &DetectedAgent,
-        now_secs: u64,
-        switched: bool,
-    ) {
+    fn record_rebind_probe_result(&mut self, agent: &DetectedAgent, now_secs: u64, switched: bool) {
         let key = AgentBindingKey::from(agent);
         let Some(binding) = self.bindings.get_mut(&key) else {
             return;
@@ -280,6 +298,96 @@ impl SessionCache {
                 .min(MAX_REBIND_PROBE_SECS)
         };
         binding.rebind_probe_due_at = now_secs.saturating_add(binding.rebind_probe_backoff_secs);
+    }
+
+    fn codex_files(&mut self, sessions_dir: &Path, now_secs: u64) -> Vec<PathBuf> {
+        self.refresh_codex_index(sessions_dir, now_secs);
+        self.codex_index
+            .as_ref()
+            .map(|index| index.files.clone())
+            .unwrap_or_default()
+    }
+
+    fn codex_meta(
+        &mut self,
+        sessions_dir: &Path,
+        path: &Path,
+        now_secs: u64,
+    ) -> Option<CodexSessionMeta> {
+        self.refresh_codex_index(sessions_dir, now_secs);
+        self.codex_index.as_ref()?.entries.get(path).cloned()
+    }
+
+    fn codex_has_token_count(&mut self, sessions_dir: &Path, path: &Path, now_secs: u64) -> bool {
+        self.refresh_codex_index(sessions_dir, now_secs);
+        let Some(index) = self.codex_index.as_mut() else {
+            return false;
+        };
+        let Some(entry) = index.entries.get_mut(path) else {
+            return false;
+        };
+        if let Some(has_token_count) = entry.has_token_count {
+            return has_token_count;
+        }
+
+        let has_token_count = codex_has_token_count(path);
+        entry.has_token_count = Some(has_token_count);
+        has_token_count
+    }
+
+    fn refresh_codex_index(&mut self, sessions_dir: &Path, now_secs: u64) {
+        if !sessions_dir.is_dir() {
+            self.codex_index = None;
+            return;
+        }
+
+        let needs_refresh = self
+            .codex_index
+            .as_ref()
+            .is_none_or(|index| index.root != sessions_dir || index.scanned_at_secs != now_secs);
+        if !needs_refresh {
+            return;
+        }
+
+        let mut files = Vec::new();
+        walk_jsonl(sessions_dir, &mut files);
+
+        let mut index = self.codex_index.take().unwrap_or_default();
+        if index.root != sessions_dir {
+            index.entries.clear();
+        }
+        index.root = sessions_dir.to_path_buf();
+        index.scanned_at_secs = now_secs;
+        index.files = files;
+
+        let live_paths: HashSet<PathBuf> = index.files.iter().cloned().collect();
+        index.entries.retain(|path, _| live_paths.contains(path));
+
+        for path in &index.files {
+            let metadata = file_metadata(path);
+            let needs_update = index
+                .entries
+                .get(path)
+                .is_none_or(|entry| entry.metadata != metadata);
+            if needs_update {
+                index.entries.insert(
+                    path.clone(),
+                    parse_codex_session_meta_cached(path, metadata),
+                );
+            }
+        }
+
+        self.codex_index = Some(index);
+    }
+
+    fn canonicalize_path_cached(&mut self, path: &str) -> Option<PathBuf> {
+        if let Some(canonical) = self.canonical_paths.get(path) {
+            return canonical.clone();
+        }
+        let canonical = fs::canonicalize(path).ok();
+        self.canonical_paths
+            .insert(path.to_string(), canonical.clone());
+        canonical
     }
 }
 
@@ -337,10 +445,11 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
 }
 
 pub fn codex_details(agent: &DetectedAgent, cache: &mut SessionCache) -> SessionDetails {
+    let now_secs = unix_now_secs();
     let sessions_dir = codex_sessions_dir();
     let jsonl_path = sessions_dir
         .as_ref()
-        .and_then(|dir| select_codex_jsonl_path(dir, agent, cache, unix_now_secs()));
+        .and_then(|dir| select_codex_jsonl_path(dir, agent, cache, now_secs));
     let mut details = agent_details(
         jsonl_path.as_deref(),
         agent.elapsed_secs,
@@ -349,10 +458,12 @@ pub fn codex_details(agent: &DetectedAgent, cache: &mut SessionCache) -> Session
         detect_codex_state,
         parse_codex_tokens,
     );
-    details.display_elapsed_secs = details
-        .jsonl_path
-        .as_deref()
-        .and_then(|path| codex_session_elapsed_secs(path, unix_now_secs()));
+    details.display_elapsed_secs = details.jsonl_path.as_deref().and_then(|path| {
+        sessions_dir
+            .as_deref()
+            .and_then(|dir| codex_session_elapsed_secs_cached(dir, path, cache, now_secs))
+            .or_else(|| codex_session_elapsed_secs(path, now_secs))
+    });
     update_binding(cache, agent, &details);
     details
 }
@@ -375,6 +486,8 @@ pub fn refresh_bound_details(
             parse_claude_tokens,
         ),
         AgentKind::Codex => {
+            let now_secs = unix_now_secs();
+            let sessions_dir = codex_sessions_dir();
             let mut details = agent_details(
                 jsonl_path,
                 agent_age_secs,
@@ -383,10 +496,12 @@ pub fn refresh_bound_details(
                 detect_codex_state,
                 parse_codex_tokens,
             );
-            details.display_elapsed_secs = details
-                .jsonl_path
-                .as_deref()
-                .and_then(|path| codex_session_elapsed_secs(path, unix_now_secs()));
+            details.display_elapsed_secs = details.jsonl_path.as_deref().and_then(|path| {
+                sessions_dir
+                    .as_deref()
+                    .and_then(|dir| codex_session_elapsed_secs_cached(dir, path, cache, now_secs))
+                    .or_else(|| codex_session_elapsed_secs(path, now_secs))
+            });
             details
         }
     };
@@ -434,7 +549,14 @@ pub fn refresh_tracked_details(
         .jsonl_path
         .as_deref()
         .is_some_and(|path| !agent.resumed && !bound_path_is_recent(path, BOUND_PATH_LIVE_SECS));
-    if has_existing_binding && (!needs_rebind_probe || !cache.should_probe_rebind(&detected, now_secs)) {
+    let should_probe_now = should_probe_bound_session(
+        &detected,
+        details.state,
+        needs_rebind_probe,
+        cache,
+        now_secs,
+    );
+    if has_existing_binding && (!needs_rebind_probe || !should_probe_now) {
         update_binding(cache, &detected, &details);
         return details;
     }
@@ -444,10 +566,21 @@ pub fn refresh_tracked_details(
         AgentKind::Codex => codex_details(&detected, cache),
     };
     if needs_rebind_probe {
-        let switched = rebound.jsonl_path != details.jsonl_path || rebound.session_id != details.session_id;
+        let switched =
+            rebound.jsonl_path != details.jsonl_path || rebound.session_id != details.session_id;
         cache.record_rebind_probe_result(&detected, now_secs, switched);
     }
     rebound
+}
+
+fn should_probe_bound_session(
+    agent: &DetectedAgent,
+    state: AgentState,
+    needs_rebind_probe: bool,
+    cache: &mut SessionCache,
+    now_secs: u64,
+) -> bool {
+    needs_rebind_probe && (state == AgentState::Idle || cache.should_probe_rebind(agent, now_secs))
 }
 
 fn select_claude_jsonl_path(
@@ -477,15 +610,23 @@ fn select_codex_jsonl_path(
     let current_path = cache.bound_path_for_agent(agent, extract_codex_session_id);
     let claimed_paths = cache.claimed_paths_for_agent(agent);
     let newer_replacement = current_path.as_deref().and_then(|current| {
-        find_newer_codex_session_replacement(sessions_dir, current, &agent.cwd, &claimed_paths)
+        find_newer_codex_session_replacement_cached(
+            sessions_dir,
+            current,
+            &agent.cwd,
+            &claimed_paths,
+            cache,
+            now_secs,
+        )
     });
-    let candidate_path = find_codex_jsonl_for_cwd_at(
+    let candidate_path = find_codex_jsonl_for_cwd_at_cached(
         sessions_dir,
         &agent.cwd,
         agent.elapsed_secs,
         agent.resumed,
         &claimed_paths,
         now_secs,
+        cache,
     );
 
     if let Some(current) = &current_path {
@@ -495,12 +636,14 @@ fn select_codex_jsonl_path(
             match candidate_path {
                 Some(candidate)
                     if current != &candidate
-                        && should_replace_codex_binding(
+                        && should_replace_codex_binding_cached(
+                            sessions_dir,
                             current,
                             &candidate,
                             &agent.cwd,
                             agent.elapsed_secs,
                             now_secs,
+                            cache,
                         ) =>
                 {
                     Some(candidate)
@@ -530,37 +673,59 @@ fn bound_path_is_recent(path: &Path, max_age_secs: u64) -> bool {
     file_age <= max_age_secs
 }
 
+#[cfg(test)]
 fn find_newer_codex_session_replacement(
     sessions_dir: &Path,
     current_path: &Path,
     cwd: &str,
     used_paths: &[PathBuf],
 ) -> Option<PathBuf> {
-    let current_start = codex_session_start_secs(current_path)?;
-    let mut files = Vec::new();
-    walk_jsonl(sessions_dir, &mut files);
+    let mut cache = SessionCache::new();
+    find_newer_codex_session_replacement_cached(
+        sessions_dir,
+        current_path,
+        cwd,
+        used_paths,
+        &mut cache,
+        unix_now_secs(),
+    )
+}
 
-    files
+fn find_newer_codex_session_replacement_cached(
+    sessions_dir: &Path,
+    current_path: &Path,
+    cwd: &str,
+    used_paths: &[PathBuf],
+    cache: &mut SessionCache,
+    now_secs: u64,
+) -> Option<PathBuf> {
+    let current_start = cache
+        .codex_meta(sessions_dir, current_path, now_secs)
+        .and_then(|meta| meta.started_at_secs)
+        .or_else(|| codex_session_start_secs(current_path))?;
+
+    cache
+        .codex_files(sessions_dir, now_secs)
         .into_iter()
         .filter(|path| path != current_path)
         .filter(|path| !used_paths.iter().any(|used| used == path))
         .filter_map(|path| {
-            let meta = parse_codex_session_meta(&path)?;
-            let session_cwd = json_str(&meta, &["payload", "cwd"])?;
-            if !codex_cwds_match(cwd, session_cwd) {
+            let meta = cache.codex_meta(sessions_dir, &path, now_secs)?;
+            let session_cwd = meta.cwd.as_deref()?;
+            if !codex_cwds_match_cached(cache, cwd, session_cwd) {
                 return None;
             }
-            let started = codex_session_start_secs(&path)?;
+            let started = meta.started_at_secs?;
             (started > current_start).then_some((started, path))
         })
         .max_by_key(|(started, _)| *started)
         .map(|(_, path)| path)
 }
 
-pub(crate) fn binding_priority(agent: &DetectedAgent) -> u64 {
+pub(crate) fn binding_priority(agent: &DetectedAgent, cache: &mut SessionCache) -> u64 {
     match agent.kind {
         AgentKind::ClaudeCode => claude_binding_priority(agent),
-        AgentKind::Codex => codex_binding_priority(agent),
+        AgentKind::Codex => codex_binding_priority(agent, cache),
     }
 }
 
@@ -583,17 +748,23 @@ fn claude_binding_priority(agent: &DetectedAgent) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn codex_binding_priority(agent: &DetectedAgent) -> u64 {
+fn codex_binding_priority(agent: &DetectedAgent, cache: &mut SessionCache) -> u64 {
     let Some(sessions_dir) = codex_sessions_dir() else {
         return u64::MAX;
     };
-    let mut files = Vec::new();
-    walk_jsonl(&sessions_dir, &mut files);
     let now = unix_now_secs();
-    files
+    cache
+        .codex_files(&sessions_dir, now)
         .into_iter()
         .filter_map(|path| {
-            codex_binding_age_mismatch_secs(&path, &agent.cwd, agent.elapsed_secs, now)
+            codex_binding_age_mismatch_secs_cached(
+                &sessions_dir,
+                &path,
+                &agent.cwd,
+                agent.elapsed_secs,
+                now,
+                cache,
+            )
         })
         .min()
         .unwrap_or(u64::MAX)
@@ -832,6 +1003,7 @@ pub(crate) fn walk_jsonl(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg(test)]
 fn find_codex_jsonl_for_cwd_at(
     sessions_dir: &Path,
     cwd: &str,
@@ -840,16 +1012,33 @@ fn find_codex_jsonl_for_cwd_at(
     used_paths: &[PathBuf],
     now_secs: u64,
 ) -> Option<PathBuf> {
+    let mut cache = SessionCache::new();
+    find_codex_jsonl_for_cwd_at_cached(
+        sessions_dir,
+        cwd,
+        agent_age_secs,
+        resumed,
+        used_paths,
+        now_secs,
+        &mut cache,
+    )
+}
+
+fn find_codex_jsonl_for_cwd_at_cached(
+    sessions_dir: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    resumed: bool,
+    used_paths: &[PathBuf],
+    now_secs: u64,
+    cache: &mut SessionCache,
+) -> Option<PathBuf> {
     if !sessions_dir.is_dir() {
         return None;
     }
-    let mut all_files: Vec<PathBuf> = Vec::new();
-    walk_jsonl(sessions_dir, &mut all_files);
-    if all_files.is_empty() {
-        return None;
-    }
 
-    let available_files: Vec<PathBuf> = all_files
+    let available_files: Vec<PathBuf> = cache
+        .codex_files(sessions_dir, now_secs)
         .into_iter()
         .filter(|path| !used_paths.iter().any(|used| used == path))
         .collect();
@@ -857,19 +1046,31 @@ fn find_codex_jsonl_for_cwd_at(
         return None;
     }
 
-    let mut candidates: Vec<(CodexMatchScore, PathBuf)> = Vec::new();
+    let mut candidates: Vec<CodexCandidateMatch> = Vec::new();
     let mut unscorable: Vec<PathBuf> = Vec::new();
     for path in available_files {
-        match codex_candidate(&path, cwd, agent_age_secs, now_secs) {
-            CodexCandidate::Scored(score) => candidates.push((score, path)),
+        match codex_candidate_cached(sessions_dir, &path, cwd, agent_age_secs, now_secs, cache) {
+            CodexCandidate::Scored(score) => {
+                let modified_ts = cache
+                    .codex_meta(sessions_dir, &path, now_secs)
+                    .map(|meta| meta.metadata.modified_ts)
+                    .unwrap_or(0);
+                candidates.push(CodexCandidateMatch {
+                    score,
+                    path,
+                    modified_ts,
+                });
+            }
             CodexCandidate::Unscorable => unscorable.push(path),
             CodexCandidate::CwdMismatch => {}
         }
     }
 
     if resumed {
-        let resumed_candidates: Vec<PathBuf> =
-            candidates.iter().map(|(_, path)| path.clone()).collect();
+        let resumed_candidates: Vec<PathBuf> = candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect();
         return most_recent_jsonl(&resumed_candidates).or_else(|| most_recent_jsonl(&unscorable));
     }
 
@@ -877,8 +1078,11 @@ fn find_codex_jsonl_for_cwd_at(
         return most_recent_jsonl(&unscorable);
     }
 
-    candidates.sort_by(compare_codex_candidates);
-    candidates.into_iter().next().map(|(_, path)| path)
+    candidates.sort_by(compare_codex_candidate_matches);
+    candidates
+        .into_iter()
+        .next()
+        .map(|candidate| candidate.path)
 }
 
 fn most_recent_jsonl(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -905,6 +1109,25 @@ fn parse_codex_session_meta(path: &Path) -> Option<Value> {
     (json_str(&entry, &["type"]) == Some("session_meta")).then_some(entry)
 }
 
+fn parse_codex_session_meta_cached(path: &Path, metadata: FileMetadata) -> CodexSessionMeta {
+    let meta = parse_codex_session_meta(path);
+    let started_at_secs = meta
+        .as_ref()
+        .and_then(|entry| json_str(entry, &["payload", "timestamp"]))
+        .and_then(parse_rfc3339_utc_secs)
+        .or_else(|| (metadata.modified_ts > 0).then_some(metadata.modified_ts / 1_000));
+
+    CodexSessionMeta {
+        metadata,
+        cwd: meta
+            .as_ref()
+            .and_then(|entry| json_str(entry, &["payload", "cwd"]))
+            .map(str::to_string),
+        started_at_secs,
+        has_token_count: None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CodexMatchScore {
     age_mismatch_secs: u64,
@@ -916,6 +1139,13 @@ enum CodexCandidate {
     Scored(CodexMatchScore),
     Unscorable,
     CwdMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexCandidateMatch {
+    score: CodexMatchScore,
+    path: PathBuf,
+    modified_ts: u64,
 }
 
 fn compare_codex_candidates(
@@ -947,6 +1177,27 @@ fn compare_codex_candidates(
         })
 }
 
+fn compare_codex_candidate_matches(
+    lhs: &CodexCandidateMatch,
+    rhs: &CodexCandidateMatch,
+) -> std::cmp::Ordering {
+    let within_bias_window = lhs
+        .score
+        .age_mismatch_secs
+        .abs_diff(rhs.score.age_mismatch_secs)
+        <= CODEX_TOKEN_BIAS_SECS;
+    if within_bias_window && lhs.score.has_token_count != rhs.score.has_token_count {
+        return rhs.score.has_token_count.cmp(&lhs.score.has_token_count);
+    }
+
+    lhs.score
+        .age_mismatch_secs
+        .cmp(&rhs.score.age_mismatch_secs)
+        .then_with(|| rhs.score.has_token_count.cmp(&lhs.score.has_token_count))
+        .then_with(|| rhs.modified_ts.cmp(&lhs.modified_ts))
+}
+
+#[cfg(test)]
 fn should_replace_codex_binding(
     current_path: &Path,
     candidate_path: &Path,
@@ -954,8 +1205,46 @@ fn should_replace_codex_binding(
     agent_age_secs: u64,
     now_secs: u64,
 ) -> bool {
-    let current_score = codex_match_score(current_path, cwd, agent_age_secs, now_secs);
-    let candidate_score = codex_match_score(candidate_path, cwd, agent_age_secs, now_secs);
+    let mut cache = SessionCache::new();
+    let Some(sessions_dir) = codex_sessions_dir() else {
+        return false;
+    };
+    should_replace_codex_binding_cached(
+        &sessions_dir,
+        current_path,
+        candidate_path,
+        cwd,
+        agent_age_secs,
+        now_secs,
+        &mut cache,
+    )
+}
+
+fn should_replace_codex_binding_cached(
+    sessions_dir: &Path,
+    current_path: &Path,
+    candidate_path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+    cache: &mut SessionCache,
+) -> bool {
+    let current_score = codex_match_score_cached(
+        sessions_dir,
+        current_path,
+        cwd,
+        agent_age_secs,
+        now_secs,
+        cache,
+    );
+    let candidate_score = codex_match_score_cached(
+        sessions_dir,
+        candidate_path,
+        cwd,
+        agent_age_secs,
+        now_secs,
+        cache,
+    );
 
     match (current_score, candidate_score) {
         (Some(current), Some(candidate)) => compare_codex_candidates(
@@ -968,94 +1257,140 @@ fn should_replace_codex_binding(
     }
 }
 
+#[cfg(test)]
 fn codex_match_score(
     path: &Path,
     cwd: &str,
     agent_age_secs: u64,
     now_secs: u64,
 ) -> Option<CodexMatchScore> {
-    match codex_candidate(path, cwd, agent_age_secs, now_secs) {
+    let mut cache = SessionCache::new();
+    let sessions_dir = path.ancestors().nth(4)?.to_path_buf();
+    codex_match_score_cached(
+        &sessions_dir,
+        path,
+        cwd,
+        agent_age_secs,
+        now_secs,
+        &mut cache,
+    )
+}
+
+fn codex_match_score_cached(
+    sessions_dir: &Path,
+    path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+    cache: &mut SessionCache,
+) -> Option<CodexMatchScore> {
+    match codex_candidate_cached(sessions_dir, path, cwd, agent_age_secs, now_secs, cache) {
         CodexCandidate::Scored(score) => Some(score),
         CodexCandidate::Unscorable | CodexCandidate::CwdMismatch => None,
     }
 }
 
+#[cfg(test)]
 fn codex_binding_age_mismatch_secs(
     path: &Path,
     cwd: &str,
     agent_age_secs: u64,
     now_secs: u64,
 ) -> Option<u64> {
-    let meta = parse_codex_session_meta(path)?;
-    let session_cwd = json_str(&meta, &["payload", "cwd"])?;
-    if !codex_cwds_match(cwd, session_cwd) {
-        return None;
-    }
-
-    json_str(&meta, &["payload", "timestamp"])
-        .and_then(parse_rfc3339_utc_secs)
-        .and_then(|started| now_secs.checked_sub(started))
-        .map(|age| age.abs_diff(agent_age_secs))
-        .or_else(|| {
-            fs::metadata(path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| {
-                    now_secs
-                        .saturating_sub(d.as_secs())
-                        .abs_diff(agent_age_secs)
-                })
-        })
+    let mut cache = SessionCache::new();
+    let sessions_dir = path.ancestors().nth(4)?.to_path_buf();
+    codex_binding_age_mismatch_secs_cached(
+        &sessions_dir,
+        path,
+        cwd,
+        agent_age_secs,
+        now_secs,
+        &mut cache,
+    )
 }
 
+fn codex_binding_age_mismatch_secs_cached(
+    sessions_dir: &Path,
+    path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+    cache: &mut SessionCache,
+) -> Option<u64> {
+    let meta = cache.codex_meta(sessions_dir, path, now_secs)?;
+    let session_cwd = meta.cwd.as_deref()?;
+    if !codex_cwds_match_cached(cache, cwd, session_cwd) {
+        return None;
+    }
+    meta.started_at_secs
+        .and_then(|started| now_secs.checked_sub(started))
+        .map(|age| age.abs_diff(agent_age_secs))
+}
+
+#[cfg(test)]
 fn codex_candidate(path: &Path, cwd: &str, agent_age_secs: u64, now_secs: u64) -> CodexCandidate {
-    let Some(meta) = parse_codex_session_meta(path) else {
+    let mut cache = SessionCache::new();
+    let Some(sessions_dir) = path.ancestors().nth(4).map(Path::to_path_buf) else {
         return CodexCandidate::Unscorable;
     };
-    let Some(session_cwd) = json_str(&meta, &["payload", "cwd"]) else {
+    codex_candidate_cached(
+        &sessions_dir,
+        path,
+        cwd,
+        agent_age_secs,
+        now_secs,
+        &mut cache,
+    )
+}
+
+fn codex_candidate_cached(
+    sessions_dir: &Path,
+    path: &Path,
+    cwd: &str,
+    agent_age_secs: u64,
+    now_secs: u64,
+    cache: &mut SessionCache,
+) -> CodexCandidate {
+    let Some(meta) = cache.codex_meta(sessions_dir, path, now_secs) else {
         return CodexCandidate::Unscorable;
     };
-    if !codex_cwds_match(cwd, session_cwd) {
+    let Some(session_cwd) = meta.cwd.as_deref() else {
+        return CodexCandidate::Unscorable;
+    };
+    if !codex_cwds_match_cached(cache, cwd, session_cwd) {
         return CodexCandidate::CwdMismatch;
     }
 
-    let start_age = json_str(&meta, &["payload", "timestamp"])
-        .and_then(parse_rfc3339_utc_secs)
-        .and_then(|started| now_secs.checked_sub(started));
-    let Some(age_mismatch_secs) = start_age
+    let Some(age_mismatch_secs) = meta
+        .started_at_secs
+        .and_then(|started| now_secs.checked_sub(started))
         .map(|age| age.abs_diff(agent_age_secs))
-        .or_else(|| {
-            fs::metadata(path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|mtime| mtime.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| {
-                    now_secs
-                        .saturating_sub(d.as_secs())
-                        .abs_diff(agent_age_secs)
-                })
-        })
     else {
         return CodexCandidate::Unscorable;
     };
 
     CodexCandidate::Scored(CodexMatchScore {
         age_mismatch_secs,
-        has_token_count: codex_has_token_count(path),
+        has_token_count: cache.codex_has_token_count(sessions_dir, path, now_secs),
     })
 }
 
+#[cfg(test)]
 fn codex_cwds_match(lhs: &str, rhs: &str) -> bool {
-    lhs == rhs
-        || canonicalize_if_exists(lhs)
-            .zip(canonicalize_if_exists(rhs))
-            .is_some_and(|(a, b)| a == b)
-        || normalized_path_equals(lhs, rhs)
+    let mut cache = SessionCache::new();
+    codex_cwds_match_cached(&mut cache, lhs, rhs)
 }
 
-fn canonicalize_if_exists(path: &str) -> Option<PathBuf> {
-    fs::canonicalize(path).ok()
+fn codex_cwds_match_cached(cache: &mut SessionCache, lhs: &str, rhs: &str) -> bool {
+    if lhs == rhs || normalized_path_equals(lhs, rhs) {
+        return true;
+    }
+
+    let lhs_canonical = cache.canonicalize_path_cached(lhs);
+    let rhs_canonical = cache.canonicalize_path_cached(rhs);
+    lhs_canonical
+        .zip(rhs_canonical)
+        .is_some_and(|(lhs, rhs)| lhs == rhs)
 }
 
 fn normalized_path_equals(lhs: &str, rhs: &str) -> bool {
@@ -1093,6 +1428,16 @@ fn codex_has_token_count(path: &Path) -> bool {
 
 fn codex_session_elapsed_secs(path: &Path, now_secs: u64) -> Option<u64> {
     Some(now_secs.saturating_sub(codex_session_start_secs(path)?))
+}
+
+fn codex_session_elapsed_secs_cached(
+    sessions_dir: &Path,
+    path: &Path,
+    cache: &mut SessionCache,
+    now_secs: u64,
+) -> Option<u64> {
+    let meta = cache.codex_meta(sessions_dir, path, now_secs)?;
+    Some(now_secs.saturating_sub(meta.started_at_secs?))
 }
 
 fn codex_session_start_secs(path: &Path) -> Option<u64> {
@@ -1445,9 +1790,7 @@ pub(crate) fn parse_codex_tokens(path: &Path) -> ParsedTokens {
 
     for entry in &entries {
         // Extract session id from session_meta entry
-        if session_id.is_none()
-            && json_str(entry, &["type"]) == Some("session_meta")
-        {
+        if session_id.is_none() && json_str(entry, &["type"]) == Some("session_meta") {
             session_id = json_str(entry, &["payload", "id"]).map(|s| s.to_string());
         }
         match json_str(entry, &["type"]) {
@@ -2672,49 +3015,12 @@ mod tests {
     }
 
     #[test]
-    fn refresh_tracked_codex_details_throttles_stale_rebind_probe() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "agentmux-codex-refresh-throttle-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&sessions_dir).unwrap();
-
-        let current_path = sessions_dir.join("current.jsonl");
-        let candidate_path = sessions_dir.join("candidate.jsonl");
-        fs::write(
-            &current_path,
-            concat!(
-                r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:15:30.000Z","source":"cli"}}"#,
-                "\n",
-                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":4},"last_token_usage":{"input_tokens":12},"model_context_window":200000}}}"#
-            ),
-        )
-        .unwrap();
-        fs::write(
-            &candidate_path,
-            concat!(
-                r#"{"type":"session_meta","payload":{"id":"session-2","cwd":"/tmp/project","timestamp":"1970-01-01T00:16:35.000Z","source":"cli"}}"#,
-                "\n",
-                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3,"output_tokens":1},"last_token_usage":{"input_tokens":3},"model_context_window":200000}}}"#
-            ),
-        )
-        .unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        set_file_mtime_secs(&current_path, now - 30);
-        set_file_mtime_secs(&candidate_path, now - 30);
-
+    fn stale_idle_binding_bypasses_rebind_backoff() {
         let mut cache = SessionCache::new();
         let detected = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
         cache.bind_agent_path(
             &detected,
-            current_path.clone(),
+            PathBuf::from("/tmp/session-1.jsonl"),
             Some("session-1".to_string()),
         );
 
@@ -2723,24 +3029,37 @@ mod tests {
         binding.rebind_probe_due_at = u64::MAX;
         binding.rebind_probe_backoff_secs = MIN_REBIND_PROBE_SECS;
 
-        let agent = tracked_agent_info(
-            AgentKind::Codex,
-            "%1",
-            101,
-            "/tmp/project",
-            &current_path,
-            "session-1",
+        assert!(should_probe_bound_session(
+            &detected,
+            AgentState::Idle,
+            true,
+            &mut cache,
+            120,
+        ));
+    }
+
+    #[test]
+    fn stale_working_binding_still_respects_rebind_backoff() {
+        let mut cache = SessionCache::new();
+        let detected = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
+        cache.bind_agent_path(
+            &detected,
+            PathBuf::from("/tmp/session-1.jsonl"),
+            Some("session-1".to_string()),
         );
-        let details = refresh_tracked_details(&agent, 120, &mut cache);
 
-        assert_eq!(details.session_id.as_deref(), Some("session-1"));
-        assert_eq!(details.jsonl_path.as_deref(), Some(current_path.as_path()));
-        assert_eq!(details.input_tokens, 12);
-        assert_eq!(details.output_tokens, 4);
+        let key = AgentBindingKey::from(&detected);
+        let binding = cache.bindings.get_mut(&key).unwrap();
+        binding.rebind_probe_due_at = u64::MAX;
+        binding.rebind_probe_backoff_secs = MIN_REBIND_PROBE_SECS;
 
-        let _ = fs::remove_file(current_path);
-        let _ = fs::remove_file(candidate_path);
-        let _ = fs::remove_dir(sessions_dir);
+        assert!(!should_probe_bound_session(
+            &detected,
+            AgentState::Working,
+            true,
+            &mut cache,
+            120,
+        ));
     }
 
     #[test]

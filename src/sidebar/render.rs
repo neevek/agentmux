@@ -524,7 +524,11 @@ fn emit_stats_row(
 
     // Col 1: period (left-aligned, 1 char padding)
     let period_pad = cw[1].saturating_sub(label.period.len() + 1);
-    let period_cell = format!(" {DIM}{}{RESET}{bg}{}", label.period, " ".repeat(period_pad));
+    let period_cell = format!(
+        " {DIM}{}{RESET}{bg}{}",
+        label.period,
+        " ".repeat(period_pad)
+    );
 
     // Col 2: input tokens (left-aligned, 1 char padding)
     let in_pad = cw[2].saturating_sub(in_str.len() + 1);
