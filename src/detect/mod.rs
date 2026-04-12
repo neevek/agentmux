@@ -82,14 +82,13 @@ fn should_force_full_rescan(agent: &AgentInfo, details: &state::SessionDetails) 
 }
 
 fn display_elapsed_secs(
-    kind: AgentKind,
+    _kind: AgentKind,
     process_elapsed_secs: u64,
     details: &state::SessionDetails,
 ) -> u64 {
-    match kind {
-        AgentKind::Codex => details.display_elapsed_secs.unwrap_or(process_elapsed_secs),
-        AgentKind::ClaudeCode => process_elapsed_secs,
-    }
+    details
+        .display_elapsed_secs
+        .unwrap_or(process_elapsed_secs)
 }
 
 /// Fast scan for startup: discovers active agent panes without JSONL/state lookup.
@@ -384,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_keeps_process_elapsed() {
+    fn claude_uses_session_elapsed_when_available() {
         let details = state::SessionDetails {
             display_elapsed_secs: Some(12),
             ..Default::default()
@@ -392,7 +391,7 @@ mod tests {
 
         assert_eq!(
             display_elapsed_secs(AgentKind::ClaudeCode, 3600, &details),
-            3600
+            12
         );
     }
 
