@@ -57,12 +57,12 @@ pub fn scan_agents(session: &str, cache: &mut SessionCache) -> Vec<AgentInfo> {
     let panes = tmux::list_session_panes(session);
     let mut detected = process::scan_panes_for_agents(&panes, crate::tmux::SIDEBAR_TITLE);
     cache.retain_live_agents(&detected);
-    detected.sort_by_key(scan_order_key);
+    detected.sort_by_key(|agent| scan_order_key(agent, cache));
     agents_from_detected(session, detected, cache)
 }
 
-fn scan_order_key(agent: &process::DetectedAgent) -> (u64, u64) {
-    (state::binding_priority(agent), agent.elapsed_secs)
+fn scan_order_key(agent: &process::DetectedAgent, cache: &mut SessionCache) -> (u64, u64) {
+    (state::binding_priority(agent, cache), agent.elapsed_secs)
 }
 
 fn has_bound_session(agent: &AgentInfo) -> bool {
@@ -140,7 +140,7 @@ pub fn discover_agents_in_panes(
     cache: &mut SessionCache,
 ) -> Vec<AgentInfo> {
     let mut detected = process::scan_panes_for_agents(panes, crate::tmux::SIDEBAR_TITLE);
-    detected.sort_by_key(scan_order_key);
+    detected.sort_by_key(|agent| scan_order_key(agent, cache));
     agents_from_detected(session, detected, cache)
 }
 
@@ -288,7 +288,6 @@ pub fn refresh_agents_incremental_from_panes(
         .filter_map(|agent| agent.agent_pid)
         .collect();
     let elapsed_by_pid = process::query_process_elapsed(&known_pids);
-
     refresh_agents_incremental_with_elapsed(panes, known_agents, cache, &elapsed_by_pid)
 }
 
@@ -416,7 +415,8 @@ mod tests {
             ..older.clone()
         };
 
-        assert!(scan_order_key(&newer) < scan_order_key(&older));
+        let mut cache = SessionCache::new();
+        assert!(scan_order_key(&newer, &mut cache) < scan_order_key(&older, &mut cache));
     }
 
     #[test]
