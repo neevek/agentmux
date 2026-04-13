@@ -15,9 +15,11 @@ pub struct PaneInfo {
     pub cwd: String,
     pub title: String,
     pub current_command: String,
+    /// Unix timestamp (seconds) of the last output activity in this pane.
+    pub activity_secs: u64,
 }
 
-const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}\t#{pane_current_command}";
+const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_current_path}\t#{pane_title}\t#{pane_current_command}\t#{pane_activity}";
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let parts: Vec<&str> = line.split('\t').collect();
@@ -32,6 +34,7 @@ fn parse_pane_line(line: &str) -> Option<PaneInfo> {
         cwd: parts[4].to_string(),
         title: parts[5].to_string(),
         current_command: parts[6].to_string(),
+        activity_secs: parts.get(7).and_then(|s| s.parse().ok()).unwrap_or(0),
     })
 }
 

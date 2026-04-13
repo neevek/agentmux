@@ -268,6 +268,7 @@ mod tests {
             cwd: "/tmp/project".to_string(),
             title: title.to_string(),
             current_command: current_command.to_string(),
+            activity_secs: 0,
         }
     }
 

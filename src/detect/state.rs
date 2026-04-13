@@ -671,15 +671,18 @@ pub fn refresh_tracked_details(
 
 fn should_probe_bound_session(
     agent: &DetectedAgent,
-    previous_state: AgentState,
+    _previous_state: AgentState,
     state: AgentState,
     needs_rebind_probe: bool,
     cache: &mut SessionCache,
     now_secs: u64,
 ) -> bool {
-    needs_rebind_probe
-        && ((previous_state == AgentState::Working && state == AgentState::Idle)
-            || cache.should_probe_rebind(agent, now_secs))
+    // When the bound path is stale and the session is currently idle, probe on
+    // every poll cycle so a newly-started Codex session is detected within one
+    // poll interval rather than waiting for the exponential rebind backoff
+    // (30-300 s), which caused the green bulb to appear "quite a long while"
+    // after Codex showed "Working..." in the pane.
+    needs_rebind_probe && (state == AgentState::Idle || cache.should_probe_rebind(agent, now_secs))
 }
 
 fn select_claude_jsonl_path(
@@ -3472,7 +3475,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_idle_binding_after_idle_state_respects_rebind_backoff() {
+    fn stale_idle_binding_probes_immediately_when_idle() {
+        // When the bound path is stale and the session is idle, we probe on
+        // every poll cycle regardless of backoff so a newly-started session is
+        // detected within one poll interval.
         let mut cache = SessionCache::new();
         let detected = detected_agent(AgentKind::Codex, "%1", 101, "/tmp/project", 120);
         cache.bind_agent_path(
@@ -3486,7 +3492,7 @@ mod tests {
         binding.rebind_probe_due_at = u64::MAX;
         binding.rebind_probe_backoff_secs = MIN_REBIND_PROBE_SECS;
 
-        assert!(!should_probe_bound_session(
+        assert!(should_probe_bound_session(
             &detected,
             AgentState::Idle,
             AgentState::Idle,

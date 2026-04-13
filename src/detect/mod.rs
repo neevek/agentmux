@@ -4,6 +4,12 @@ pub mod state;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
+
+/// If a Codex pane produced output within this many seconds, treat the agent
+/// as Working even when the JSONL file hasn't been updated yet (the JSONL only
+/// gets its first new event after the API responds, which can take 10–20 s).
+const PANE_ACTIVITY_WORKING_THRESHOLD_SECS: u64 = 3;
 
 use serde::{Deserialize, Serialize};
 
@@ -320,6 +326,25 @@ fn refresh_agents_incremental_with_elapsed(
             return None;
         }
 
+        // When JSONL shows Idle but the pane had very recent output, Codex is
+        // likely still processing (waiting for the API to return the first
+        // token) and just hasn't written to the JSONL file yet.  The Codex
+        // spinner animates continuously while working, so pane_activity stays
+        // fresh; when truly idle the pane goes quiet after printing the prompt.
+        let state = if details.state == state::AgentState::Idle
+            && agent.kind == AgentKind::Codex
+            && pane.activity_secs > 0
+            && SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs().saturating_sub(pane.activity_secs))
+                .unwrap_or(u64::MAX)
+                < PANE_ACTIVITY_WORKING_THRESHOLD_SECS
+        {
+            state::AgentState::Working
+        } else {
+            details.state
+        };
+
         let window_name = if agent.window_id == pane.window_id {
             agent.window_name.clone()
         } else {
@@ -346,7 +371,7 @@ fn refresh_agents_incremental_with_elapsed(
             cwd: pane.cwd.clone(),
             window_id: pane.window_id.clone(),
             window_name,
-            state: details.state,
+            state,
             elapsed_secs,
             process_elapsed_secs,
             input_tokens: details.input_tokens,
@@ -549,6 +574,7 @@ mod tests {
             cwd: "/tmp/project".to_string(),
             title: "shell".to_string(),
             current_command: "zsh".to_string(),
+            activity_secs: 0,
         }
     }
 
