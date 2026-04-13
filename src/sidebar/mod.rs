@@ -689,7 +689,10 @@ pub fn run() {
                     role = SidebarRole::Inactive;
                 }
             } else {
-                activate_sidebar(
+                // Only suppress the refresh block when data was already loaded
+                // from a snapshot. On a cold start (no snapshot) we need the
+                // refresh to run immediately so stats aren't blank.
+                just_activated = activate_sidebar(
                     &mut role,
                     &mut runtime_store,
                     &mut cached_agents,
@@ -698,7 +701,6 @@ pub fn run() {
                     &mut unseen_done,
                     &sidebar_window_id,
                 );
-                just_activated = true;
             }
             last_active = is_active;
             needs_render = true;
@@ -1024,6 +1026,9 @@ pub fn run() {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Returns true if existing data was loaded (snapshot), false if this is a
+/// cold start with no prior state — caller should skip `just_activated` in
+/// that case so the first refresh fires immediately.
 fn activate_sidebar(
     role: &mut SidebarRole,
     runtime_store: &mut RuntimeStore,
@@ -1032,7 +1037,7 @@ fn activate_sidebar(
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
     sidebar_window_id: &str,
-) {
+) -> bool {
     let mut snapshot_loaded = false;
     let lease = runtime_store.read_lease();
     if let Some(snapshot) = runtime_store.load_snapshot_for_activation() {
@@ -1054,7 +1059,7 @@ fn activate_sidebar(
             epoch,
             last_refresh: Instant::now() - Duration::from_millis(runtime::POLL_INTERVAL_MS),
         };
-        return;
+        return snapshot_loaded;
     }
 
     *role = SidebarRole::Follower {
@@ -1064,6 +1069,7 @@ fn activate_sidebar(
             Instant::now() - Duration::from_millis(runtime::POLL_INTERVAL_MS)
         },
     };
+    snapshot_loaded
 }
 
 #[allow(clippy::too_many_arguments)]
