@@ -27,10 +27,6 @@ jobs:
             target: aarch64-unknown-linux-musl
             needs_musl: true
             use_cross: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -58,8 +54,7 @@ jobs:
         if: ${{ !matrix.use_cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (macOS/Linux)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           set -euo pipefail
           target_dir="target/${{ matrix.target }}/release"
@@ -73,19 +68,6 @@ jobs:
           else
             sha256sum "dist/${pkg_name}.tar.gz" > "dist/SHA256SUMS-${{ matrix.target }}.txt"
           fi
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $targetDir = "target/${{ matrix.target }}/release"
-          $pkgName = "agentmux-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "$targetDir/agentmux.exe" "dist/agentmux.exe"
-          Compress-Archive -Path "dist/agentmux.exe" -DestinationPath "dist/$pkgName.zip" -Force
-          Remove-Item "dist/agentmux.exe"
-          $hash = Get-FileHash "dist/$pkgName.zip" -Algorithm SHA256
-          "$($hash.Hash)  $pkgName.zip" | Out-File -Encoding ascii "dist/SHA256SUMS-${{ matrix.target }}.txt"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2

@@ -38,7 +38,6 @@ get_target() {
         aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
         *)             echo "x86_64-unknown-linux-musl" ;;
       esac ;;
-    MINGW*|MSYS*|CYGWIN*) echo "x86_64-pc-windows-msvc" ;;
     *)      echo "" ;;
   esac
 }
@@ -86,20 +85,12 @@ download_binary() {
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
   [ -z "$tag" ] && return 1
 
-  case "$target" in
-    *windows*) ext="zip" ;;
-    *)         ext="tar.gz" ;;
-  esac
-
-  url="https://github.com/$REPO/releases/download/$tag/agentmux-${target}.${ext}"
+  url="https://github.com/$REPO/releases/download/$tag/agentmux-${target}.tar.gz"
   tmp="$(mktemp -d)"
 
-  if curl -fsSL "$url" -o "$tmp/archive.$ext" 2>/dev/null; then
+  if curl -fsSL "$url" -o "$tmp/archive.tar.gz" 2>/dev/null; then
     mkdir -p "$BIN_DIR"
-    case "$ext" in
-      tar.gz) tar xzf "$tmp/archive.$ext" -C "$BIN_DIR" ;;
-      zip)    unzip -o "$tmp/archive.$ext" -d "$BIN_DIR" >/dev/null ;;
-    esac
+    tar xzf "$tmp/archive.tar.gz" -C "$BIN_DIR"
     rm -rf "$tmp"
     chmod +x "$BINARY" 2>/dev/null
     return 0
@@ -108,8 +99,27 @@ download_binary() {
   return 1
 }
 
-# Get binary: prefer existing, then download prebuilt, then build from source
-if [ ! -x "$BINARY" ]; then
+get_latest_tag() {
+  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+}
+
+get_installed_version() {
+  "$BINARY" --version 2>/dev/null | awk '{print $2}'
+}
+
+needs_install() {
+  [ ! -x "$BINARY" ] && return 0
+  local latest installed
+  latest="$(get_latest_tag)"
+  [ -z "$latest" ] && return 1   # can't reach GitHub — keep existing
+  installed="$(get_installed_version)"
+  # Strip leading 'v' for comparison
+  [ "${latest#v}" != "${installed#v}" ]
+}
+
+# Get binary: install if missing or a newer version is available
+if needs_install; then
   target=$(get_target)
   if [ -n "$target" ]; then
     download_binary "$target" 2>/tmp/agentmux-download.log
