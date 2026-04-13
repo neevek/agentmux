@@ -15,11 +15,9 @@ const WHITE: &str = "\x1b[38;2;205;214;244m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const BLUE: &str = "\x1b[38;2;137;180;250m"; // blue #89b4fa (input tokens)
 const MAUVE: &str = "\x1b[38;2;203;166;247m"; // mauve #cba6f7 (output tokens)
-const TEAL: &str = "\x1b[38;2;148;226;213m"; // teal #94e2d5 (context left)
 const SUBTEXT: &str = "\x1b[38;2;186;194;222m"; // subtext0 #bac2de (cwd)
 const PEACH: &str = "\x1b[38;2;250;179;135m"; // peach #fab387 (Claude)
 const ROSEWATER: &str = "\x1b[38;2;245;224;220m"; // rosewater #f5e0dc (cost)
-const SAPPHIRE: &str = "\x1b[38;2;116;199;236m"; // sapphire #74c7ec (model)
 const FLAMINGO: &str = "\x1b[38;2;242;205;205m"; // flamingo #f2cdcd (msg count)
 
 // Backgrounds
@@ -381,10 +379,6 @@ pub fn render_sidebar(
             let name = agent.kind.display_name();
             let has_badge = unseen_done.contains(&agent.pane_id);
 
-            let state_color = match agent.state {
-                AgentState::Working => GREEN,
-                AgentState::Idle => GRAY,
-            };
             let elapsed = format_elapsed(agent.elapsed_secs);
             let short_cwd = truncate_path(&agent.cwd, w.saturating_sub(6));
             let win_name = &agent.window_name;
@@ -409,10 +403,10 @@ pub fn render_sidebar(
             let sep = format!("{bg} {DIM}|{RESET}{bg} ");
             let mut info_parts: Vec<String> = Vec::new();
             info_parts.push(format!(
-                "{BLUE}↑ {in_tok}{RESET}{bg} {MAUVE}↓ {out_tok}{RESET}"
+                "{SUBTEXT}↑ {in_tok}{RESET}{bg} {SUBTEXT}↓ {out_tok}{RESET}"
             ));
             if agent.cost_usd >= 0.01 {
-                info_parts.push(format!("{ROSEWATER}{}{RESET}", format_cost(agent.cost_usd)));
+                info_parts.push(format!("{SUBTEXT}{}{RESET}", format_cost(agent.cost_usd)));
             }
             let info_str = format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep));
 
@@ -426,7 +420,7 @@ pub fn render_sidebar(
                 row,
                 bg,
                 &format!(
-                    "  {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {DIM}{elapsed}{RESET}{bg}{info_str}"
+                    "  {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {SUBTEXT}{elapsed}{RESET}{bg}{info_str}"
                 ),
             );
             row += 1;
@@ -434,16 +428,15 @@ pub fn render_sidebar(
             // Line 2 (optional): model (effort) | N% left | N msgs
             let mut metadata_parts: Vec<String> = Vec::new();
             if let Some(model_display) = metadata_model_display(agent) {
-                metadata_parts.push(format!("{SAPPHIRE}{model_display}{RESET}"));
+                metadata_parts.push(format!("{SUBTEXT}{model_display}{RESET}"));
             }
             if let Some(pct) = agent.context_pct {
                 let left = 100u8.saturating_sub(pct);
-                let ctx_color = if left <= 20 { YELLOW } else { TEAL };
-                metadata_parts.push(format!("{ctx_color}{left}% left{RESET}"));
+                metadata_parts.push(format!("{SUBTEXT}{left}% left{RESET}"));
             }
             if agent.turn_count > 0 {
                 let msg_label = if agent.turn_count == 1 { "msg" } else { "msgs" };
-                metadata_parts.push(format!("{FLAMINGO}{} {msg_label}{RESET}", agent.turn_count));
+                metadata_parts.push(format!("{SUBTEXT}{} {msg_label}{RESET}", agent.turn_count));
             }
             if !metadata_parts.is_empty() {
                 emit(
@@ -467,11 +460,25 @@ pub fn render_sidebar(
             if agent.details_ready {
                 // Line 4: state dot + last activity / fallback text
                 let activity_text = agent.last_activity.as_deref().unwrap_or("");
-                let state_prefix = format!("{state_color}{BOLD}●{RESET}{bg}  ");
                 let state_line = if activity_text.is_empty() {
-                    format!("  {state_prefix}{}", state_label(agent.state))
+                    let fallback = state_label(agent.state);
+                    match agent.state {
+                        AgentState::Working => {
+                            format!("  {GREEN}{BOLD}●{RESET}{bg}  {GREEN}{fallback}{RESET}")
+                        }
+                        AgentState::Idle => {
+                            format!("  {DIM}●{RESET}{bg}  {DIM}{fallback}{RESET}")
+                        }
+                    }
                 } else {
-                    format!("  {state_prefix}{DIM}{activity_text}{RESET}")
+                    match agent.state {
+                        AgentState::Working => {
+                            format!("  {GREEN}{BOLD}●{RESET}{bg}  {GREEN}{activity_text}{RESET}")
+                        }
+                        AgentState::Idle => {
+                            format!("  {DIM}●{RESET}{bg}  {DIM}{activity_text}{RESET}")
+                        }
+                    }
                 };
                 emit(&mut buf, row, bg, &state_line);
                 row += 1;
@@ -628,8 +635,8 @@ fn metadata_model_display(agent: &AgentInfo) -> Option<String> {
 
 fn state_label(state: AgentState) -> &'static str {
     match state {
-        AgentState::Working => "working...",
-        AgentState::Idle => "idle",
+        AgentState::Working => "Working...",
+        AgentState::Idle => "Idle",
     }
 }
 
@@ -847,7 +854,7 @@ mod tests {
             .0;
         let state_row = rows
             .iter()
-            .find(|(_, line)| line.contains("●  working..."))
+            .find(|(_, line)| line.contains("●  Working..."))
             .unwrap()
             .0;
 
@@ -879,7 +886,7 @@ mod tests {
             },
         );
 
-        assert!(strip_ansi(&rendered).contains("●  idle"));
+        assert!(strip_ansi(&rendered).contains("●  Idle"));
     }
 
     #[test]

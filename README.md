@@ -4,39 +4,33 @@ A tmux sidebar that monitors all your coding agent sessions — Claude Code, Cod
 
 ## Features
 
-- **Agent Detection** — Automatically discovers coding agents (Claude Code, Codex) running in any tmux pane via process tree scanning
-- **Live Status** — Shows WORKING/IDLE state for each agent, updated every 3 seconds
-- **Token Usage** — Displays cumulative input/output tokens per session (↑ input ↓ output)
-- **Context Window** — Shows remaining context percentage, turns yellow when running low
-- **Last Activity** — Previews the most recent tool call (Edit, Bash, Grep, etc.)
-- **Elapsed Time** — How long each agent has been running
-- **Window Indicator** — Shows which tmux window each agent lives in
-- **Notification Badge** — Yellow `!` marks agents that finished while you were in another window
-- **Keyboard Navigation** — j/k or arrow keys to select, Enter to jump to that agent's pane
-- **Mouse Support** — Click to select and switch to an agent
-- **Persistent Per-Window** — Each window gets its own sidebar, lazily created on first visit
-- **No Squash** — Sidebar only takes space from the adjacent pane, not all panes
-- **Selection Sync** — Selected item stays consistent across all windows
+- **Agent Detection** — Discovers Claude Code and Codex processes via process tree scanning
+- **Live Status** — WORKING/IDLE state per agent, updated every 3 seconds
+- **Token & Cost** — Cumulative tokens with cache breakdown (↑↓), cost estimation per session
+- **Usage History** — Header shows aggregated stats for today, 7 days, and all time
+- **Context Window** — Remaining context %, turns yellow when low
+- **Last Activity** — Most recent tool call preview (Edit, Bash, Grep, etc.)
+- **Notifications** — Yellow `!` badge for agents that finished in another window
+- **Navigation** — j/k or arrows to select, Enter or click to jump to agent's pane
+- **Per-Window Sidebars** — Lazily created per tmux window, no pane squashing
+- **Selection Sync** — Selection stays consistent across windows
 
 ## Install
 
 ### With TPM (recommended)
 
-Add to your `~/.tmux.conf`:
-
 ```tmux
 set -g @plugin 'neevek/agentmux'
 ```
 
-Press `prefix + I` to install. The plugin automatically downloads a prebuilt binary for your platform. If no binary is available, it falls back to building from source (requires Rust toolchain).
+Press `prefix + I`. Downloads a prebuilt binary; falls back to `cargo build` if unavailable.
 
 ### Manual
 
 ```bash
 git clone https://github.com/neevek/agentmux ~/.tmux/plugins/agentmux
 cd ~/.tmux/plugins/agentmux
-cargo build --release
-mkdir -p bin && cp target/release/agentmux bin/
+cargo build --release && mkdir -p bin && cp target/release/agentmux bin/
 ```
 
 Add to `~/.tmux.conf`:
@@ -50,39 +44,31 @@ run-shell ~/.tmux/plugins/agentmux/agentmux.tmux
 | Action | Key |
 |--------|-----|
 | Toggle sidebar | `prefix + a` |
-| Move selection up | `k` or `↑` |
-| Move selection down | `j` or `↓` |
-| Jump to agent's pane | `Enter` or click |
-| Quit sidebar | `q` |
-
-Or use the CLI directly:
+| Navigate | `j`/`k` or `↑`/`↓` |
+| Jump to agent | `Enter` or click |
+| Quit | `q` |
 
 ```bash
-agentmux toggle   # Toggle sidebar
-agentmux open     # Open if not already open
-agentmux close    # Close all sidebars
+agentmux toggle / open / close
 ```
 
 ## Configuration
 
-Set these in `~/.tmux.conf` before the plugin line:
-
 ```tmux
-# Change toggle keybinding (default: a)
-set -g @agentmux-key 'a'
-
-# Set sidebar width (default: 60)
-set -g @agentmux-width 50
+set -g @agentmux-key 'a'      # toggle keybinding (default: a)
+set -g @agentmux-width 50     # sidebar width in columns (default: 60, min: 50)
 ```
+
+Runtime settings (e.g. resized width) are persisted to `~/.config/agentmux/config.toml`.
 
 ## Supported Agents
 
-| Agent |
-|-------|
-| **Claude Code** |
-| **Codex** |
+| Agent | Tokens | Cost |
+|-------|--------|------|
+| Claude Code | ✓ with cache breakdown | ✓ |
+| Codex | ✓ | ✓ |
 
-Adding support for new agents is straightforward — implement the process pattern and JSONL/state parser in `src/detect/`.
+Models: Claude Opus/Sonnet/Haiku, OpenAI o3/o4-mini, GPT-5.4/4.1/4o, and more.
 
 ## Why Rust?
 
@@ -105,24 +91,16 @@ So yes — I chose Rust because it's fast, correct, and dependency-free. But mos
 
 ```
 src/
-  main.rs              CLI entry point (toggle/open/close/ensure)
-  tmux/mod.rs          Tmux command helpers
-  detect/
-    mod.rs             Agent scan coordinator
-    process.rs         Process tree walking (ps → agent detection)
-    state.rs           JSONL parsing, token counting, state detection
-  sidebar/
-    mod.rs             Main event loop (active/inactive polling)
-    render.rs          ANSI terminal rendering
-    input.rs           Keyboard and mouse input handling
+  main.rs          CLI entry point
+  config.rs        TOML config
+  tmux/            Tmux command helpers
+  detect/          Agent scanning, JSONL parsing, cost estimation, SQLite history
+  sidebar/         Event loop, rendering, input, leader/follower coordination
 ```
 
-**Design principles:**
-- One sidebar process per window, each with its own stdin/stdout
-- Active window sidebar does full scanning every 3s; inactive sidebars only sync selection state (1 tmux query/sec)
-- JSONL token counting is cached by file size — no re-reads unless the file grows
-- State detection uses a fast 32KB tail read, not the full file
-- Sidebar creation auto-detects window layout to avoid squashing other panes
+- Active sidebar scans every 3s; inactive sidebars sync selection only (1 query/sec)
+- JSONL token counts cached by file size/mtime; state detection uses 32KB tail reads
+- Codex sessions parsed incrementally; usage history persisted to SQLite
 
 ## License
 
