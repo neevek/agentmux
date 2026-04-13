@@ -24,7 +24,7 @@ extern "C" fn winch_handler(_sig: libc::c_int) {}
 
 const INPUT_POLL_MS: u64 = 1000;
 const FOCUS_POLL_MS: u64 = 500;
-const WIDTH_SAVE_THROTTLE_MS: u64 = 50;
+const WIDTH_SAVE_DEBOUNCE_MS: u64 = 300;
 const DISCOVERY_SWEEP_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +515,80 @@ mod tests {
         assert!(!changed);
         assert_eq!(selection, Selection::Header);
     }
+
+    #[test]
+    fn keyboard_nav_down_reaches_last_item_even_with_last_focused_agent() {
+        // Regression: sync_selection_from_focus used to snap selection back to
+        // last_focused_agent on every loop iteration, preventing keyboard
+        // navigation from reaching any item other than the last activated one.
+        // Fix: keyboard handlers update last_focused_agent_pane_id so the sync
+        // sees the selection as already matching and doesn't override.
+        let agents = vec![agent("%1"), agent("%2"), agent("%3")];
+
+        // Simulate: user previously activated %1, then returns to the sidebar
+        // and presses j twice to reach %3.
+        let mut selection = Selection::Agent("%1".to_string());
+        let mut last_focused = Some("%1".to_string());
+
+        // First j press: moves to %2, update last_focused to match
+        let next = move_selection_down(&selection, &agents);
+        assert_eq!(next, Selection::Agent("%2".to_string()));
+        if let Selection::Agent(ref pane_id) = next {
+            last_focused = Some(pane_id.clone());
+        }
+        selection = next;
+
+        // sync_selection_from_focus should NOT override: last_focused now == selection
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
+        assert!(!changed);
+        assert_eq!(selection, Selection::Agent("%2".to_string()));
+
+        // Second j press: moves to %3 (last item)
+        let next = move_selection_down(&selection, &agents);
+        assert_eq!(next, Selection::Agent("%3".to_string()));
+        if let Selection::Agent(ref pane_id) = next {
+            last_focused = Some(pane_id.clone());
+        }
+        selection = next;
+
+        // sync_selection_from_focus should NOT override
+        let changed = sync_selection_from_focus(
+            &mut selection,
+            &mut last_focused,
+            true,
+            Some("%sidebar"),
+            "%sidebar",
+            "@1",
+            &agents,
+        );
+        assert!(!changed);
+        assert_eq!(selection, Selection::Agent("%3".to_string()));
+    }
+}
+
+struct SidebarConfig {
+    compact_mode: bool,
+    item_separator: bool,
+}
+
+fn load_sidebar_config() -> SidebarConfig {
+    use crate::config::read_value;
+    SidebarConfig {
+        compact_mode: read_value("sidebar", "compact_mode")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+        item_separator: read_value("sidebar", "item_separator")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+    }
 }
 
 fn load_header_config() -> HeaderConfig {
@@ -574,7 +648,8 @@ pub fn run() {
     let mut selection = Selection::None;
     let mut scroll_offset = 0usize;
     let mut last_width = 0u32;
-    let mut last_width_save = Instant::now();
+    let mut last_width_change = Instant::now() - Duration::from_secs(10);
+    let mut pending_width_save: Option<u32> = None;
     let mut needs_render = true;
     let mut just_activated = false;
     let mut suppress_on_exit = false;
@@ -582,6 +657,7 @@ pub fn run() {
     let mut last_discovery_sweep = Instant::now() - Duration::from_millis(DISCOVERY_SWEEP_MS);
 
     let header_config = load_header_config();
+    let sidebar_config = load_sidebar_config();
     let mut header_expanded = header_config.start_mode == HeaderMode::Expanded;
     let mut header_user_toggled = false;
     let start_time = Instant::now();
@@ -758,8 +834,14 @@ pub fn run() {
 
         let (_, height) = terminal_size();
         if let Some(selected_idx) = selected_idx {
-            let visible =
-                render::visible_item_count(height, &cached_agents, scroll_offset, header_expanded);
+            let visible = render::visible_item_count_opts(
+                height,
+                &cached_agents,
+                scroll_offset,
+                header_expanded,
+                sidebar_config.compact_mode,
+                sidebar_config.item_separator,
+            );
             if visible > 0 {
                 if selected_idx < scroll_offset {
                     scroll_offset = selected_idx;
@@ -769,18 +851,26 @@ pub fn run() {
             }
         }
 
+        // Flush a pending width save once the width has been stable long enough
+        // (debounce: avoids tmux resize-pane calls while the user is still dragging).
+        if let Some(w) = pending_width_save {
+            if last_width_change.elapsed() >= Duration::from_millis(WIDTH_SAVE_DEBOUNCE_MS) {
+                tmux::save_sidebar_width(&session, w);
+                pending_width_save = None;
+            }
+        }
+
         if needs_render {
             let (mut width, height) = terminal_size();
-            if width < tmux::MIN_WIDTH {
-                tmux::resize_pane_width(tmux::MIN_WIDTH);
+            let clamped = width < tmux::MIN_WIDTH;
+            if clamped {
                 width = tmux::MIN_WIDTH;
             }
-            if last_width != 0
-                && width != last_width
-                && last_width_save.elapsed() >= Duration::from_millis(WIDTH_SAVE_THROTTLE_MS)
-            {
-                tmux::save_sidebar_width(&session, width);
-                last_width_save = Instant::now();
+            // Schedule a save when the width changes OR when we clamped it for
+            // the first time (last_width == 0 means first render).
+            if width != last_width || (clamped && last_width == 0) {
+                last_width_change = Instant::now();
+                pending_width_save = Some(width);
             }
             last_width = width;
             print!(
@@ -796,6 +886,8 @@ pub fn run() {
                         unseen_done: &unseen_done,
                         expanded: header_expanded,
                         header_selected,
+                        compact_mode: sidebar_config.compact_mode,
+                        item_separator: sidebar_config.item_separator,
                     },
                 )
             );
@@ -803,16 +895,30 @@ pub fn run() {
             needs_render = false;
         }
 
-        let input_timeout = if sidebar_window_id.is_empty() {
-            Duration::from_millis(INPUT_POLL_MS)
-        } else {
-            next_input_poll_timeout(last_focus_poll.elapsed())
+        let input_timeout = {
+            let base = if sidebar_window_id.is_empty() {
+                Duration::from_millis(INPUT_POLL_MS)
+            } else {
+                next_input_poll_timeout(last_focus_poll.elapsed())
+            };
+            // Wake up in time to flush a pending width save
+            if pending_width_save.is_some() {
+                let debounce = Duration::from_millis(WIDTH_SAVE_DEBOUNCE_MS);
+                let elapsed = last_width_change.elapsed();
+                let remaining = debounce.saturating_sub(elapsed);
+                base.min(remaining + Duration::from_millis(10))
+            } else {
+                base
+            }
         };
 
         match input::poll_input(input_timeout) {
             input::InputEvent::KeyUp if is_active => {
                 let next_selection = move_selection_up(&selection, &cached_agents);
                 if next_selection != selection {
+                    if let Selection::Agent(pane_id) = &next_selection {
+                        last_focused_agent_pane_id = Some(pane_id.clone());
+                    }
                     selection = next_selection;
                     needs_render = true;
                 }
@@ -820,6 +926,9 @@ pub fn run() {
             input::InputEvent::KeyDown if is_active => {
                 let next_selection = move_selection_down(&selection, &cached_agents);
                 if next_selection != selection {
+                    if let Selection::Agent(pane_id) = &next_selection {
+                        last_focused_agent_pane_id = Some(pane_id.clone());
+                    }
                     selection = next_selection;
                     needs_render = true;
                 }
@@ -830,11 +939,13 @@ pub fn run() {
             }
             input::InputEvent::MouseScrollDown if is_active => {
                 let max_offset = cached_agents.len().saturating_sub(
-                    render::visible_item_count(
+                    render::visible_item_count_opts(
                         height,
                         &cached_agents,
                         scroll_offset,
                         header_expanded,
+                        sidebar_config.compact_mode,
+                        sidebar_config.item_separator,
                     )
                     .max(1),
                 );
@@ -869,7 +980,7 @@ pub fn run() {
                     }
                     needs_render = true;
                 } else if let Some(agent) =
-                    input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows)
+                    input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows, sidebar_config.compact_mode, sidebar_config.item_separator)
                         .and_then(|idx| cached_agents.get(idx))
                 {
                     selection = Selection::Agent(agent.pane_id.clone());
