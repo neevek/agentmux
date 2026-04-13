@@ -130,6 +130,16 @@ pub fn suppress_window(window_id: &str) {
     let _ = tmux_output(&["set-option", "-g", &option, "1"]);
 }
 
+pub fn window_pane_count(window_id: &str) -> usize {
+    tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"])
+        .map(|out| out.lines().count())
+        .unwrap_or(0)
+}
+
+pub fn kill_window(window_id: &str) {
+    let _ = tmux_output(&["kill-window", "-t", window_id]);
+}
+
 pub fn clear_window_suppressed(window_id: &str) {
     let option = suppressed_option(window_id);
     let _ = tmux_output(&["set-option", "-gu", &option]);
