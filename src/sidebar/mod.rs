@@ -632,10 +632,10 @@ pub fn run() {
     let mut prev_states: HashMap<String, AgentState> = HashMap::new();
     let mut unseen_done: HashSet<String> = HashSet::new();
     let mut cached_agents = detect::scan_agents_fast(&session);
-    let mut current_stats = AggregatedStats::default();
+    let mut history = HistoryStore::start();
+    let mut current_stats = history.aggregated_stats(&cached_agents);
     let mut role = SidebarRole::Inactive;
     let mut runtime_store = RuntimeStore::new(&session);
-    let mut history = HistoryStore::start();
     let mut detect_cache = detect::SessionCache::new();
     let sidebar_pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
     let sidebar_window_id = tmux::pane_window_id(&sidebar_pane_id)
@@ -689,10 +689,7 @@ pub fn run() {
                     role = SidebarRole::Inactive;
                 }
             } else {
-                // Only suppress the refresh block when data was already loaded
-                // from a snapshot. On a cold start (no snapshot) we need the
-                // refresh to run immediately so stats aren't blank.
-                just_activated = activate_sidebar(
+                activate_sidebar(
                     &mut role,
                     &mut runtime_store,
                     &mut cached_agents,
@@ -701,6 +698,7 @@ pub fn run() {
                     &mut unseen_done,
                     &sidebar_window_id,
                 );
+                just_activated = true;
             }
             last_active = is_active;
             needs_render = true;
@@ -1026,9 +1024,6 @@ pub fn run() {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Returns true if existing data was loaded (snapshot), false if this is a
-/// cold start with no prior state — caller should skip `just_activated` in
-/// that case so the first refresh fires immediately.
 fn activate_sidebar(
     role: &mut SidebarRole,
     runtime_store: &mut RuntimeStore,
@@ -1037,7 +1032,7 @@ fn activate_sidebar(
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
     sidebar_window_id: &str,
-) -> bool {
+) {
     let mut snapshot_loaded = false;
     let lease = runtime_store.read_lease();
     if let Some(snapshot) = runtime_store.load_snapshot_for_activation() {
@@ -1059,7 +1054,7 @@ fn activate_sidebar(
             epoch,
             last_refresh: Instant::now() - Duration::from_millis(runtime::POLL_INTERVAL_MS),
         };
-        return snapshot_loaded;
+        return;
     }
 
     *role = SidebarRole::Follower {
@@ -1069,7 +1064,6 @@ fn activate_sidebar(
             Instant::now() - Duration::from_millis(runtime::POLL_INTERVAL_MS)
         },
     };
-    snapshot_loaded
 }
 
 #[allow(clippy::too_many_arguments)]
