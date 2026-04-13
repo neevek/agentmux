@@ -70,7 +70,9 @@ fn suppressed_option(window_id: &str) -> String {
 }
 
 pub fn get_sidebar_width() -> u32 {
-    crate::config::read_value("core", "width")
+    crate::config::read_value("sidebar", "width")
+        // fall back to legacy [core] width key for existing configs
+        .or_else(|| crate::config::read_value("core", "width"))
         .and_then(|v| v.parse().ok())
         .or_else(|| {
             tmux_output(&["show-option", "-gqv", WIDTH_OPTION]).and_then(|s| s.parse().ok())
@@ -80,12 +82,18 @@ pub fn get_sidebar_width() -> u32 {
 
 /// Save width to tmux option, persistent config, and resize all other sidebar panes.
 pub fn save_sidebar_width(session: &str, width: u32) {
+    let width = width.max(MIN_WIDTH);
     let w = width.to_string();
     let _ = tmux_output(&["set-option", "-g", WIDTH_OPTION, &w]);
-    crate::config::write_value("core", "width", &w);
+    crate::config::write_value("sidebar", "width", &w);
+
+    // Enforce minimum on the current pane now that dragging has settled
+    let my_pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    if !my_pane.is_empty() {
+        let _ = tmux_output(&["resize-pane", "-t", &my_pane, "-x", &w]);
+    }
 
     // Resize all other sidebar panes in the session to match
-    let my_pane = std::env::var("TMUX_PANE").unwrap_or_default();
     for (pane_id, _) in find_all_sidebar_panes(session) {
         if pane_id != my_pane {
             let _ = tmux_output(&["resize-pane", "-t", &pane_id, "-x", &w]);
@@ -250,14 +258,6 @@ fn find_split_target(window_id: &str) -> Option<(String, bool)> {
     } else {
         let first = panes.first()?;
         Some((first.0.clone(), true))
-    }
-}
-
-pub fn resize_pane_width(width: u32) {
-    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
-    if !pane.is_empty() {
-        let w = width.to_string();
-        let _ = tmux_output(&["resize-pane", "-t", &pane, "-x", &w]);
     }
 }
 

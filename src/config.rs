@@ -3,13 +3,17 @@ use std::path::PathBuf;
 
 const DEFAULT_CONFIG: &str = "\
 [core]
-width = 50
 initialized = false
 
 [header]
 auto_collapse = true
 auto_collapse_timeout_ms = 5000
 start_mode = \"expanded\"
+
+[sidebar]
+width = 50
+compact_mode = true
+item_separator = true
 ";
 
 pub fn config_dir() -> PathBuf {

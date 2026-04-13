@@ -29,34 +29,54 @@ pub fn header_rows(expanded: bool) -> u32 {
     if expanded { 15 } else { 8 }
 }
 
-/// Calculate the row count for a single agent item.
-pub fn item_row_count(agent: &AgentInfo) -> u32 {
-    // Always: top margin (1) + summary (1) + path (1) + bottom margin (1)
-    let mut rows = 4u32;
+pub fn item_row_count_opts(agent: &AgentInfo, compact: bool, separator: bool) -> u32 {
+    // Normal: top margin (1) + summary (1) + path (1) + bottom margin (1)
+    // Compact: no top/bottom margin; 1 row top + 1 row bottom replaced by separator
+    let mut rows = if compact { 0u32 } else { 2u32 }; // margins
+    rows += 1; // summary line
+    rows += 1; // path line
     if has_metadata_line(agent) {
         rows += 1;
     }
     if agent.details_ready {
         rows += 1;
     }
+    if compact && separator {
+        rows += 1; // separator row (between items, counted as part of each item except the last)
+    }
     rows
 }
 
-/// Calculate how many items fit in the visible area (adaptive heights).
-pub fn visible_item_count(
+pub fn visible_item_count_opts(
     height: u32,
     agents: &[AgentInfo],
     scroll_offset: usize,
     expanded: bool,
+    compact: bool,
+    separator: bool,
 ) -> usize {
-    let mut available = height.saturating_sub(header_rows(expanded));
-    let mut count = 0;
-    for agent in agents.iter().skip(scroll_offset) {
-        let h = item_row_count(agent);
-        if h > available {
+    let available = height.saturating_sub(header_rows(expanded));
+    // Each item occupies its own rows; separators appear *between* visible items,
+    // never after the last visible one. Greedily count items without any separator
+    // overhead, then add (count-1) separator rows at the end to check fit.
+    // This matches exactly what render_sidebar draws.
+    let base_rows: Vec<u32> = agents
+        .iter()
+        .skip(scroll_offset)
+        .map(|a| item_row_count_opts(a, compact, false))
+        .collect();
+
+    let sep_rows = if compact && separator { 1u32 } else { 0 };
+
+    let mut used = 0u32;
+    let mut count = 0usize;
+    for &item_h in &base_rows {
+        // Adding this item costs item_h rows plus one separator if it's not first
+        let extra = if count > 0 { sep_rows } else { 0 };
+        if used + extra + item_h > available {
             break;
         }
-        available -= h;
+        used += extra + item_h;
         count += 1;
     }
     count
@@ -70,6 +90,8 @@ pub struct RenderOptions<'a> {
     pub unseen_done: &'a HashSet<String>,
     pub expanded: bool,
     pub header_selected: bool,
+    pub compact_mode: bool,
+    pub item_separator: bool,
 }
 
 pub fn render_sidebar(
@@ -84,6 +106,8 @@ pub fn render_sidebar(
     let unseen_done = opts.unseen_done;
     let expanded = opts.expanded;
     let header_selected = opts.header_selected;
+    let compact_mode = opts.compact_mode;
+    let item_separator = opts.item_separator;
     let w = width as usize;
     let mut buf = String::new();
     let mut row: u32 = 1;
@@ -366,11 +390,13 @@ pub fn render_sidebar(
         );
         row += 1;
     } else {
-        let visible = visible_item_count(height, agents, scroll_offset, expanded);
+        let visible =
+            visible_item_count_opts(height, agents, scroll_offset, expanded, compact_mode, item_separator);
         let end = (scroll_offset + visible).min(agents.len());
 
         for (vi, agent) in agents[scroll_offset..end].iter().enumerate() {
             let i = scroll_offset + vi;
+            let is_last_visible = vi + 1 == end - scroll_offset;
             let is_selected = !header_selected && selected == Some(i);
             let color = match agent.kind {
                 AgentKind::ClaudeCode => PEACH,
@@ -392,35 +418,37 @@ pub fn render_sidebar(
             let in_tok = format_tokens(agent.input_tokens);
             let out_tok = format_tokens(agent.output_tokens);
 
-            let bg = if is_selected { SEL_BG } else { "" };
-            let emit = if is_selected {
-                emit_line_bg
+            // Selection indicator: a colored '█' bar at column 1, no background fill.
+            let sel_bar = if is_selected {
+                format!("{color}█{RESET}")
             } else {
-                emit_line_no_bg
+                " ".to_string()
             };
 
             // Build info trail: ↑2.8M ↓25.6k | $2.54
-            let sep = format!("{bg} {DIM}|{RESET}{bg} ");
+            let sep = format!(" {DIM}|{RESET} ");
             let mut info_parts: Vec<String> = Vec::new();
             info_parts.push(format!(
-                "{SUBTEXT}↑ {in_tok}{RESET}{bg} {SUBTEXT}↓ {out_tok}{RESET}"
+                "{SUBTEXT}↑ {in_tok}{RESET} {SUBTEXT}↓ {out_tok}{RESET}"
             ));
             if agent.cost_usd >= 0.01 {
                 info_parts.push(format!("{SUBTEXT}{}{RESET}", format_cost(agent.cost_usd)));
             }
-            let info_str = format!("{bg} {DIM}|{RESET}{bg} {}", info_parts.join(&sep));
+            let info_str = format!(" {DIM}|{RESET} {}", info_parts.join(&sep));
 
-            // Top margin
-            emit(&mut buf, row, bg, "");
-            row += 1;
+            // Top margin (skipped in compact mode)
+            if !compact_mode {
+                emit_line_no_bg(&mut buf, row, "", &sel_bar);
+                row += 1;
+            }
 
             // Line 1: name elapsed | ↑in ↓out | $cost
-            emit(
+            emit_line_no_bg(
                 &mut buf,
                 row,
-                bg,
+                "",
                 &format!(
-                    "  {color}{BOLD}{name}{RESET}{bg}{badge}{bg} {SUBTEXT}{elapsed}{RESET}{bg}{info_str}"
+                    "{sel_bar} {color}{BOLD}{name}{RESET}{badge} {SUBTEXT}{elapsed}{RESET}{info_str}"
                 ),
             );
             row += 1;
@@ -439,54 +467,60 @@ pub fn render_sidebar(
                 metadata_parts.push(format!("{SUBTEXT}{} {msg_label}{RESET}", agent.turn_count));
             }
             if !metadata_parts.is_empty() {
-                emit(
+                emit_line_no_bg(
                     &mut buf,
                     row,
-                    bg,
-                    &format!("  {}", metadata_parts.join(&sep)),
+                    "",
+                    &format!("{sel_bar} {}", metadata_parts.join(&sep)),
                 );
                 row += 1;
             }
 
             // Line 3: [window] cwd
-            emit(
+            emit_line_no_bg(
                 &mut buf,
                 row,
-                bg,
-                &format!("  {GRAY}[{win_name}]{RESET}{bg} {SUBTEXT}{short_cwd}{RESET}"),
+                "",
+                &format!("{sel_bar} {GRAY}[{win_name}]{RESET} {SUBTEXT}{short_cwd}{RESET}"),
             );
             row += 1;
 
             if agent.details_ready {
                 // Line 4: state dot + last activity / fallback text
                 let activity_text = agent.last_activity.as_deref().unwrap_or("");
-                let state_line = if activity_text.is_empty() {
-                    let fallback = state_label(agent.state);
-                    match agent.state {
-                        AgentState::Working => {
-                            format!("  {GREEN}{BOLD}●{RESET}{bg}  {GREEN}{fallback}{RESET}")
-                        }
-                        AgentState::Idle => {
-                            format!("  {DIM}●{RESET}{bg}  {DIM}{fallback}{RESET}")
-                        }
+                let state_line = match agent.state {
+                    AgentState::Working => {
+                        let text = if activity_text.is_empty() {
+                            state_label(agent.state)
+                        } else {
+                            activity_text
+                        };
+                        format!("{sel_bar} {GREEN}{BOLD}●{RESET}  {GRAY}{text}{RESET}")
                     }
-                } else {
-                    match agent.state {
-                        AgentState::Working => {
-                            format!("  {GREEN}{BOLD}●{RESET}{bg}  {GREEN}{activity_text}{RESET}")
-                        }
-                        AgentState::Idle => {
-                            format!("  {DIM}●{RESET}{bg}  {DIM}{activity_text}{RESET}")
-                        }
+                    AgentState::Idle => {
+                        let text = if activity_text.is_empty() {
+                            state_label(agent.state)
+                        } else {
+                            activity_text
+                        };
+                        format!("{sel_bar} {DIM}●{RESET}  {DIM}{text}{RESET}")
                     }
                 };
-                emit(&mut buf, row, bg, &state_line);
+                emit_line_no_bg(&mut buf, row, "", &state_line);
                 row += 1;
             }
 
-            // Bottom margin
-            emit(&mut buf, row, bg, "");
-            row += 1;
+            // Bottom margin (skipped in compact mode) or separator between items
+            if compact_mode {
+                if item_separator && !is_last_visible {
+                    let sep_line = format!("{DIM}{}{RESET}", "─".repeat(w));
+                    emit_line_no_bg(&mut buf, row, "", &sep_line);
+                    row += 1;
+                }
+            } else {
+                emit_line_no_bg(&mut buf, row, "", &sel_bar);
+                row += 1;
+            }
         }
     }
 
@@ -769,8 +803,8 @@ mod tests {
         without_metadata.context_pct = None;
         without_metadata.turn_count = 0;
 
-        assert_eq!(item_row_count(&with_metadata), 6);
-        assert_eq!(item_row_count(&without_metadata), 5);
+        assert_eq!(item_row_count_opts(&with_metadata, false, false), 6);
+        assert_eq!(item_row_count_opts(&without_metadata, false, false), 5);
     }
 
     #[test]
@@ -782,7 +816,7 @@ mod tests {
         provisional.context_pct = None;
         provisional.turn_count = 0;
 
-        assert_eq!(item_row_count(&provisional), 4);
+        assert_eq!(item_row_count_opts(&provisional, false, false), 4);
     }
 
     #[test]
@@ -798,6 +832,8 @@ mod tests {
                 unseen_done: &HashSet::new(),
                 expanded: false,
                 header_selected: false,
+                compact_mode: false,
+                item_separator: false,
             },
         );
         let rows = rendered_rows(&rendered);
@@ -844,6 +880,8 @@ mod tests {
                 unseen_done: &HashSet::new(),
                 expanded: false,
                 header_selected: false,
+                compact_mode: false,
+                item_separator: false,
             },
         );
         let rows = rendered_rows(&rendered);
@@ -883,6 +921,8 @@ mod tests {
                 unseen_done: &HashSet::new(),
                 expanded: false,
                 header_selected: false,
+                compact_mode: false,
+                item_separator: false,
             },
         );
 
@@ -906,6 +946,8 @@ mod tests {
                 unseen_done: &HashSet::new(),
                 expanded: false,
                 header_selected: false,
+                compact_mode: false,
+                item_separator: false,
             },
         );
         let rows = rendered_rows(&rendered);
@@ -916,9 +958,10 @@ mod tests {
             .0;
 
         assert!(!strip_ansi(&rendered).contains("●  "));
+        // Row after dir is the bottom margin; it must not contain a state dot
         assert!(
             rows.iter()
-                .all(|(row, line)| *row != dir_row + 1 || line.trim().is_empty())
+                .all(|(row, line)| *row != dir_row + 1 || !strip_ansi(line).contains('●'))
         );
     }
 
@@ -941,6 +984,8 @@ mod tests {
                 unseen_done: &HashSet::new(),
                 expanded: false,
                 header_selected: false,
+                compact_mode: false,
+                item_separator: false,
             },
         );
 
@@ -960,6 +1005,8 @@ mod tests {
                 unseen_done: &HashSet::new(),
                 expanded: false,
                 header_selected: false,
+                compact_mode: false,
+                item_separator: false,
             },
         );
 

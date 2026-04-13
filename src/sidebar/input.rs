@@ -121,15 +121,22 @@ pub fn click_to_agent_index(
     agents: &[crate::detect::AgentInfo],
     scroll_offset: usize,
     header_rows: u32,
+    compact_mode: bool,
+    item_separator: bool,
 ) -> Option<usize> {
-    use crate::sidebar::render::item_row_count;
+    use crate::sidebar::render::item_row_count_opts;
     if y <= header_rows || agents.is_empty() {
         return None;
     }
     let click_row = y - header_rows;
+    let sep_rows = if compact_mode && item_separator { 1u32 } else { 0 };
     let mut cumulative = 0u32;
     for (vi, agent) in agents.iter().skip(scroll_offset).enumerate() {
-        cumulative += item_row_count(agent);
+        // Separator precedes every item except the first visible one
+        if vi > 0 {
+            cumulative += sep_rows;
+        }
+        cumulative += item_row_count_opts(agent, compact_mode, false);
         if click_row <= cumulative {
             return Some(scroll_offset + vi);
         }
@@ -176,15 +183,15 @@ mod tests {
         let header_rows = crate::sidebar::render::header_rows(true);
 
         assert_eq!(
-            click_to_agent_index(header_rows + 1, &agents, 0, header_rows),
+            click_to_agent_index(header_rows + 1, &agents, 0, header_rows, false, false),
             Some(0)
         );
         assert_eq!(
-            click_to_agent_index(header_rows + 5, &agents, 0, header_rows),
+            click_to_agent_index(header_rows + 5, &agents, 0, header_rows, false, false),
             Some(0)
         );
         assert_eq!(
-            click_to_agent_index(header_rows + 6, &agents, 0, header_rows),
+            click_to_agent_index(header_rows + 6, &agents, 0, header_rows, false, false),
             Some(1)
         );
     }
@@ -195,7 +202,7 @@ mod tests {
         let header_rows = crate::sidebar::render::header_rows(true);
 
         assert_eq!(
-            click_to_agent_index(header_rows, &agents, 0, header_rows),
+            click_to_agent_index(header_rows, &agents, 0, header_rows, false, false),
             None
         );
     }
