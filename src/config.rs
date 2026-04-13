@@ -6,7 +6,7 @@ const DEFAULT_CONFIG: &str = "\
 initialized = false
 
 [header]
-auto_collapse = true
+auto_collapse = false
 auto_collapse_timeout_ms = 5000
 start_mode = \"expanded\"
 

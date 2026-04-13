@@ -4,16 +4,12 @@ A tmux sidebar that monitors all your coding agent sessions — Claude Code, Cod
 
 ## Features
 
-- **Agent Detection** — Discovers Claude Code and Codex processes via process tree scanning
-- **Live Status** — WORKING/IDLE state per agent, updated every 3 seconds
-- **Token & Cost** — Cumulative tokens with cache breakdown (↑↓), cost estimation per session
-- **Usage History** — Header shows aggregated stats for today, 7 days, and all time
+- **Live Status** — WORKING/IDLE state, tokens, cost, and context per agent
+- **Usage History** — Aggregated stats for today, 7 days, and all time
+- **Navigation** — Select agents and jump to their pane with a keypress or click
+- **Per-Window Sidebars** — Each tmux window gets its own sidebar
 - **Context Window** — Remaining context %, turns yellow when low
-- **Last Activity** — Most recent tool call preview (Edit, Bash, Grep, etc.)
 - **Notifications** — Yellow `!` badge for agents that finished in another window
-- **Navigation** — j/k or arrows to select, Enter or click to jump to agent's pane
-- **Per-Window Sidebars** — Lazily created per tmux window, no pane squashing
-- **Selection Sync** — Selection stays consistent across windows
 
 ## Install
 

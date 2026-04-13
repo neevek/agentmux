@@ -121,7 +121,7 @@ pub fn render_sidebar(
         &mut buf,
         row,
         HEADER_BG,
-        &format!("{}{BOLD}{GREEN}{title}{RESET}", " ".repeat(padding)),
+        &format!("{}{BOLD}{BLUE}{title}{RESET}", " ".repeat(padding)),
     );
     row += 1;
 
@@ -390,8 +390,14 @@ pub fn render_sidebar(
         );
         row += 1;
     } else {
-        let visible =
-            visible_item_count_opts(height, agents, scroll_offset, expanded, compact_mode, item_separator);
+        let visible = visible_item_count_opts(
+            height,
+            agents,
+            scroll_offset,
+            expanded,
+            compact_mode,
+            item_separator,
+        );
         let end = (scroll_offset + visible).min(agents.len());
 
         for (vi, agent) in agents[scroll_offset..end].iter().enumerate() {
