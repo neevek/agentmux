@@ -672,6 +672,10 @@ pub fn run() {
             cached_focus_is_active = true;
             cached_active_pane_id = None;
         } else if last_focus_poll.elapsed() >= Duration::from_millis(FOCUS_POLL_MS) {
+            if tmux::window_pane_count(&sidebar_window_id) <= 1 {
+                tmux::kill_window(&sidebar_window_id);
+                break;
+            }
             let (is_active, active_pane_id) = tmux::window_focus(&sidebar_window_id);
             cached_focus_is_active = is_active;
             cached_active_pane_id = active_pane_id;
@@ -1007,7 +1011,11 @@ pub fn run() {
     }
 
     if suppress_on_exit && let Some(window_id) = tmux::current_window_id() {
-        tmux::suppress_window(&window_id);
+        if tmux::window_pane_count(&window_id) <= 1 {
+            tmux::kill_window(&window_id);
+        } else {
+            tmux::suppress_window(&window_id);
+        }
     }
 
     if let SidebarRole::Leader { epoch, .. } = role {
