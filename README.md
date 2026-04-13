@@ -39,6 +39,26 @@ Add to `~/.tmux.conf`:
 run-shell ~/.tmux/plugins/agentmux/agentmux.tmux
 ```
 
+## Uninstall
+
+Remove the binary:
+
+```bash
+rm -f ~/.local/bin/agentmux ~/bin/agentmux
+```
+
+Remove the plugin line from `~/.tmux.conf`:
+
+```tmux
+set -g @plugin 'neevek/agentmux'
+```
+
+Then press `prefix + alt + u` (TPM uninstall) or delete the plugin directory:
+
+```bash
+rm -rf ~/.tmux/plugins/agentmux
+```
+
 ## Usage
 
 | Action | Key |
@@ -59,13 +79,13 @@ set -g @agentmux-key 'a'      # toggle keybinding (default: a)
 set -g @agentmux-width 50     # sidebar width in columns (default: 60, min: 50)
 ```
 
-Runtime settings (e.g. resized width) are persisted to `~/.config/agentmux/config.toml`.
+Runtime settings (e.g. resized width) are persisted to `~/.agentmux/config.toml`.
 
 ## Supported Agents
 
 | Agent | Tokens | Cost |
 |-------|--------|------|
-| Claude Code | ✓ with cache breakdown | ✓ |
+| Claude Code | ✓ | ✓ |
 | Codex | ✓ | ✓ |
 
 Models: Claude Opus/Sonnet/Haiku, OpenAI o3/o4-mini, GPT-5.4/4.1/4o, and more.
@@ -83,7 +103,7 @@ And it turns out Rust is genuinely the right tool here:
 - **Zero runtime dependencies** — A single static binary. No Node.js, no Python, no Bun. `prefix + I` and you're done.
 - **Low resource footprint** — Inactive sidebars cost near-zero CPU. One tmux query per second, no file I/O. Your laptop fan stays quiet.
 - **Fast startup** — Millisecond launch. No interpreter warmup, no `npm install`, no waiting for your JIT to warm up while you watch a spinner.
-- **Cross-platform builds** — One CI matrix, six targets (macOS ARM/Intel, Linux x86_64/ARM64, Windows x86_64/ARM64). No platform-specific shims or runtime bundles.
+- **Cross-platform builds** — One CI matrix, four targets (macOS ARM/Intel, Linux x86_64/ARM64). No platform-specific shims or runtime bundles.
 
 So yes — I chose Rust because it's fast, correct, and dependency-free. But mostly because I didn't want to wake up to a PR titled *"agentmux-rs: A blazingly fast rewrite"*. You're welcome.
 

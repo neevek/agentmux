@@ -19,8 +19,7 @@ item_separator = true
 pub fn config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("agentmux")
+        .join(".agentmux")
 }
 
 pub fn config_path() -> PathBuf {
