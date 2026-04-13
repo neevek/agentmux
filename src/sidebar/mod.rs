@@ -652,6 +652,7 @@ pub fn run() {
     let mut last_width_change = Instant::now() - Duration::from_secs(10);
     let mut pending_width_save: Option<u32> = None;
     let mut needs_render = true;
+    let mut last_rendered_stats: Option<crate::detect::history::AggregatedStats> = None;
     let mut just_activated = false;
     let mut suppress_on_exit = false;
     let mut pane_fingerprints: HashMap<String, PaneFingerprint> = HashMap::new();
@@ -865,6 +866,10 @@ pub fn run() {
             }
         }
 
+        let has_working = cached_agents
+            .iter()
+            .any(|a| a.state == crate::detect::state::AgentState::Working);
+
         if needs_render {
             let (mut width, height) = terminal_size();
             let clamped = width < tmux::MIN_WIDTH;
@@ -873,9 +878,13 @@ pub fn run() {
             }
             // Schedule a save when the width changes OR when we clamped it for
             // the first time (last_width == 0 means first render).
-            if width != last_width || (clamped && last_width == 0) {
+            let width_changed = width != last_width || (clamped && last_width == 0);
+            if width_changed {
                 last_width_change = Instant::now();
                 pending_width_save = Some(width);
+                // Width affects header column layout — invalidate cached stats so
+                // skip_header is false and the header is fully redrawn.
+                last_rendered_stats = None;
             }
             last_width = width;
             print!(
@@ -893,11 +902,41 @@ pub fn run() {
                         header_selected,
                         compact_mode: sidebar_config.compact_mode,
                         item_separator: sidebar_config.item_separator,
+                        elapsed_ms: start_time.elapsed().as_millis() as u64,
+                        pulse_only: false,
+                        skip_header: last_rendered_stats.as_ref() == Some(&current_stats),
                     },
                 )
             );
             flush();
+            last_rendered_stats = Some(current_stats.clone());
             needs_render = false;
+        } else if has_working {
+            // Pulse-only frame: update only the Working-state indicator rows.
+            // This avoids touching static content (header) and prevents cursor flicker.
+            let (width, height) = (last_width, terminal_size().1);
+            print!(
+                "{}",
+                render::render_sidebar(
+                    &cached_agents,
+                    &current_stats,
+                    render::RenderOptions {
+                        width,
+                        height,
+                        selected: selected_idx,
+                        scroll_offset,
+                        unseen_done: &unseen_done,
+                        expanded: header_expanded,
+                        header_selected,
+                        compact_mode: sidebar_config.compact_mode,
+                        item_separator: sidebar_config.item_separator,
+                        elapsed_ms: start_time.elapsed().as_millis() as u64,
+                        pulse_only: true,
+                        skip_header: true,
+                    },
+                )
+            );
+            flush();
         }
 
         let input_timeout = {
@@ -907,11 +946,20 @@ pub fn run() {
                 next_input_poll_timeout(last_focus_poll.elapsed())
             };
             // Wake up in time to flush a pending width save
-            if pending_width_save.is_some() {
+            let base = if pending_width_save.is_some() {
                 let debounce = Duration::from_millis(WIDTH_SAVE_DEBOUNCE_MS);
                 let elapsed = last_width_change.elapsed();
                 let remaining = debounce.saturating_sub(elapsed);
                 base.min(remaining + Duration::from_millis(10))
+            } else {
+                base
+            };
+            // Drive the Working-state pulse animation at ~50 ms intervals.
+            let has_working = cached_agents
+                .iter()
+                .any(|a| a.state == crate::detect::state::AgentState::Working);
+            if has_working {
+                base.min(Duration::from_millis(100))
             } else {
                 base
             }

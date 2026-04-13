@@ -9,7 +9,6 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 
 // Colors
-const GREEN: &str = "\x1b[38;2;0;255;0m";
 const GRAY: &str = "\x1b[38;2;127;132;156m";
 const WHITE: &str = "\x1b[38;2;205;214;244m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
@@ -26,7 +25,7 @@ const HEADER_BG: &str = "\x1b[48;2;30;30;46m";
 
 /// Number of rendered rows occupied by the header before the first item begins.
 pub fn header_rows(expanded: bool) -> u32 {
-    if expanded { 15 } else { 8 }
+    if expanded { 16 } else { 8 }
 }
 
 pub fn item_row_count_opts(agent: &AgentInfo, compact: bool, separator: bool) -> u32 {
@@ -92,6 +91,13 @@ pub struct RenderOptions<'a> {
     pub header_selected: bool,
     pub compact_mode: bool,
     pub item_separator: bool,
+    /// Elapsed milliseconds since sidebar start, used to drive the Working-state pulse animation.
+    pub elapsed_ms: u64,
+    /// When true, only emit Working-state indicator rows (skips header and all other lines).
+    /// Used for pulse-animation frames to avoid flickering static content.
+    pub pulse_only: bool,
+    /// When true, skip header rows even in a full render (stats unchanged, only agents changed).
+    pub skip_header: bool,
 }
 
 pub fn render_sidebar(
@@ -108,13 +114,21 @@ pub fn render_sidebar(
     let header_selected = opts.header_selected;
     let compact_mode = opts.compact_mode;
     let item_separator = opts.item_separator;
+    let pulse_only = opts.pulse_only;
+    let skip_header = opts.skip_header || pulse_only;
     let w = width as usize;
     let mut buf = String::new();
     let mut row: u32 = 1;
 
     buf.push_str("\x1b[?25l");
 
+    if skip_header {
+        // Skip header rows entirely; advance `row` past the header.
+        row = header_rows(expanded) + 1;
+    }
+
     // === Header ===
+    if !skip_header {
     let title = "agentmux";
     let padding = w.saturating_sub(title.len()) / 2;
     emit_line_bg(
@@ -378,8 +392,9 @@ pub fn render_sidebar(
         &format!("{DIM}{}{RESET}", table_border(&cw, '┴')),
     );
     row += 1;
+    } // end !skip_header block
 
-    if agents.is_empty() {
+    if agents.is_empty() && !pulse_only {
         emit_line_clear(&mut buf, row);
         row += 1;
         emit_line_no_bg(
@@ -444,19 +459,23 @@ pub fn render_sidebar(
 
             // Top margin (skipped in compact mode)
             if !compact_mode {
-                emit_line_no_bg(&mut buf, row, "", &sel_bar);
+                if !pulse_only {
+                    emit_line_no_bg(&mut buf, row, "", &sel_bar);
+                }
                 row += 1;
             }
 
             // Line 1: name elapsed | ↑in ↓out | $cost
-            emit_line_no_bg(
-                &mut buf,
-                row,
-                "",
-                &format!(
-                    "{sel_bar} {color}{BOLD}{name}{RESET}{badge} {SUBTEXT}{elapsed}{RESET}{info_str}"
-                ),
-            );
+            if !pulse_only {
+                emit_line_no_bg(
+                    &mut buf,
+                    row,
+                    "",
+                    &format!(
+                        "{sel_bar} {color}{BOLD}{name}{RESET}{badge} {SUBTEXT}{elapsed}{RESET}{info_str}"
+                    ),
+                );
+            }
             row += 1;
 
             // Line 2 (optional): model (effort) | N% left | N msgs
@@ -473,22 +492,26 @@ pub fn render_sidebar(
                 metadata_parts.push(format!("{SUBTEXT}{} {msg_label}{RESET}", agent.turn_count));
             }
             if !metadata_parts.is_empty() {
-                emit_line_no_bg(
-                    &mut buf,
-                    row,
-                    "",
-                    &format!("{sel_bar} {}", metadata_parts.join(&sep)),
-                );
+                if !pulse_only {
+                    emit_line_no_bg(
+                        &mut buf,
+                        row,
+                        "",
+                        &format!("{sel_bar} {}", metadata_parts.join(&sep)),
+                    );
+                }
                 row += 1;
             }
 
             // Line 3: [window] cwd
-            emit_line_no_bg(
-                &mut buf,
-                row,
-                "",
-                &format!("{sel_bar} {GRAY}[{win_name}]{RESET} {SUBTEXT}{short_cwd}{RESET}"),
-            );
+            if !pulse_only {
+                emit_line_no_bg(
+                    &mut buf,
+                    row,
+                    "",
+                    &format!("{sel_bar} {GRAY}[{win_name}]{RESET} {SUBTEXT}{short_cwd}{RESET}"),
+                );
+            }
             row += 1;
 
             if agent.details_ready {
@@ -501,7 +524,12 @@ pub fn render_sidebar(
                         } else {
                             activity_text
                         };
-                        format!("{sel_bar} {GREEN}{BOLD}●{RESET}  {GRAY}{text}{RESET}")
+                        // Pulse: GREEN → black → GREEN over 1 s using a cosine wave.
+                        let phase = (opts.elapsed_ms % 1000) as f64 / 1000.0; // 0.0..1.0
+                        let intensity = ((phase * std::f64::consts::TAU).cos() + 1.0) / 2.0; // 1→0→1
+                        let g = (intensity * 255.0).round() as u8;
+                        let pulse_green = format!("\x1b[38;2;0;{g};0m");
+                        format!("{sel_bar} {pulse_green}{BOLD}●{RESET}  {GRAY}{text}{RESET}")
                     }
                     AgentState::Idle => {
                         let text = if activity_text.is_empty() {
@@ -512,28 +540,40 @@ pub fn render_sidebar(
                         format!("{sel_bar} {DIM}●{RESET}  {DIM}{text}{RESET}")
                     }
                 };
-                emit_line_no_bg(&mut buf, row, "", &state_line);
+                // In pulse_only mode, only emit Working-state rows (Idle is static).
+                if !pulse_only || matches!(agent.state, AgentState::Working) {
+                    emit_line_no_bg(&mut buf, row, "", &state_line);
+                }
                 row += 1;
             }
 
             // Bottom margin (skipped in compact mode) or separator between items
             if compact_mode {
                 if item_separator && !is_last_visible {
-                    let sep_line = format!("{DIM}{}{RESET}", "─".repeat(w));
-                    emit_line_no_bg(&mut buf, row, "", &sep_line);
+                    if !pulse_only {
+                        let sep_line = format!("{DIM}{}{RESET}", "─".repeat(w));
+                        emit_line_no_bg(&mut buf, row, "", &sep_line);
+                    }
                     row += 1;
                 }
             } else {
-                emit_line_no_bg(&mut buf, row, "", &sel_bar);
+                if !pulse_only {
+                    emit_line_no_bg(&mut buf, row, "", &sel_bar);
+                }
                 row += 1;
             }
         }
     }
 
-    while row <= height {
+    while !pulse_only && row <= height {
         emit_line_clear(&mut buf, row);
         row += 1;
     }
+
+    // Park cursor at bottom-left (a cleared row) then hide it.
+    // This way, if tmux briefly exposes the cursor between render cycles, it appears
+    // against a blank background rather than in the middle of content.
+    buf.push_str(&format!("\x1b[{height};1H\x1b[?25l"));
 
     buf
 }
@@ -840,6 +880,9 @@ mod tests {
                 header_selected: false,
                 compact_mode: false,
                 item_separator: false,
+                elapsed_ms: 0,
+                pulse_only: false,
+                skip_header: false,
             },
         );
         let rows = rendered_rows(&rendered);
@@ -888,6 +931,9 @@ mod tests {
                 header_selected: false,
                 compact_mode: false,
                 item_separator: false,
+                elapsed_ms: 0,
+                pulse_only: false,
+                skip_header: false,
             },
         );
         let rows = rendered_rows(&rendered);
@@ -929,6 +975,9 @@ mod tests {
                 header_selected: false,
                 compact_mode: false,
                 item_separator: false,
+                elapsed_ms: 0,
+                pulse_only: false,
+                skip_header: false,
             },
         );
 
@@ -954,6 +1003,9 @@ mod tests {
                 header_selected: false,
                 compact_mode: false,
                 item_separator: false,
+                elapsed_ms: 0,
+                pulse_only: false,
+                skip_header: false,
             },
         );
         let rows = rendered_rows(&rendered);
@@ -992,6 +1044,9 @@ mod tests {
                 header_selected: false,
                 compact_mode: false,
                 item_separator: false,
+                elapsed_ms: 0,
+                pulse_only: false,
+                skip_header: false,
             },
         );
 
@@ -1013,6 +1068,9 @@ mod tests {
                 header_selected: false,
                 compact_mode: false,
                 item_separator: false,
+                elapsed_ms: 0,
+                pulse_only: false,
+                skip_header: false,
             },
         );
 
@@ -1022,6 +1080,6 @@ mod tests {
     #[test]
     fn header_rows_match_rendered_layout() {
         assert_eq!(header_rows(false), 8);
-        assert_eq!(header_rows(true), 15);
+        assert_eq!(header_rows(true), 16);
     }
 }
