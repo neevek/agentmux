@@ -77,13 +77,14 @@ ensure_path() {
   export PATH="$bin_dir:$PATH"
 }
 
-download_binary() {
-  local target="$1"
-  local tag ext url tmp
+get_latest_tag() {
+  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+}
 
-  tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-  [ -z "$tag" ] && return 1
+download_binary() {
+  local target="$1" tag="$2"
+  local url tmp
 
   url="https://github.com/$REPO/releases/download/$tag/agentmux-${target}.tar.gz"
   tmp="$(mktemp -d)"
@@ -99,30 +100,17 @@ download_binary() {
   return 1
 }
 
-get_latest_tag() {
-  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
-}
+# Fetch latest tag once; used for both version check and download URL
+LATEST_TAG="$(get_latest_tag)"
 
-get_installed_version() {
-  "$BINARY" --version 2>/dev/null | awk '{print $2}'
-}
-
-needs_install() {
-  [ ! -x "$BINARY" ] && return 0
-  local latest installed
-  latest="$(get_latest_tag)"
-  [ -z "$latest" ] && return 1   # can't reach GitHub — keep existing
-  installed="$(get_installed_version)"
-  # Strip leading 'v' for comparison
-  [ "${latest#v}" != "${installed#v}" ]
-}
-
-# Get binary: install if missing or a newer version is available
-if needs_install; then
+# Install if binary is missing or the installed version differs from latest
+if [ ! -x "$BINARY" ] || {
+     [ -n "$LATEST_TAG" ] \
+     && [ "${LATEST_TAG#v}" != "$("$BINARY" --version 2>/dev/null | awk '{print $2}')" ]
+   }; then
   target=$(get_target)
-  if [ -n "$target" ]; then
-    download_binary "$target" 2>/tmp/agentmux-download.log
+  if [ -n "$target" ] && [ -n "$LATEST_TAG" ]; then
+    download_binary "$target" "$LATEST_TAG" 2>/tmp/agentmux-download.log
   fi
 
   # Fallback: build from source if download failed and cargo is available
