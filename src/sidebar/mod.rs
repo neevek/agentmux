@@ -129,9 +129,9 @@ fn selection_index(selection: &Selection, agents: &[AgentInfo]) -> Option<usize>
     }
 }
 
-fn next_input_poll_timeout(focus_poll_elapsed: Duration) -> Duration {
+fn next_input_poll_timeout(focus_poll_elapsed: Duration, focus_poll_ms: u64) -> Duration {
     let input_timeout = Duration::from_millis(INPUT_POLL_MS);
-    let focus_timeout = Duration::from_millis(FOCUS_POLL_MS);
+    let focus_timeout = Duration::from_millis(focus_poll_ms);
 
     if focus_poll_elapsed >= focus_timeout {
         Duration::ZERO
@@ -344,11 +344,11 @@ mod tests {
     #[test]
     fn next_input_poll_timeout_wakes_immediately_when_focus_refresh_is_due() {
         assert_eq!(
-            next_input_poll_timeout(Duration::from_millis(FOCUS_POLL_MS)),
+            next_input_poll_timeout(Duration::from_millis(FOCUS_POLL_MS), FOCUS_POLL_MS),
             Duration::ZERO
         );
         assert_eq!(
-            next_input_poll_timeout(Duration::from_millis(FOCUS_POLL_MS + 10)),
+            next_input_poll_timeout(Duration::from_millis(FOCUS_POLL_MS + 10), FOCUS_POLL_MS),
             Duration::ZERO
         );
     }
@@ -356,11 +356,11 @@ mod tests {
     #[test]
     fn next_input_poll_timeout_caps_sleep_to_remaining_focus_deadline() {
         assert_eq!(
-            next_input_poll_timeout(Duration::from_millis(0)),
+            next_input_poll_timeout(Duration::from_millis(0), FOCUS_POLL_MS),
             Duration::from_millis(FOCUS_POLL_MS)
         );
         assert_eq!(
-            next_input_poll_timeout(Duration::from_millis(100)),
+            next_input_poll_timeout(Duration::from_millis(100), FOCUS_POLL_MS),
             Duration::from_millis(FOCUS_POLL_MS - 100)
         );
     }
@@ -653,6 +653,7 @@ pub fn run() {
     let mut pending_width_save: Option<u32> = None;
     let mut needs_render = true;
     let mut last_rendered_stats: Option<crate::detect::history::AggregatedStats> = None;
+    let mut last_rendered_header_selected: Option<bool> = None;
     let mut just_activated = false;
     let mut suppress_on_exit = false;
     let mut pane_fingerprints: HashMap<String, PaneFingerprint> = HashMap::new();
@@ -669,10 +670,11 @@ pub fn run() {
             break;
         }
 
+        let effective_focus_poll_ms = if matches!(selection, Selection::Header) { 50 } else { FOCUS_POLL_MS };
         if sidebar_window_id.is_empty() {
             cached_focus_is_active = true;
             cached_active_pane_id = None;
-        } else if last_focus_poll.elapsed() >= Duration::from_millis(FOCUS_POLL_MS) {
+        } else if last_focus_poll.elapsed() >= Duration::from_millis(effective_focus_poll_ms) {
             if tmux::window_pane_count(&sidebar_window_id) <= 1 {
                 tmux::kill_window(&sidebar_window_id);
                 break;
@@ -832,13 +834,30 @@ pub fn run() {
         {
             header_expanded = false;
             header_user_toggled = true;
+            last_rendered_stats = None;
             needs_render = true;
         }
 
         let header_selected = matches!(selection, Selection::Header);
         let selected_idx = selection_index(&selection, &cached_agents);
 
-        let (_, height) = terminal_size();
+        // Sample terminal dimensions once per iteration so all render paths
+        // (full, pulse) use the same consistent values.
+        let (raw_width, height) = terminal_size();
+        let cur_width = raw_width.max(tmux::MIN_WIDTH);
+
+        // Commit width change BEFORE the debounce check so the debounce timer
+        // always reflects the most recently observed width.  If we checked the
+        // debounce first we could fire resize-pane with a stale (wider) value
+        // while the user is still dragging narrower.
+        if cur_width != last_width {
+            last_width = cur_width;
+            last_width_change = Instant::now();
+            pending_width_save = Some(cur_width);
+            last_rendered_stats = None; // force header redraw at new width
+            needs_render = true;
+        }
+
         if let Some(selected_idx) = selected_idx {
             let visible = render::visible_item_count_opts(
                 height,
@@ -871,22 +890,7 @@ pub fn run() {
             .any(|a| a.state == crate::detect::state::AgentState::Working);
 
         if needs_render {
-            let (mut width, height) = terminal_size();
-            let clamped = width < tmux::MIN_WIDTH;
-            if clamped {
-                width = tmux::MIN_WIDTH;
-            }
-            // Schedule a save when the width changes OR when we clamped it for
-            // the first time (last_width == 0 means first render).
-            let width_changed = width != last_width || (clamped && last_width == 0);
-            if width_changed {
-                last_width_change = Instant::now();
-                pending_width_save = Some(width);
-                // Width affects header column layout — invalidate cached stats so
-                // skip_header is false and the header is fully redrawn.
-                last_rendered_stats = None;
-            }
-            last_width = width;
+            let width = cur_width;
             print!(
                 "{}",
                 render::render_sidebar(
@@ -904,17 +908,19 @@ pub fn run() {
                         item_separator: sidebar_config.item_separator,
                         elapsed_ms: start_time.elapsed().as_millis() as u64,
                         pulse_only: false,
-                        skip_header: last_rendered_stats.as_ref() == Some(&current_stats),
+                        skip_header: last_rendered_stats.as_ref() == Some(&current_stats)
+                            && last_rendered_header_selected == Some(header_selected),
                     },
                 )
             );
             flush();
             last_rendered_stats = Some(current_stats.clone());
+            last_rendered_header_selected = Some(header_selected);
             needs_render = false;
         } else if has_working {
             // Pulse-only frame: update only the Working-state indicator rows.
             // This avoids touching static content (header) and prevents cursor flicker.
-            let (width, height) = (last_width, terminal_size().1);
+            let width = last_width;
             print!(
                 "{}",
                 render::render_sidebar(
@@ -943,7 +949,7 @@ pub fn run() {
             let base = if sidebar_window_id.is_empty() {
                 Duration::from_millis(INPUT_POLL_MS)
             } else {
-                next_input_poll_timeout(last_focus_poll.elapsed())
+                next_input_poll_timeout(last_focus_poll.elapsed(), effective_focus_poll_ms)
             };
             // Wake up in time to flush a pending width save
             let base = if pending_width_save.is_some() {
@@ -1009,6 +1015,7 @@ pub fn run() {
                 Selection::Header => {
                     header_expanded = !header_expanded;
                     header_user_toggled = true;
+                    last_rendered_stats = None;
                     needs_render = true;
                 }
                 Selection::Agent(pane_id) => {
@@ -1025,6 +1032,7 @@ pub fn run() {
                 if y > 0 && y <= hrows {
                     header_expanded = !header_expanded;
                     header_user_toggled = true;
+                    last_rendered_stats = None;
                     selection = Selection::Header;
                     cached_focus_is_active = true;
                     if !sidebar_pane_id.is_empty() {
@@ -1037,6 +1045,15 @@ pub fn run() {
                         .and_then(|idx| cached_agents.get(idx))
                 {
                     selection = Selection::Agent(agent.pane_id.clone());
+                    // Eagerly update cached focus so sync_selection_from_focus
+                    // sees the correct active pane on the very next iteration,
+                    // rather than waiting up to FOCUS_POLL_MS for the real poll.
+                    if agent.window_id == sidebar_window_id {
+                        cached_active_pane_id = Some(agent.pane_id.clone());
+                    } else {
+                        cached_focus_is_active = false;
+                        cached_active_pane_id = None;
+                    }
                     activate_agent(agent, &mut unseen_done);
                     needs_render = true;
                 }
