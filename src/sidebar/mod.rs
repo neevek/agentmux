@@ -573,6 +573,45 @@ mod tests {
         assert!(!changed);
         assert_eq!(selection, Selection::Agent("%3".to_string()));
     }
+
+    #[test]
+    fn apply_agents_update_marks_unseen_only_for_stops_outside_active_window() {
+        let mut prev_states = HashMap::from([("%1".to_string(), AgentState::Working)]);
+        let mut unseen_done = HashSet::new();
+        let mut stopped = agent("%1");
+        stopped.state = AgentState::Idle;
+        stopped.window_id = "@2".to_string();
+
+        apply_agents_update(&mut prev_states, &mut unseen_done, &[stopped], Some("@1"));
+
+        assert!(unseen_done.contains("%1"));
+    }
+
+    #[test]
+    fn apply_agents_update_skips_unseen_for_stops_in_active_window() {
+        let mut prev_states = HashMap::from([("%1".to_string(), AgentState::Working)]);
+        let mut unseen_done = HashSet::new();
+        let mut stopped = agent("%1");
+        stopped.state = AgentState::Idle;
+        stopped.window_id = "@1".to_string();
+
+        apply_agents_update(&mut prev_states, &mut unseen_done, &[stopped], Some("@1"));
+
+        assert!(!unseen_done.contains("%1"));
+    }
+
+    #[test]
+    fn apply_agents_update_clears_unseen_when_window_becomes_active() {
+        let mut prev_states = HashMap::from([("%1".to_string(), AgentState::Idle)]);
+        let mut unseen_done = HashSet::from(["%1".to_string()]);
+        let mut idle = agent("%1");
+        idle.state = AgentState::Idle;
+        idle.window_id = "@2".to_string();
+
+        apply_agents_update(&mut prev_states, &mut unseen_done, &[idle], Some("@2"));
+
+        assert!(!unseen_done.contains("%1"));
+    }
 }
 
 struct SidebarConfig {
@@ -670,7 +709,11 @@ pub fn run() {
             break;
         }
 
-        let effective_focus_poll_ms = if matches!(selection, Selection::Header) { 50 } else { FOCUS_POLL_MS };
+        let effective_focus_poll_ms = if matches!(selection, Selection::Header) {
+            50
+        } else {
+            FOCUS_POLL_MS
+        };
         if sidebar_window_id.is_empty() {
             cached_focus_is_active = true;
             cached_active_pane_id = None;
@@ -686,6 +729,7 @@ pub fn run() {
         }
         let is_active = cached_focus_is_active;
         let active_pane_id = cached_active_pane_id.as_deref();
+        let active_window_id = tmux::current_window_id();
         if is_active != last_active {
             if !is_active {
                 if !matches!(role, SidebarRole::Leader { .. }) {
@@ -699,7 +743,7 @@ pub fn run() {
                     &mut current_stats,
                     &mut prev_states,
                     &mut unseen_done,
-                    &sidebar_window_id,
+                    active_window_id.as_deref(),
                 );
                 just_activated = true;
             }
@@ -738,7 +782,7 @@ pub fn run() {
                         &mut unseen_done,
                         &mut pane_fingerprints,
                         &mut last_discovery_sweep,
-                        &sidebar_window_id,
+                        active_window_id.as_deref(),
                     ) {
                         *last_refresh = Instant::now();
                         needs_render = true;
@@ -771,7 +815,7 @@ pub fn run() {
                             &mut current_stats,
                             &mut prev_states,
                             &mut unseen_done,
-                            &sidebar_window_id,
+                            active_window_id.as_deref(),
                         );
                         needs_render = true;
                     }
@@ -790,7 +834,7 @@ pub fn run() {
                             &mut current_stats,
                             &mut prev_states,
                             &mut unseen_done,
-                            &sidebar_window_id,
+                            active_window_id.as_deref(),
                         );
                         needs_render = true;
                     }
@@ -811,7 +855,7 @@ pub fn run() {
                     &mut unseen_done,
                     &mut pane_fingerprints,
                     &mut last_discovery_sweep,
-                    &sidebar_window_id,
+                    active_window_id.as_deref(),
                 );
                 role = if refreshed {
                     SidebarRole::Leader {
@@ -1040,9 +1084,15 @@ pub fn run() {
                         tmux::select_pane(&sidebar_pane_id);
                     }
                     needs_render = true;
-                } else if let Some(agent) =
-                    input::click_to_agent_index(y, &cached_agents, scroll_offset, hrows, sidebar_config.compact_mode, sidebar_config.item_separator)
-                        .and_then(|idx| cached_agents.get(idx))
+                } else if let Some(agent) = input::click_to_agent_index(
+                    y,
+                    &cached_agents,
+                    scroll_offset,
+                    hrows,
+                    sidebar_config.compact_mode,
+                    sidebar_config.item_separator,
+                )
+                .and_then(|idx| cached_agents.get(idx))
                 {
                     selection = Selection::Agent(agent.pane_id.clone());
                     // Eagerly update cached focus so sync_selection_from_focus
@@ -1096,7 +1146,7 @@ fn activate_sidebar(
     current_stats: &mut AggregatedStats,
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
-    sidebar_window_id: &str,
+    active_window_id: Option<&str>,
 ) {
     let mut snapshot_loaded = false;
     let lease = runtime_store.read_lease();
@@ -1107,7 +1157,7 @@ fn activate_sidebar(
             current_stats,
             prev_states,
             unseen_done,
-            sidebar_window_id,
+            active_window_id,
         );
         snapshot_loaded = true;
     }
@@ -1144,7 +1194,7 @@ fn refresh_leader_state(
     unseen_done: &mut HashSet<String>,
     pane_fingerprints: &mut HashMap<String, PaneFingerprint>,
     last_discovery_sweep: &mut Instant,
-    sidebar_window_id: &str,
+    active_window_id: Option<&str>,
 ) -> bool {
     if !runtime_store.heartbeat_leader(epoch) {
         return false;
@@ -1169,7 +1219,7 @@ fn refresh_leader_state(
         update_pane_fingerprints(pane_fingerprints, &panes);
         let stats = history.aggregated_stats(&agents);
         runtime_store.publish_snapshot(epoch, &agents, &stats);
-        apply_agents_update(prev_states, unseen_done, &agents, sidebar_window_id);
+        apply_agents_update(prev_states, unseen_done, &agents, active_window_id);
         *cached_agents = agents;
         *current_stats = stats;
         return true;
@@ -1202,7 +1252,7 @@ fn refresh_leader_state(
     update_pane_fingerprints(pane_fingerprints, &panes);
     let stats = history.aggregated_stats(&agents);
     runtime_store.publish_snapshot(epoch, &agents, &stats);
-    apply_agents_update(prev_states, unseen_done, &agents, sidebar_window_id);
+    apply_agents_update(prev_states, unseen_done, &agents, active_window_id);
     *cached_agents = agents;
     *current_stats = stats;
     true
@@ -1214,14 +1264,9 @@ fn apply_snapshot(
     current_stats: &mut AggregatedStats,
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
-    sidebar_window_id: &str,
+    active_window_id: Option<&str>,
 ) {
-    apply_agents_update(
-        prev_states,
-        unseen_done,
-        &snapshot.agents,
-        sidebar_window_id,
-    );
+    apply_agents_update(prev_states, unseen_done, &snapshot.agents, active_window_id);
     *cached_agents = snapshot.agents;
     *current_stats = snapshot.stats;
 }
@@ -1230,14 +1275,18 @@ fn apply_agents_update(
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
     agents: &[AgentInfo],
-    sidebar_window_id: &str,
+    active_window_id: Option<&str>,
 ) {
     for agent in agents {
         if prev_states
             .get(&agent.pane_id)
             .is_some_and(|&prev| prev == AgentState::Working && agent.state == AgentState::Idle)
         {
-            unseen_done.insert(agent.pane_id.clone());
+            if active_window_id.is_some_and(|wid| agent.window_id != wid) {
+                unseen_done.insert(agent.pane_id.clone());
+            } else {
+                unseen_done.remove(&agent.pane_id);
+            }
         }
         prev_states.insert(agent.pane_id.clone(), agent.state);
     }
@@ -1246,9 +1295,11 @@ fn apply_agents_update(
     prev_states.retain(|pane_id, _| current_ids.contains(pane_id.as_str()));
     unseen_done.retain(|pane_id| current_ids.contains(pane_id.as_str()));
 
-    for agent in agents {
-        if agent.window_id == sidebar_window_id {
-            unseen_done.remove(&agent.pane_id);
+    if let Some(active_wid) = active_window_id {
+        for agent in agents {
+            if agent.window_id == active_wid {
+                unseen_done.remove(&agent.pane_id);
+            }
         }
     }
 }

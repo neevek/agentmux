@@ -6,7 +6,11 @@ mod tmux;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "agentmux", version, about = "Tmux sidebar for coding agent sessions")]
+#[command(
+    name = "agentmux",
+    version,
+    about = "Tmux sidebar for coding agent sessions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

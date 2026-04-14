@@ -846,9 +846,7 @@ fn find_newer_claude_session_replacement(
             let mtime = fs::metadata(&path).ok()?.modified().ok()?;
             // Must be more recently modified than the stale binding AND still
             // live enough to be the active session file.
-            if mtime > current_mtime
-                && bound_path_is_recent(&path, CLAUDE_REPLACEMENT_LIVE_SECS)
-            {
+            if mtime > current_mtime && bound_path_is_recent(&path, CLAUDE_REPLACEMENT_LIVE_SECS) {
                 Some((mtime, path))
             } else {
                 None
