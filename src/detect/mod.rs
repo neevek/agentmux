@@ -133,7 +133,7 @@ pub fn scan_agents_fast(session: &str) -> Vec<AgentInfo> {
         });
     }
 
-    agents.sort_by_key(|a| a.elapsed_secs);
+    agents.sort_by_key(|a| a.process_elapsed_secs);
     agents
 }
 
@@ -204,7 +204,7 @@ fn agents_from_detected(
         });
     }
 
-    agents.sort_by_key(|a| a.elapsed_secs);
+    agents.sort_by_key(|a| a.process_elapsed_secs);
     agents
 }
 
@@ -406,7 +406,7 @@ fn refresh_agents_incremental_with_elapsed(
         });
     }
 
-    refreshed.sort_by_key(|a| a.elapsed_secs);
+    refreshed.sort_by_key(|a| a.process_elapsed_secs);
     Some(refreshed)
 }
 

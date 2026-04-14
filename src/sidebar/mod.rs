@@ -244,8 +244,13 @@ fn move_selection_down(selection: &Selection, agents: &[AgentInfo]) -> Selection
     }
 }
 
-fn activate_agent(agent: &AgentInfo, unseen_done: &mut HashSet<String>) {
+fn activate_agent(
+    agent: &AgentInfo,
+    unseen_done: &mut HashSet<String>,
+    recently_acked: &mut HashSet<String>,
+) {
     unseen_done.remove(&agent.pane_id);
+    recently_acked.insert(agent.pane_id.clone());
     let in_current_window = tmux::current_window_id().is_some_and(|cw| cw == agent.window_id);
     if !in_current_window {
         tmux::select_window(&agent.window_id);
@@ -582,7 +587,7 @@ mod tests {
         stopped.state = AgentState::Idle;
         stopped.window_id = "@2".to_string();
 
-        apply_agents_update(&mut prev_states, &mut unseen_done, &[stopped], Some("@1"));
+        apply_agents_update(&mut prev_states, &mut unseen_done, &mut HashSet::new(), &[stopped], Some("@1"));
 
         assert!(unseen_done.contains("%1"));
     }
@@ -595,7 +600,7 @@ mod tests {
         stopped.state = AgentState::Idle;
         stopped.window_id = "@1".to_string();
 
-        apply_agents_update(&mut prev_states, &mut unseen_done, &[stopped], Some("@1"));
+        apply_agents_update(&mut prev_states, &mut unseen_done, &mut HashSet::new(), &[stopped], Some("@1"));
 
         assert!(!unseen_done.contains("%1"));
     }
@@ -608,7 +613,7 @@ mod tests {
         idle.state = AgentState::Idle;
         idle.window_id = "@2".to_string();
 
-        apply_agents_update(&mut prev_states, &mut unseen_done, &[idle], Some("@2"));
+        apply_agents_update(&mut prev_states, &mut unseen_done, &mut HashSet::new(), &[idle], Some("@2"));
 
         assert!(!unseen_done.contains("%1"));
     }
@@ -670,6 +675,7 @@ pub fn run() {
 
     let mut prev_states: HashMap<String, AgentState> = HashMap::new();
     let mut unseen_done: HashSet<String> = HashSet::new();
+    let mut recently_acked: HashSet<String> = HashSet::new();
     let mut cached_agents = detect::scan_agents_fast(&session);
     let mut history = HistoryStore::start();
     let mut current_stats = history.aggregated_stats(&cached_agents);
@@ -743,6 +749,7 @@ pub fn run() {
                     &mut current_stats,
                     &mut prev_states,
                     &mut unseen_done,
+                    &mut recently_acked,
                     active_window_id.as_deref(),
                 );
                 just_activated = true;
@@ -780,6 +787,7 @@ pub fn run() {
                         &mut current_stats,
                         &mut prev_states,
                         &mut unseen_done,
+                        &mut recently_acked,
                         &mut pane_fingerprints,
                         &mut last_discovery_sweep,
                         active_window_id.as_deref(),
@@ -815,6 +823,7 @@ pub fn run() {
                             &mut current_stats,
                             &mut prev_states,
                             &mut unseen_done,
+                            &mut recently_acked,
                             active_window_id.as_deref(),
                         );
                         needs_render = true;
@@ -834,6 +843,7 @@ pub fn run() {
                             &mut current_stats,
                             &mut prev_states,
                             &mut unseen_done,
+                            &mut recently_acked,
                             active_window_id.as_deref(),
                         );
                         needs_render = true;
@@ -853,6 +863,7 @@ pub fn run() {
                     &mut current_stats,
                     &mut prev_states,
                     &mut unseen_done,
+                    &mut recently_acked,
                     &mut pane_fingerprints,
                     &mut last_discovery_sweep,
                     active_window_id.as_deref(),
@@ -1066,7 +1077,7 @@ pub fn run() {
                     if let Some(agent) =
                         cached_agents.iter().find(|agent| agent.pane_id == *pane_id)
                     {
-                        activate_agent(agent, &mut unseen_done);
+                        activate_agent(agent, &mut unseen_done, &mut recently_acked);
                     }
                 }
                 Selection::None => {}
@@ -1104,7 +1115,7 @@ pub fn run() {
                         cached_focus_is_active = false;
                         cached_active_pane_id = None;
                     }
-                    activate_agent(agent, &mut unseen_done);
+                    activate_agent(agent, &mut unseen_done, &mut recently_acked);
                     needs_render = true;
                 }
             }
@@ -1146,6 +1157,7 @@ fn activate_sidebar(
     current_stats: &mut AggregatedStats,
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
+    recently_acked: &mut HashSet<String>,
     active_window_id: Option<&str>,
 ) {
     let mut snapshot_loaded = false;
@@ -1157,6 +1169,7 @@ fn activate_sidebar(
             current_stats,
             prev_states,
             unseen_done,
+            recently_acked,
             active_window_id,
         );
         snapshot_loaded = true;
@@ -1192,6 +1205,7 @@ fn refresh_leader_state(
     current_stats: &mut AggregatedStats,
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
+    recently_acked: &mut HashSet<String>,
     pane_fingerprints: &mut HashMap<String, PaneFingerprint>,
     last_discovery_sweep: &mut Instant,
     active_window_id: Option<&str>,
@@ -1219,7 +1233,7 @@ fn refresh_leader_state(
         update_pane_fingerprints(pane_fingerprints, &panes);
         let stats = history.aggregated_stats(&agents);
         runtime_store.publish_snapshot(epoch, &agents, &stats);
-        apply_agents_update(prev_states, unseen_done, &agents, active_window_id);
+        apply_agents_update(prev_states, unseen_done, recently_acked, &agents, active_window_id);
         *cached_agents = agents;
         *current_stats = stats;
         return true;
@@ -1245,14 +1259,14 @@ fn refresh_leader_state(
                 agents.push(discovered_agent);
             }
         }
-        agents.sort_by_key(|agent| agent.elapsed_secs);
+        agents.sort_by_key(|agent| agent.process_elapsed_secs);
     }
 
     detect_cache.retain_agent_infos(&agents);
     update_pane_fingerprints(pane_fingerprints, &panes);
     let stats = history.aggregated_stats(&agents);
     runtime_store.publish_snapshot(epoch, &agents, &stats);
-    apply_agents_update(prev_states, unseen_done, &agents, active_window_id);
+    apply_agents_update(prev_states, unseen_done, recently_acked, &agents, active_window_id);
     *cached_agents = agents;
     *current_stats = stats;
     true
@@ -1264,9 +1278,10 @@ fn apply_snapshot(
     current_stats: &mut AggregatedStats,
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
+    recently_acked: &mut HashSet<String>,
     active_window_id: Option<&str>,
 ) {
-    apply_agents_update(prev_states, unseen_done, &snapshot.agents, active_window_id);
+    apply_agents_update(prev_states, unseen_done, recently_acked, &snapshot.agents, active_window_id);
     *cached_agents = snapshot.agents;
     *current_stats = snapshot.stats;
 }
@@ -1274,19 +1289,26 @@ fn apply_snapshot(
 fn apply_agents_update(
     prev_states: &mut HashMap<String, AgentState>,
     unseen_done: &mut HashSet<String>,
+    recently_acked: &mut HashSet<String>,
     agents: &[AgentInfo],
     active_window_id: Option<&str>,
 ) {
     for agent in agents {
-        if prev_states
-            .get(&agent.pane_id)
-            .is_some_and(|&prev| prev == AgentState::Working && agent.state == AgentState::Idle)
-        {
-            if active_window_id.is_some_and(|wid| agent.window_id != wid) {
-                unseen_done.insert(agent.pane_id.clone());
-            } else {
+        let prev = prev_states.get(&agent.pane_id).copied();
+        match (prev, agent.state) {
+            (Some(AgentState::Working), AgentState::Idle) => {
+                // Suppress if: user just acked this agent, OR it's in the currently active window.
+                let acked = recently_acked.remove(&agent.pane_id);
+                let in_active_window = active_window_id.is_some_and(|wid| agent.window_id == wid);
+                if !acked && !in_active_window {
+                    unseen_done.insert(agent.pane_id.clone());
+                }
+            }
+            (_, AgentState::Working) => {
+                // Agent is working again — clear any stale done-badge.
                 unseen_done.remove(&agent.pane_id);
             }
+            _ => {}
         }
         prev_states.insert(agent.pane_id.clone(), agent.state);
     }
@@ -1294,6 +1316,7 @@ fn apply_agents_update(
     let current_ids: HashSet<&str> = agents.iter().map(|agent| agent.pane_id.as_str()).collect();
     prev_states.retain(|pane_id, _| current_ids.contains(pane_id.as_str()));
     unseen_done.retain(|pane_id| current_ids.contains(pane_id.as_str()));
+    recently_acked.retain(|pane_id| current_ids.contains(pane_id.as_str()));
 
     if let Some(active_wid) = active_window_id {
         for agent in agents {
