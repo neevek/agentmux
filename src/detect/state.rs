@@ -1708,6 +1708,12 @@ fn read_jsonl(path: &Path, tail_bytes: Option<u64>) -> Vec<Value> {
 // --- State detection (fast tail read) ---
 
 fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
+    // Set to true whenever a user entry is encountered (even an XML/JSON one
+    // that is skipped).  Used below: if we skipped past a user message and
+    // then find an assistant end_turn, the user message arrived *after* that
+    // end_turn — the conversation is still ongoing (e.g. subagent feedback or
+    // orchestration XML), so end_turn should infer Working, not Idle.
+    let mut seen_user = false;
     for entry in read_jsonl(path, Some(TAIL_BYTES)).iter().rev() {
         let Some(msg) = entry.get("message") else {
             continue;
@@ -1724,7 +1730,15 @@ fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
                     }
                 }
                 return match msg.get("stop_reason") {
-                    Some(Value::String(r)) if r == "end_turn" => AgentState::Idle,
+                    Some(Value::String(r)) if r == "end_turn" => {
+                        // If any user message followed this end_turn (even an
+                        // XML/JSON one we skipped), the agent is still active.
+                        if seen_user {
+                            AgentState::Working
+                        } else {
+                            AgentState::Idle
+                        }
+                    }
                     Some(Value::String(r)) if r == "tool_use" => AgentState::Working,
                     Some(Value::String(_)) => AgentState::Idle,
                     Some(Value::Null) | None => AgentState::Working,
@@ -1732,6 +1746,7 @@ fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
                 };
             }
             "user" => {
+                seen_user = true;
                 let text = match msg.get("content") {
                     Some(Value::String(s)) => Some(s.as_str()),
                     Some(Value::Array(items)) => items.iter().find_map(|c| {

@@ -120,7 +120,9 @@ pub fn render_sidebar(
     let mut buf = String::new();
     let mut row: u32 = 1;
 
-    buf.push_str("\x1b[?25l");
+    // Begin synchronized update: tmux batches the output and composites it
+    // atomically, preventing intermediate cursor positions from being displayed.
+    buf.push_str("\x1b[?2026h\x1b[?25l");
 
     if skip_header {
         // Skip header rows entirely; advance `row` past the header.
@@ -519,33 +521,46 @@ pub fn render_sidebar(
                 let activity_text = agent.last_activity.as_deref().unwrap_or("");
                 // "X ●  " prefix = 5 visible chars; truncate so the line never wraps.
                 let text_max = w.saturating_sub(5);
-                let state_line = match agent.state {
-                    AgentState::Working => {
-                        let full = if activity_text.is_empty() {
-                            state_label(agent.state)
-                        } else {
-                            activity_text
-                        };
-                        let text = truncate_str(full, text_max);
-                        // Pulse: GREEN → black → GREEN over 1 s using a cosine wave.
-                        let phase = (opts.elapsed_ms % 1000) as f64 / 1000.0; // 0.0..1.0
-                        let intensity = ((phase * std::f64::consts::TAU).cos() + 1.0) / 2.0; // 1→0→1
+                if pulse_only {
+                    // Pulse-only: the ● glyph sits at a fixed column (col 3: sel_bar +
+                    // space + ●).  Overwrite just that one character in-place — no line
+                    // clear, no surrounding content rewrite — so the cursor visits only
+                    // a single cell and the change is imperceptible.
+                    if matches!(agent.state, AgentState::Working) {
+                        let phase = (opts.elapsed_ms % 1000) as f64 / 1000.0;
+                        let intensity = ((phase * std::f64::consts::TAU).cos() + 1.0) / 2.0;
                         let g = (intensity * 255.0).round() as u8;
-                        let pulse_green = format!("\x1b[38;2;0;{g};0m");
-                        format!("{sel_bar} {pulse_green}{BOLD}●{RESET}  {GRAY}{text}{RESET}")
+                        buf.push_str(&format!(
+                            "\x1b[{row};3H\x1b[38;2;0;{g};0m{BOLD}●{RESET}"
+                        ));
                     }
-                    AgentState::Idle => {
-                        let full = if activity_text.is_empty() {
-                            state_label(agent.state)
-                        } else {
-                            activity_text
-                        };
-                        let text = truncate_str(full, text_max);
-                        format!("{sel_bar} {DIM}●{RESET}  {DIM}{text}{RESET}")
-                    }
-                };
-                // In pulse_only mode, only emit Working-state rows (Idle is static).
-                if !pulse_only || matches!(agent.state, AgentState::Working) {
+                    // Idle agents are static — skip entirely in pulse-only mode.
+                } else {
+                    let state_line = match agent.state {
+                        AgentState::Working => {
+                            let full = if activity_text.is_empty() {
+                                state_label(agent.state)
+                            } else {
+                                activity_text
+                            };
+                            let text = truncate_str(full, text_max);
+                            let phase = (opts.elapsed_ms % 1000) as f64 / 1000.0;
+                            let intensity =
+                                ((phase * std::f64::consts::TAU).cos() + 1.0) / 2.0;
+                            let g = (intensity * 255.0).round() as u8;
+                            let pulse_green = format!("\x1b[38;2;0;{g};0m");
+                            format!("{sel_bar} {pulse_green}{BOLD}●{RESET}  {GRAY}{text}{RESET}")
+                        }
+                        AgentState::Idle => {
+                            let full = if activity_text.is_empty() {
+                                state_label(agent.state)
+                            } else {
+                                activity_text
+                            };
+                            let text = truncate_str(full, text_max);
+                            format!("{sel_bar} {DIM}●{RESET}  {DIM}{text}{RESET}")
+                        }
+                    };
                     emit_line_no_bg(&mut buf, row, "", &state_line);
                 }
                 row += 1;
@@ -574,10 +589,10 @@ pub fn render_sidebar(
         row += 1;
     }
 
-    // Park cursor at bottom-left (a cleared row) then hide it.
-    // This way, if tmux briefly exposes the cursor between render cycles, it appears
-    // against a blank background rather than in the middle of content.
-    buf.push_str(&format!("\x1b[{height};1H\x1b[?25l"));
+    // Park cursor at bottom-left, clear to end-of-line so the cell is blank,
+    // hide the cursor, then end the synchronized update so tmux composites
+    // the entire frame in one shot.
+    buf.push_str(&format!("\x1b[{height};1H\x1b[K\x1b[?25l\x1b[?2026l"));
 
     buf
 }
