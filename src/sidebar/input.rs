@@ -124,12 +124,21 @@ pub fn click_to_agent_index(
     compact_mode: bool,
     item_separator: bool,
 ) -> Option<usize> {
-    use crate::sidebar::render::item_row_count_opts;
+    use crate::sidebar::render::{item_row_count_opts, list_top_margin_rows};
     if y <= header_rows || agents.is_empty() {
         return None;
     }
-    let click_row = y - header_rows;
-    let sep_rows = if compact_mode && item_separator { 1u32 } else { 0 };
+    let mut click_row = y - header_rows;
+    let top_margin = list_top_margin_rows(compact_mode);
+    if click_row <= top_margin {
+        return None;
+    }
+    click_row -= top_margin;
+    let sep_rows = if compact_mode && item_separator {
+        1u32
+    } else {
+        0
+    };
     let mut cumulative = 0u32;
     for (vi, agent) in agents.iter().skip(scroll_offset).enumerate() {
         // Separator precedes every item except the first visible one
@@ -204,6 +213,21 @@ mod tests {
         assert_eq!(
             click_to_agent_index(header_rows, &agents, 0, header_rows, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn compact_mode_top_margin_click_does_not_select_first_item() {
+        let agents = vec![agent("%1"), agent("%2")];
+        let header_rows = crate::sidebar::render::header_rows(true);
+
+        assert_eq!(
+            click_to_agent_index(header_rows + 1, &agents, 0, header_rows, true, false),
+            None
+        );
+        assert_eq!(
+            click_to_agent_index(header_rows + 2, &agents, 0, header_rows, true, false),
+            Some(0)
         );
     }
 }
