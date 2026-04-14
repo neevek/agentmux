@@ -92,9 +92,7 @@ fn display_elapsed_secs(
     process_elapsed_secs: u64,
     details: &state::SessionDetails,
 ) -> u64 {
-    details
-        .display_elapsed_secs
-        .unwrap_or(process_elapsed_secs)
+    details.display_elapsed_secs.unwrap_or(process_elapsed_secs)
 }
 
 /// Fast scan for startup: discovers active agent panes without JSONL/state lookup.
@@ -214,18 +212,37 @@ fn agents_from_detected(
 /// Order matters: specific variants must come before broad patterns.
 const MODEL_TABLE: &[(&str, &str, f64, f64)] = &[
     // Claude
+    ("opus-4-6", "opus", 5.0, 25.0),
+    ("opus-4-5", "opus", 5.0, 25.0),
+    ("opus-4-1", "opus", 15.0, 75.0),
+    ("opus-4", "opus", 15.0, 75.0),
+    ("opus-3", "opus", 15.0, 75.0),
     ("opus", "opus", 5.0, 25.0),
-    ("sonnet", "sonnet", 3.0, 15.0),
+    ("haiku-3-5", "haiku", 0.80, 4.0),
+    ("haiku-3", "haiku", 0.25, 1.25),
     ("haiku", "haiku", 1.0, 5.0),
+    ("sonnet", "sonnet", 3.0, 15.0),
+    // OpenAI Codex variants (from per-model docs/pricing)
+    ("gpt-5.3-codex", "gpt-5.3-codex", 1.75, 14.0),
+    ("gpt-5.2-codex", "gpt-5.2-codex", 1.75, 14.0),
+    ("gpt-5.1-codex-max", "gpt-5.1-codex-max", 1.25, 10.0),
+    ("gpt-5.1-codex-mini", "gpt-5.1-codex-mini", 0.25, 2.0),
+    ("gpt-5.1-codex", "gpt-5.1-codex", 1.25, 10.0),
+    ("gpt-5-codex", "gpt-5-codex", 1.25, 10.0),
+    ("codex-mini-latest", "codex-mini-latest", 1.50, 6.0),
     // OpenAI — specific before broad
-    ("o4-mini", "o4-mini", 0.55, 2.20),
+    ("gpt-5.4-mini", "gpt-5.4-mini", 0.75, 4.50),
+    ("gpt-5.4-nano", "gpt-5.4-nano", 0.20, 1.25),
+    ("gpt-5.4", "gpt-5.4", 2.50, 15.0),
+    ("gpt-5.2", "gpt-5.2", 1.75, 14.0),
+    ("gpt-5.1", "gpt-5.1", 1.25, 10.0),
+    ("gpt-5-mini", "gpt-5-mini", 0.25, 2.0),
+    ("gpt-5-nano", "gpt-5-nano", 0.05, 0.40),
+    ("gpt-5", "gpt-5", 1.25, 10.0),
+    // Legacy OpenAI model aliases we still see in logs
+    ("o4-mini", "o4-mini", 1.10, 4.40),
     ("o3-mini", "o3-mini", 1.10, 4.40),
     ("o3", "o3", 2.0, 8.0),
-    ("gpt-5.4-codex", "gpt-5.4-codex", 2.0, 8.0),
-    ("gpt-5.4-mini", "gpt-5.4-mini", 0.40, 1.60),
-    ("gpt-5.4-nano", "gpt-5.4-nano", 0.10, 0.40),
-    ("gpt-5.4", "gpt-5.4", 2.0, 8.0),
-    ("gpt-5.3-codex", "gpt-5.3-codex", 2.0, 8.0),
     ("gpt-4.1-nano", "gpt-4.1-nano", 0.10, 0.40),
     ("gpt-4.1-mini", "gpt-4.1-mini", 0.40, 1.60),
     ("gpt-4.1", "gpt-4.1", 2.0, 8.0),
@@ -605,5 +622,29 @@ mod tests {
         assert_eq!(refreshed.len(), 1);
         assert_eq!(refreshed[0].process_elapsed_secs, 42);
         assert_eq!(refreshed[0].elapsed_secs, 42);
+    }
+
+    #[test]
+    fn model_table_matches_current_claude_and_codex_pricing() {
+        let codex_max = lookup_model("gpt-5.1-codex-max").unwrap();
+        assert_eq!((codex_max.2, codex_max.3), (1.25, 10.0));
+
+        let codex_mini = lookup_model("gpt-5.1-codex-mini").unwrap();
+        assert_eq!((codex_mini.2, codex_mini.3), (0.25, 2.0));
+
+        let codex_52 = lookup_model("gpt-5.2-codex").unwrap();
+        assert_eq!((codex_52.2, codex_52.3), (1.75, 14.0));
+
+        let codex_53 = lookup_model("gpt-5.3-codex").unwrap();
+        assert_eq!((codex_53.2, codex_53.3), (1.75, 14.0));
+
+        let gpt_54 = lookup_model("gpt-5.4").unwrap();
+        assert_eq!((gpt_54.2, gpt_54.3), (2.50, 15.0));
+
+        let claude_sonnet = lookup_model("claude-sonnet-4-6-20260401").unwrap();
+        assert_eq!((claude_sonnet.2, claude_sonnet.3), (3.0, 15.0));
+
+        let claude_opus = lookup_model("claude-opus-4-6-20251115").unwrap();
+        assert_eq!((claude_opus.2, claude_opus.3), (5.0, 25.0));
     }
 }
