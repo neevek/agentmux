@@ -274,8 +274,45 @@ fn find_split_target(window_id: &str) -> Option<(String, bool)> {
     }
 }
 
-pub fn kill_pane(pane_id: &str) {
-    let _ = tmux_output(&["kill-pane", "-t", pane_id]);
+/// Close sidebar pane and restore non-left pane widths in this window so
+/// reclaimed width returns to the left column instead of being spread out.
+pub fn kill_sidebar_with_restore(window_id: &str, sidebar_pane_id: &str) {
+    let fmt = "#{pane_id}\t#{pane_left}\t#{pane_width}";
+    let saved_widths: Vec<(String, String)> = tmux_output(&["list-panes", "-t", window_id, "-F", fmt])
+        .map(|out| {
+            out.lines()
+                .filter_map(|line| {
+                    let p: Vec<&str> = line.split('\t').collect();
+                    if p.len() < 3 {
+                        return None;
+                    }
+                    if p[0] == sidebar_pane_id {
+                        return None;
+                    }
+                    let left: u32 = p[1].parse().ok()?;
+                    if left > 0 {
+                        Some((p[0].to_string(), p[2].to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut args: Vec<String> = vec!["kill-pane".into(), "-t".into(), sidebar_pane_id.to_string()];
+    for (pane_id, width) in &saved_widths {
+        args.extend([
+            ";".to_string(),
+            "resize-pane".to_string(),
+            "-t".to_string(),
+            pane_id.clone(),
+            "-x".to_string(),
+            width.clone(),
+        ]);
+    }
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let _ = tmux_output(&refs);
 }
 
 pub fn select_pane(pane_id: &str) {

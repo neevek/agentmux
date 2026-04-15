@@ -98,8 +98,8 @@ fn cmd_ensure() {
 }
 
 fn close_all_sidebars(sidebars: &[(String, String)]) {
-    for (pane_id, _) in sidebars {
-        tmux::kill_pane(pane_id);
+    for (pane_id, window_id) in sidebars {
+        tmux::kill_sidebar_with_restore(window_id, pane_id);
     }
 }
 
@@ -114,12 +114,22 @@ fn create_sidebar_in_window(window_id: &str) {
 
 fn install_hooks() {
     let binary = tmux::self_binary();
-    let ensure_cmd = format!("run-shell -b '{} ensure'", binary);
-    tmux::set_hook("after-select-window", &ensure_cmd);
-    tmux::set_hook("after-new-window", &ensure_cmd);
+    // Keep hook execution synchronous to avoid concurrent ensure races
+    // when multiple hooks fire for one window switch.
+    let ensure_cmd = format!("run-shell '{} ensure'", binary);
+    // Use one switch hook to avoid duplicate ensure runs for the same action.
+    for hook in ["session-window-changed", "after-new-window"] {
+        tmux::set_hook(hook, &ensure_cmd);
+    }
 }
 
 fn uninstall_hooks() {
-    tmux::remove_hook("after-select-window");
-    tmux::remove_hook("after-new-window");
+    for hook in [
+        "after-select-window",
+        "after-new-window",
+        "session-window-changed",
+        "client-session-changed",
+    ] {
+        tmux::remove_hook(hook);
+    }
 }

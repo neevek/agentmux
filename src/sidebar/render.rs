@@ -560,7 +560,7 @@ pub fn render_sidebar(
                             let intensity = ((phase * std::f64::consts::TAU).cos() + 1.0) / 2.0;
                             let g = (intensity * 255.0).round() as u8;
                             let pulse_green = format!("\x1b[38;2;0;{g};0m");
-                            format!("{sel_bar} {pulse_green}{BOLD}● {RESET} {GRAY}{text}{RESET}")
+                            format!("{sel_bar} {pulse_green}{BOLD}●{RESET} {GRAY}{text}{RESET}")
                         }
                         AgentState::Idle => {
                             let full = if activity_text.is_empty() {
@@ -569,7 +569,7 @@ pub fn render_sidebar(
                                 activity_text
                             };
                             let text = truncate_str(full, text_max);
-                            format!("{sel_bar} {DIM}● {RESET} {DIM}{text}{RESET}")
+                            format!("{sel_bar} {DIM}●{RESET} {DIM}{text}{RESET}")
                         }
                     };
                     emit_line_no_bg(&mut buf, row, "", &state_line);
@@ -936,7 +936,7 @@ mod tests {
             .0;
         let state_row = rows
             .iter()
-            .find(|(_, line)| line.contains("●  exec_command cargo test"))
+            .find(|(_, line)| line.contains("● exec_command cargo test"))
             .unwrap()
             .0;
 
@@ -982,7 +982,7 @@ mod tests {
             .0;
         let state_row = rows
             .iter()
-            .find(|(_, line)| line.contains("●  Working..."))
+            .find(|(_, line)| line.contains("● Working..."))
             .unwrap()
             .0;
 
@@ -1019,7 +1019,7 @@ mod tests {
             },
         );
 
-        assert!(strip_ansi(&rendered).contains("●  Idle"));
+        assert!(strip_ansi(&rendered).contains("● Idle"));
     }
 
     #[test]
@@ -1053,7 +1053,7 @@ mod tests {
             .unwrap()
             .0;
 
-        assert!(!strip_ansi(&rendered).contains("● "));
+        assert!(!strip_ansi(&rendered).contains("●"));
         // Row after dir is the bottom margin; it must not contain a state dot
         assert!(
             rows.iter()
