@@ -1114,6 +1114,12 @@ pub fn run() {
                     } else {
                         cached_focus_is_active = false;
                         cached_active_pane_id = None;
+                        // Force the next iteration to re-poll tmux focus
+                        // instead of using the stale cached values.  Without
+                        // this, sync_selection_from_focus would see
+                        // is_active=false and wipe the selection we just set.
+                        last_focus_poll =
+                            Instant::now() - Duration::from_millis(FOCUS_POLL_MS);
                     }
                     activate_agent(agent, &mut unseen_done, &mut recently_acked);
                     needs_render = true;

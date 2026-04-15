@@ -91,13 +91,24 @@ fn parse_input(buf: &[u8]) -> InputEvent {
 fn parse_sgr_mouse(buf: &[u8]) -> InputEvent {
     let s = std::str::from_utf8(buf).unwrap_or("");
 
-    // Only handle press events (ending with 'M'), not release ('m')
-    if !s.ends_with('M') {
+    // Find the first press ('M') or release ('m') terminator.  When a fast
+    // tap lands both events in the same read buffer (e.g. "0;5;10M\x1b[<0;5;10m"),
+    // we must not let the trailing release cause us to discard the press.
+    let (terminator, end) = if let Some(pos) = s.find('M') {
+        ('M', pos)
+    } else if let Some(pos) = s.find('m') {
+        ('m', pos)
+    } else {
+        return InputEvent::None;
+    };
+
+    // Only handle press events, not release
+    if terminator != 'M' {
         return InputEvent::None;
     }
 
-    let s = &s[..s.len() - 1];
-    let parts: Vec<&str> = s.split(';').collect();
+    let payload = &s[..end];
+    let parts: Vec<&str> = payload.split(';').collect();
     if parts.len() != 3 {
         return InputEvent::None;
     }
@@ -184,6 +195,33 @@ mod tests {
             resumed: false,
             details_ready: true,
         }
+    }
+
+    #[test]
+    fn sgr_press_only() {
+        // Normal press event: "0;5;10M"
+        assert!(matches!(parse_sgr_mouse(b"0;5;10M"), InputEvent::MouseClick { y: 10 }));
+    }
+
+    #[test]
+    fn sgr_release_ignored() {
+        // Release event: "0;5;10m"
+        assert!(matches!(parse_sgr_mouse(b"0;5;10m"), InputEvent::None));
+    }
+
+    #[test]
+    fn sgr_press_followed_by_release_in_same_buffer() {
+        // Fast trackpad tap: press + release land in one read().
+        // Buffer after ESC[< prefix stripped: "0;5;10M\x1b[<0;5;10m"
+        let buf = b"0;5;10M\x1b[<0;5;10m";
+        assert!(matches!(parse_sgr_mouse(buf), InputEvent::MouseClick { y: 10 }));
+    }
+
+    #[test]
+    fn parse_input_fast_tap() {
+        // Full sequence: ESC [ < 0;3;7M ESC [ < 0;3;7m
+        let buf = b"\x1b[<0;3;7M\x1b[<0;3;7m";
+        assert!(matches!(parse_input(buf), InputEvent::MouseClick { y: 7 }));
     }
 
     #[test]
