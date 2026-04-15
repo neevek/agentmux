@@ -1957,6 +1957,30 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
             .and_then(|s| s.to_str())
             .map(|s| s.to_string());
     }
+
+    // Aggregate tokens from subagent JSONL files.
+    // Claude Code stores subagent sessions under <session-uuid>/subagents/*.jsonl
+    // next to the parent <session-uuid>.jsonl file.
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if let Some(parent_dir) = path.parent() {
+            let subagents_dir = parent_dir.join(stem).join("subagents");
+            if subagents_dir.is_dir() {
+                if let Ok(entries) = fs::read_dir(&subagents_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().is_some_and(|ext| ext == "jsonl") {
+                            let sub = parse_claude_subagent_tokens(&p);
+                            input_tokens += sub.input_tokens;
+                            output_tokens += sub.output_tokens;
+                            cache_read_tokens += sub.cache_read_tokens;
+                            cache_creation_tokens += sub.cache_creation_tokens;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ParsedTokens {
         input_tokens,
         output_tokens,
@@ -1968,6 +1992,65 @@ pub(crate) fn parse_claude_tokens(path: &Path) -> ParsedTokens {
         effort,
         turn_count,
         session_id,
+    }
+}
+
+/// Parse only the token usage from a Claude Code subagent JSONL file.
+/// Uses the same deduplication logic as `parse_claude_tokens` (keyed by message
+/// id) but skips fields that are only relevant on the parent session (model,
+/// context_pct, turn_count, etc.).
+fn parse_claude_subagent_tokens(path: &Path) -> ParsedTokens {
+    let entries = read_jsonl(path, None);
+    let mut input_tokens: u64 = 0;
+    let mut output_tokens: u64 = 0;
+    let mut cache_read_tokens: u64 = 0;
+    let mut cache_creation_tokens: u64 = 0;
+    let mut assistant_messages: Vec<&Value> = Vec::new();
+    let mut assistant_id_indexes: HashMap<String, usize> = HashMap::new();
+
+    for entry in &entries {
+        let Some(msg) = entry.get("message") else {
+            continue;
+        };
+        if json_str(msg, &["role"]) != Some("assistant") {
+            continue;
+        }
+        if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+            if let Some(index) = assistant_id_indexes.get(id).copied() {
+                assistant_messages[index] = msg;
+            } else {
+                assistant_id_indexes.insert(id.to_string(), assistant_messages.len());
+                assistant_messages.push(msg);
+            }
+        } else {
+            assistant_messages.push(msg);
+        }
+    }
+
+    for msg in assistant_messages {
+        if let Some(usage) = msg.get("usage") {
+            let get = |k| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            let base = get("input_tokens");
+            let cache_read = get("cache_read_input_tokens");
+            let cache_create = get("cache_creation_input_tokens");
+            input_tokens += base + cache_read + cache_create;
+            output_tokens += get("output_tokens");
+            cache_read_tokens += cache_read;
+            cache_creation_tokens += cache_create;
+        }
+    }
+
+    ParsedTokens {
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        last_activity: None,
+        context_pct: None,
+        model: None,
+        effort: None,
+        turn_count: 0,
+        session_id: None,
     }
 }
 
@@ -3647,6 +3730,78 @@ mod tests {
         );
 
         assert_eq!(codex_session_elapsed_secs(&path, 160), Some(60));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_tokens_include_subagent_usage() {
+        // Create a temp directory mimicking the Claude project layout:
+        //   <dir>/<session-uuid>.jsonl
+        //   <dir>/<session-uuid>/subagents/agent-xxx.jsonl
+        let dir = std::env::temp_dir().join(format!(
+            "agentmux-claude-subagent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_id = "test-session-uuid";
+        let parent_path = dir.join(format!("{session_id}.jsonl"));
+        let subagents_dir = dir.join(session_id).join("subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+
+        // Parent JSONL: 100 input, 20 output
+        fs::write(
+            &parent_path,
+            r#"{"sessionId":"s1","message":{"role":"assistant","id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}"#,
+        )
+        .unwrap();
+
+        // Subagent 1: 50 input (30 base + 15 cache_read + 5 cache_create), 10 output
+        fs::write(
+            subagents_dir.join("agent-aaa.jsonl"),
+            r#"{"message":{"role":"assistant","id":"s1","usage":{"input_tokens":30,"cache_read_input_tokens":15,"cache_creation_input_tokens":5,"output_tokens":10}}}"#,
+        )
+        .unwrap();
+
+        // Subagent 2: 25 input, 5 output
+        fs::write(
+            subagents_dir.join("agent-bbb.jsonl"),
+            r#"{"message":{"role":"assistant","id":"s2","usage":{"input_tokens":25,"output_tokens":5}}}"#,
+        )
+        .unwrap();
+
+        // Non-jsonl file should be ignored
+        fs::write(subagents_dir.join("agent-ccc.meta.json"), r#"{"agentType":"Explore"}"#).unwrap();
+
+        let tokens = parse_claude_tokens(&parent_path);
+
+        // Parent: 100 in, 20 out
+        // Sub1:    50 in, 10 out  (30 + 15 + 5)
+        // Sub2:    25 in,  5 out
+        assert_eq!(tokens.input_tokens, 175);
+        assert_eq!(tokens.output_tokens, 35);
+        assert_eq!(tokens.cache_read_tokens, 15);
+        assert_eq!(tokens.cache_creation_tokens, 5);
+        // Parent fields preserved
+        assert_eq!(tokens.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(tokens.session_id.as_deref(), Some("s1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_tokens_without_subagents_unchanged() {
+        let path = write_temp_jsonl(
+            "claude-no-subagents",
+            r#"{"sessionId":"s1","message":{"role":"assistant","id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}"#,
+        );
+
+        let tokens = parse_claude_tokens(&path);
+        assert_eq!(tokens.input_tokens, 100);
+        assert_eq!(tokens.output_tokens, 20);
 
         let _ = fs::remove_file(path);
     }
