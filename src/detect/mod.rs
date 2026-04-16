@@ -253,7 +253,8 @@ const MODEL_TABLE: &[(&str, &str, f64, f64)] = &[
 fn lookup_model(model: &str) -> Option<&'static (&'static str, &'static str, f64, f64)> {
     MODEL_TABLE
         .iter()
-        .find(|(pattern, _, _, _)| model.contains(pattern))
+        .filter(|(pattern, _, _, _)| model.contains(pattern))
+        .max_by_key(|(pattern, _, _, _)| pattern.len())
 }
 
 /// Estimate cost using per-type pricing.
@@ -640,11 +641,18 @@ mod tests {
 
         let gpt_54 = lookup_model("gpt-5.4").unwrap();
         assert_eq!((gpt_54.2, gpt_54.3), (2.50, 15.0));
+        let gpt_54_mini = lookup_model("gpt-5.4-mini").unwrap();
+        assert_eq!((gpt_54_mini.1, gpt_54_mini.2, gpt_54_mini.3), ("gpt-5.4-mini", 0.75, 4.50));
 
         let claude_sonnet = lookup_model("claude-sonnet-4-6-20260401").unwrap();
         assert_eq!((claude_sonnet.2, claude_sonnet.3), (3.0, 15.0));
 
         let claude_opus = lookup_model("claude-opus-4-6-20251115").unwrap();
         assert_eq!((claude_opus.2, claude_opus.3), (5.0, 25.0));
+    }
+
+    #[test]
+    fn short_model_name_preserves_gpt_54_mini_variant() {
+        assert_eq!(short_model_name("gpt-5.4-mini"), "gpt-5.4-mini");
     }
 }

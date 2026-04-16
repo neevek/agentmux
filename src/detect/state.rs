@@ -16,6 +16,35 @@ pub enum AgentState {
     Idle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateDetection {
+    state: AgentState,
+    explicit_idle: bool,
+}
+
+impl StateDetection {
+    fn working() -> Self {
+        Self {
+            state: AgentState::Working,
+            explicit_idle: false,
+        }
+    }
+
+    fn inferred_idle() -> Self {
+        Self {
+            state: AgentState::Idle,
+            explicit_idle: false,
+        }
+    }
+
+    fn explicit_idle() -> Self {
+        Self {
+            state: AgentState::Idle,
+            explicit_idle: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionDetails {
     pub state: AgentState,
@@ -530,7 +559,7 @@ pub fn claude_code_details(agent: &DetectedAgent, cache: &mut SessionCache) -> S
         agent.elapsed_secs,
         !agent.resumed,
         cache,
-        detect_claude_state,
+        detect_claude_state_detection,
     );
     update_binding(cache, agent, &details);
     details.display_elapsed_secs = cache
@@ -551,7 +580,7 @@ pub fn codex_details(agent: &DetectedAgent, cache: &mut SessionCache) -> Session
         agent.elapsed_secs,
         !agent.resumed,
         cache,
-        detect_codex_state,
+        detect_codex_state_detection,
     );
     details.display_elapsed_secs = details.jsonl_path.as_deref().and_then(|path| {
         sessions_dir
@@ -578,7 +607,7 @@ pub fn refresh_bound_details(
             agent_age_secs,
             !resumed,
             cache,
-            detect_claude_state,
+            detect_claude_state_detection,
         ),
         AgentKind::Codex => {
             let now_secs = unix_now_secs();
@@ -589,7 +618,7 @@ pub fn refresh_bound_details(
                 agent_age_secs,
                 !resumed,
                 cache,
-                detect_codex_state,
+                detect_codex_state_detection,
             );
             details.display_elapsed_secs = details.jsonl_path.as_deref().and_then(|path| {
                 sessions_dir
@@ -856,24 +885,6 @@ fn find_newer_claude_session_replacement(
         .map(|(_, path)| path)
 }
 
-#[cfg(test)]
-fn find_newer_codex_session_replacement(
-    sessions_dir: &Path,
-    current_path: &Path,
-    cwd: &str,
-    used_paths: &[PathBuf],
-) -> Option<PathBuf> {
-    let mut cache = SessionCache::new();
-    find_newer_codex_session_replacement_cached(
-        sessions_dir,
-        current_path,
-        cwd,
-        used_paths,
-        &mut cache,
-        unix_now_secs(),
-    )
-}
-
 fn find_newer_codex_session_replacement_cached(
     sessions_dir: &Path,
     current_path: &Path,
@@ -967,7 +978,7 @@ fn agent_details(
     agent_age_secs: u64,
     enforce_file_age_match: bool,
     cache: &mut SessionCache,
-    detect_state: fn(&Path, u64) -> AgentState,
+    detect_state: fn(&Path, u64) -> StateDetection,
 ) -> SessionDetails {
     let Some(path) = jsonl_path else {
         return SessionDetails::default();
@@ -984,10 +995,11 @@ fn agent_details(
         return SessionDetails::default();
     }
 
-    let state = if file_age < ACTIVE_WRITE_THRESHOLD.as_secs() {
+    let detection = detect_state(path, file_age);
+    let state = if file_age < ACTIVE_WRITE_THRESHOLD.as_secs() && !detection.explicit_idle {
         AgentState::Working
     } else {
-        detect_state(path, file_age)
+        detection.state
     };
 
     let metadata = FileMetadata {
@@ -1385,29 +1397,6 @@ fn compare_codex_candidate_matches(
         .then_with(|| rhs.modified_ts.cmp(&lhs.modified_ts))
 }
 
-#[cfg(test)]
-fn should_replace_codex_binding(
-    current_path: &Path,
-    candidate_path: &Path,
-    cwd: &str,
-    agent_age_secs: u64,
-    now_secs: u64,
-) -> bool {
-    let mut cache = SessionCache::new();
-    let Some(sessions_dir) = codex_sessions_dir() else {
-        return false;
-    };
-    should_replace_codex_binding_cached(
-        &sessions_dir,
-        current_path,
-        candidate_path,
-        cwd,
-        agent_age_secs,
-        now_secs,
-        &mut cache,
-    )
-}
-
 fn should_replace_codex_binding_cached(
     sessions_dir: &Path,
     current_path: &Path,
@@ -1445,25 +1434,6 @@ fn should_replace_codex_binding_cached(
     }
 }
 
-#[cfg(test)]
-fn codex_match_score(
-    path: &Path,
-    cwd: &str,
-    agent_age_secs: u64,
-    now_secs: u64,
-) -> Option<CodexMatchScore> {
-    let mut cache = SessionCache::new();
-    let sessions_dir = path.ancestors().nth(4)?.to_path_buf();
-    codex_match_score_cached(
-        &sessions_dir,
-        path,
-        cwd,
-        agent_age_secs,
-        now_secs,
-        &mut cache,
-    )
-}
-
 fn codex_match_score_cached(
     sessions_dir: &Path,
     path: &Path,
@@ -1476,25 +1446,6 @@ fn codex_match_score_cached(
         CodexCandidate::Scored(score) => Some(score),
         CodexCandidate::Unscorable | CodexCandidate::CwdMismatch => None,
     }
-}
-
-#[cfg(test)]
-fn codex_binding_age_mismatch_secs(
-    path: &Path,
-    cwd: &str,
-    agent_age_secs: u64,
-    now_secs: u64,
-) -> Option<u64> {
-    let mut cache = SessionCache::new();
-    let sessions_dir = path.ancestors().nth(4)?.to_path_buf();
-    codex_binding_age_mismatch_secs_cached(
-        &sessions_dir,
-        path,
-        cwd,
-        agent_age_secs,
-        now_secs,
-        &mut cache,
-    )
 }
 
 fn codex_binding_age_mismatch_secs_cached(
@@ -1513,22 +1464,6 @@ fn codex_binding_age_mismatch_secs_cached(
     meta.started_at_secs
         .and_then(|started| now_secs.checked_sub(started))
         .map(|age| age.abs_diff(agent_age_secs))
-}
-
-#[cfg(test)]
-fn codex_candidate(path: &Path, cwd: &str, agent_age_secs: u64, now_secs: u64) -> CodexCandidate {
-    let mut cache = SessionCache::new();
-    let Some(sessions_dir) = path.ancestors().nth(4).map(Path::to_path_buf) else {
-        return CodexCandidate::Unscorable;
-    };
-    codex_candidate_cached(
-        &sessions_dir,
-        path,
-        cwd,
-        agent_age_secs,
-        now_secs,
-        &mut cache,
-    )
 }
 
 fn codex_candidate_cached(
@@ -1561,12 +1496,6 @@ fn codex_candidate_cached(
         age_mismatch_secs,
         has_token_count: cache.codex_has_token_count(sessions_dir, path, now_secs),
     })
-}
-
-#[cfg(test)]
-fn codex_cwds_match(lhs: &str, rhs: &str) -> bool {
-    let mut cache = SessionCache::new();
-    codex_cwds_match_cached(&mut cache, lhs, rhs)
 }
 
 fn codex_cwds_match_cached(cache: &mut SessionCache, lhs: &str, rhs: &str) -> bool {
@@ -1705,7 +1634,7 @@ fn read_jsonl(path: &Path, tail_bytes: Option<u64>) -> Vec<Value> {
 
 // --- State detection (fast tail read) ---
 
-fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
+fn detect_claude_state_detection(path: &Path, file_age_secs: u64) -> StateDetection {
     // Set to true whenever a user entry is encountered (even an XML/JSON one
     // that is skipped).  Used below: if we skipped past a user message and
     // then find an assistant end_turn, the user message arrived *after* that
@@ -1724,7 +1653,7 @@ fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
                 if let Some(Value::Array(items)) = msg.get("content") {
                     let has = |t| items.iter().any(|c| json_str(c, &["type"]) == Some(t));
                     if has("tool_use") || has("thinking") {
-                        return AgentState::Working;
+                        return StateDetection::working();
                     }
                 }
                 return match msg.get("stop_reason") {
@@ -1732,14 +1661,14 @@ fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
                         // If any user message followed this end_turn (even an
                         // XML/JSON one we skipped), the agent is still active.
                         if seen_user {
-                            AgentState::Working
+                            StateDetection::working()
                         } else {
-                            AgentState::Idle
+                            StateDetection::explicit_idle()
                         }
                     }
-                    Some(Value::String(r)) if r == "tool_use" => AgentState::Working,
-                    Some(Value::String(_)) => AgentState::Idle,
-                    Some(Value::Null) | None => AgentState::Working,
+                    Some(Value::String(r)) if r == "tool_use" => StateDetection::working(),
+                    Some(Value::String(_)) => StateDetection::explicit_idle(),
+                    Some(Value::Null) | None => StateDetection::working(),
                     _ => continue,
                 };
             }
@@ -1757,10 +1686,10 @@ fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
                     _ => None,
                 };
                 if let Some(text) = text {
-                    if text.starts_with("[Request interrupted")
+                    if claude_user_message_is_request_interrupted(text)
                         || text.contains("<command-name>/exit</command-name>")
                     {
-                        return AgentState::Idle;
+                        return StateDetection::explicit_idle();
                     }
                     if text.starts_with('<') || text.starts_with('{') {
                         continue;
@@ -1768,48 +1697,50 @@ fn detect_claude_state(path: &Path, file_age_secs: u64) -> AgentState {
                 }
                 if matches!(msg.get("content"), Some(Value::Array(items)) if items.iter().any(|c| json_str(c, &["type"]) == Some("tool_result")))
                 {
-                    return AgentState::Working;
+                    return StateDetection::working();
                 }
                 // A plain user message usually means an in-flight turn. If it
                 // remains unchanged for an extremely long time, consider it
                 // stale instead of perpetually working.
                 return if file_age_secs < INFERRED_WORKING_STALE_SECS {
-                    AgentState::Working
+                    StateDetection::working()
                 } else {
-                    AgentState::Idle
+                    StateDetection::inferred_idle()
                 };
             }
             _ => continue,
         }
     }
-    AgentState::Idle
+    StateDetection::inferred_idle()
 }
 
-fn detect_codex_state(path: &Path, file_age_secs: u64) -> AgentState {
+fn detect_codex_state_detection(path: &Path, file_age_secs: u64) -> StateDetection {
     for entry in read_jsonl(path, Some(TAIL_BYTES)).iter().rev() {
         match json_str(entry, &["type"]) {
             Some("event_msg") => {
                 if let Some(pt) = json_str(entry, &["payload", "type"]) {
                     match pt {
                         "task_started" | "user_message" => {
-                            return AgentState::Working;
+                            return StateDetection::working();
                         }
                         // `exec_command_end` is still mid-turn; Codex often
                         // emits follow-up events before completion.
                         "exec_command_end" => {
                             return if file_age_secs < INFERRED_WORKING_STALE_SECS {
-                                AgentState::Working
+                                StateDetection::working()
                             } else {
-                                AgentState::Idle
+                                StateDetection::inferred_idle()
                             };
                         }
-                        "task_complete" | "turn_aborted" => return AgentState::Idle,
+                        "task_complete" | "turn_aborted" => {
+                            return StateDetection::explicit_idle();
+                        }
                         "agent_message" => {
                             return if json_str(entry, &["payload", "phase"]) == Some("final_answer")
                             {
-                                AgentState::Idle
+                                StateDetection::explicit_idle()
                             } else {
-                                AgentState::Working
+                                StateDetection::working()
                             };
                         }
                         _ => continue,
@@ -1820,14 +1751,17 @@ fn detect_codex_state(path: &Path, file_age_secs: u64) -> AgentState {
                 if let Some(it) = json_str(entry, &["payload", "type"]) {
                     match it {
                         "function_call" | "function_call_output" | "reasoning" => {
-                            return AgentState::Working;
+                            return StateDetection::working();
                         }
                         "message" => {
+                            if codex_response_message_is_turn_aborted(entry) {
+                                return StateDetection::explicit_idle();
+                            }
                             return if json_str(entry, &["payload", "phase"]) == Some("final_answer")
                             {
-                                AgentState::Idle
+                                StateDetection::explicit_idle()
                             } else {
-                                AgentState::Working
+                                StateDetection::working()
                             };
                         }
                         _ => {}
@@ -1837,15 +1771,43 @@ fn detect_codex_state(path: &Path, file_age_secs: u64) -> AgentState {
             _ => {
                 if let Some(role) = json_str(entry, &["role"]) {
                     return if role == "user" {
-                        AgentState::Working
+                        StateDetection::working()
                     } else {
-                        AgentState::Idle
+                        StateDetection::explicit_idle()
                     };
                 }
             }
         }
     }
-    AgentState::Idle
+    StateDetection::inferred_idle()
+}
+
+fn codex_response_message_is_turn_aborted(entry: &Value) -> bool {
+    let Some(payload) = entry.get("payload") else {
+        return false;
+    };
+    if json_str(payload, &["role"]) != Some("user") {
+        return false;
+    }
+    let Some(Value::Array(content)) = payload.get("content") else {
+        return false;
+    };
+    content.iter().any(|item| {
+        json_str(item, &["text"]).is_some_and(codex_text_is_turn_aborted_marker)
+            || json_str(item, &["content"]).is_some_and(codex_text_is_turn_aborted_marker)
+    })
+}
+
+fn claude_user_message_is_request_interrupted(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "[Request interrupted by user]" | "[Request interrupted]"
+    )
+}
+
+fn codex_text_is_turn_aborted_marker(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("<turn_aborted>") && trimmed.ends_with("</turn_aborted>")
 }
 
 // --- Token counting (cached, full read) ---
@@ -2767,10 +2729,13 @@ mod tests {
 "#,
         );
 
-        assert_eq!(detect_claude_state(&path, 10), AgentState::Working);
-        assert_eq!(detect_claude_state(&path, 10_000), AgentState::Working);
+        assert_eq!(detect_claude_state_detection(&path, 10).state, AgentState::Working);
         assert_eq!(
-            detect_claude_state(&path, INFERRED_WORKING_STALE_SECS + 1),
+            detect_claude_state_detection(&path, 10_000).state,
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_claude_state_detection(&path, INFERRED_WORKING_STALE_SECS + 1).state,
             AgentState::Idle
         );
 
@@ -2786,7 +2751,10 @@ mod tests {
 "#,
         );
 
-        assert_eq!(detect_claude_state(&path, 300), AgentState::Working);
+        assert_eq!(
+            detect_claude_state_detection(&path, 300).state,
+            AgentState::Working
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -2800,7 +2768,10 @@ mod tests {
 "#,
         );
 
-        assert_eq!(detect_codex_state(&path, 300), AgentState::Working);
+        assert_eq!(
+            detect_codex_state_detection(&path, 300).state,
+            AgentState::Working
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -2814,10 +2785,13 @@ mod tests {
 "#,
         );
 
-        assert_eq!(detect_codex_state(&path, 10), AgentState::Working);
-        assert_eq!(detect_codex_state(&path, 10_000), AgentState::Working);
+        assert_eq!(detect_codex_state_detection(&path, 10).state, AgentState::Working);
         assert_eq!(
-            detect_codex_state(&path, INFERRED_WORKING_STALE_SECS + 1),
+            detect_codex_state_detection(&path, 10_000).state,
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_codex_state_detection(&path, INFERRED_WORKING_STALE_SECS + 1).state,
             AgentState::Idle
         );
 
@@ -2833,7 +2807,131 @@ mod tests {
 "#,
         );
 
-        assert_eq!(detect_codex_state(&path, 300), AgentState::Idle);
+        assert_eq!(
+            detect_codex_state_detection(&path, 300).state,
+            AgentState::Idle
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_turn_aborted_overrides_fresh_write_working_heuristic() {
+        let path = write_temp_jsonl(
+            "codex-turn-aborted-fresh",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}
+"#,
+        );
+        let mut cache = SessionCache::new();
+
+        let details = agent_details(
+            AgentKind::Codex,
+            Some(&path),
+            60,
+            false,
+            &mut cache,
+            detect_codex_state_detection,
+        );
+
+        assert_eq!(details.state, AgentState::Idle);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_turn_aborted_user_message_is_idle_without_event_marker() {
+        let path = write_temp_jsonl(
+            "codex-turn-aborted-message",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}
+"#,
+        );
+        let mut cache = SessionCache::new();
+
+        let details = agent_details(
+            AgentKind::Codex,
+            Some(&path),
+            60,
+            false,
+            &mut cache,
+            detect_codex_state_detection,
+        );
+
+        assert_eq!(details.state, AgentState::Idle);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_turn_aborted_literal_mention_does_not_force_idle() {
+        let path = write_temp_jsonl(
+            "codex-turn-aborted-literal-mention",
+            r#"{"type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","timestamp":"1970-01-01T00:01:40.000Z","source":"cli"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Explain when `<turn_aborted>` appears in logs."}]}}
+"#,
+        );
+        let mut cache = SessionCache::new();
+
+        let details = agent_details(
+            AgentKind::Codex,
+            Some(&path),
+            60,
+            false,
+            &mut cache,
+            detect_codex_state_detection,
+        );
+
+        assert_eq!(details.state, AgentState::Working);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_request_interrupted_overrides_fresh_write_working_heuristic() {
+        let path = write_temp_jsonl(
+            "claude-interrupted-fresh",
+            r#"{"sessionId":"session-1","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}
+{"sessionId":"session-1","message":{"role":"user","content":"[Request interrupted by user]"}}
+"#,
+        );
+        let mut cache = SessionCache::new();
+
+        let details = agent_details(
+            AgentKind::ClaudeCode,
+            Some(&path),
+            60,
+            false,
+            &mut cache,
+            detect_claude_state_detection,
+        );
+
+        assert_eq!(details.state, AgentState::Idle);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_request_interrupted_literal_prefix_does_not_force_idle() {
+        let path = write_temp_jsonl(
+            "claude-interrupted-prefix-literal",
+            r#"{"sessionId":"session-1","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}
+{"sessionId":"session-1","message":{"role":"user","content":"[Request interrupted by user] appears in the logs, explain why."}}
+"#,
+        );
+        let mut cache = SessionCache::new();
+
+        let details = agent_details(
+            AgentKind::ClaudeCode,
+            Some(&path),
+            60,
+            false,
+            &mut cache,
+            detect_claude_state_detection,
+        );
+
+        assert_eq!(details.state, AgentState::Working);
 
         let _ = fs::remove_file(path);
     }
